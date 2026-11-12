@@ -200,7 +200,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}, "type"),
 			},
 		}, "assets"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
@@ -336,6 +336,15 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				if err != nil {
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
+				}
+				if intelligenceEnabled() && typ == "service" && taskID > 0 {
+					for _, auth := range item.Auth {
+						raw, _ := json.Marshal(auth)
+						input := db.IntelligenceInput{Kind: "credential", Title: fmt.Sprintf("服务 #%d 的认证信息", id), Content: string(raw), Evidence: fmt.Sprintf("insert_assets 上报，服务资产 #%d，来源意图 #%d", id, t.ownerNode), Confidence: "observed", Status: "unverified", AssetIDs: []int64{id}}
+						if _, err := t.saveIntelligence(ctx, 0, input); err != nil {
+							errs = append(errs, errEntry{Index: i, Error: "资产已保存，凭据情报未保存：" + err.Error()})
+						}
+					}
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
 				t.writes.Assets++
@@ -530,7 +539,7 @@ func (t *ToolSet) listUntestedAssets() actool.CoreTool {
 func (t *ToolSet) listAssets() actool.CoreTool {
 	return readTool(
 		"list_assets",
-		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。只返回【本任务及直接关联任务】测试范围内的资产。\n"+
+		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。默认只返回本任务及直接关联任务的资产；用户开启「共享全局资产」后可查询全局资产。\n"+
 			"DSL：field=value 模糊(ILIKE) | field==value 精确 | field!=value 排除 | 数字字段支持 > >= < <= | 裸词=全文模糊；AND/OR 组合(AND 优先级高)，可用括号分组。资产类型用独立 type 参数，不写进 DSL。\n"+
 			"未传 id/ids 时 dsl 必须非空（不允许无条件全量查询）。\n"+
 			"可用字段：domain(根/子/服务域名)、root_domain、ip、url、page_title、icp、service_name、app_name、method(如 GET/POST)、service_type(http|other)、record_type(如 A/CNAME)、technology(数组，=模糊 ==精确)、port/status_code/company_id(整数)。\n"+
@@ -587,7 +596,7 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 func (t *ToolSet) listCompanies() actool.CoreTool {
 	return readTool(
 		"list_companies",
-		"列出资产库中的【企业/公司】及其资产范围(scope)与已归属资产数。用于查看有哪些公司、"+
+		"列出当前任务可见的【企业/公司】及其资产范围(scope)与可见资产数；开启共享全局资产后可查询全局企业。用于查看有哪些公司、"+
 			"拿到 company_id（insert_assets 关联 app、list_assets 按 company_id 过滤时用）。"+
 			"可选 search 按公司名模糊过滤(不区分大小写)，留空返回全部。",
 		obj(map[string]any{
@@ -601,7 +610,7 @@ func (t *ToolSet) listCompanies() actool.CoreTool {
 				Search string `json:"search"`
 			}
 			_ = json.Unmarshal(in, &a)
-			cos, err := t.cs.ListCompanies()
+			cos, err := t.cs.ListCompaniesForTask(t.taskID)
 			if err != nil {
 				return actool.Errorf("查询公司失败: " + err.Error()), nil
 			}
@@ -645,7 +654,7 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
-		t.addFinding(), t.recordFact(),
+		t.addFinding(), t.recordFact(), t.recordIntelligence(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
@@ -674,7 +683,7 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.setConstraints(),
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
-		t.addFinding(), t.recordFact(),
+		t.addFinding(), t.recordFact(), t.recordIntelligence(),
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),

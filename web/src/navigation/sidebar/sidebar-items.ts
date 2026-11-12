@@ -5,6 +5,7 @@ import {
   Bot,
   Brain,
   Bug,
+  CalendarClock,
   ClipboardList,
   FolderOpen,
   FolderSync,
@@ -14,6 +15,7 @@ import {
   Network,
   Plug,
   Radio,
+  Repeat,
   ScrollText,
   Settings2,
   ShieldAlert,
@@ -69,8 +71,10 @@ export const sidebarItems: NavGroup[] = [
       { id: "dashboard", title: "仪表盘", url: "/dashboard", icon: LayoutDashboard },
       { id: "chat", title: "对话", url: "/chat", icon: MessageSquare },
       { id: "tasks", title: "任务", url: "/function/tasks", icon: Target },
+      { id: "schedules", title: "计划任务", url: "/function/schedules", icon: CalendarClock },
       { id: "findings", title: "发现", url: "/function/findings", icon: Bug },
       { id: "traffic", title: "流量", url: "/function/traffic", icon: Activity },
+      { id: "repeater", title: "请求重发", url: "/function/repeater", icon: Repeat },
       { id: "commands", title: "工具执行", url: "/function/commands", icon: Terminal },
       { id: "llm-records", title: "LLM 录制", url: "/function/llm-records", icon: Radio },
       { id: "assets", title: "资产", url: "/function/assets", icon: Network },
@@ -96,3 +100,16 @@ export const sidebarItems: NavGroup[] = [
     ],
   },
 ];
+
+// Rebuild display labels when the active language changes; IDs and URLs stay stable.
+export function getSidebarItems(t: (key: string) => string): NavGroup[] {
+  return sidebarItems.map((group) => ({
+    ...group,
+    label: t(group.id === 1 ? "nav.features" : "nav.system"),
+    items: group.items.map((item) => ({
+      ...item,
+      title: t(`nav.${item.id}`),
+      ...(item.subItems ? { subItems: item.subItems.map((sub) => ({ ...sub, title: t(`nav.${sub.id}`) })) } : {}),
+    })),
+  }));
+}

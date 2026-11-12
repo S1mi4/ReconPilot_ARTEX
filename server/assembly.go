@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"path/filepath"
@@ -95,6 +96,13 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 					continue
 				}
 				for _, t := range ts {
+					// Playwright exposes the screenshot capability as a separate tool. Keep
+					// it opt-in so a normal browser MCP session does not unexpectedly send
+					// image payloads to the model or consume extra tokens.
+					if m.Name == browserMCPName && isBrowserScreenshotTool(t.Name()) &&
+						(agentKey != "reporter" || !pg.GetBool(settingBrowserScreenshot, false)) {
+						continue
+					}
 					extra = append(extra, t)
 					allNames = append(allNames, t.Name())
 					serverTools[m.Name] = append(serverTools[m.Name], t.Name())
@@ -179,6 +187,11 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 	}
 }
 
+func isBrowserScreenshotTool(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(name, "screenshot") || strings.Contains(name, "take_screenshot")
+}
+
 func idSet(ids []int64) map[int64]bool {
 	m := make(map[int64]bool, len(ids))
 	for _, id := range ids {
@@ -211,6 +224,24 @@ func seedPrompts(pg *db.DB) {
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
+	agent.IntelligenceEnabled = func() bool { return pg.GetBool(db.SettingTaskIntelligence, false) }
+	agent.IntelligenceRecord = func(ctx context.Context, taskID, nodeID int64, worker string, input db.IntelligenceInput) (int64, error) {
+		if !pg.GetBool(db.SettingTaskIntelligence, false) {
+			return 0, fmt.Errorf("任务情报自动记录已关闭")
+		}
+		item, err := pg.RecordIntelligence(ctx, taskID, nodeID, worker, input)
+		if err != nil {
+			return 0, err
+		}
+		if item.Kind == "credential" {
+			// The durable database row is the source of truth; this wake-up only
+			// reduces latency. The recovery ticker handles missed notifications.
+			if agent.CredentialRecorded != nil {
+				agent.CredentialRecorded()
+			}
+		}
+		return item.ID, nil
+	}
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
 	// custom tools (system=false, added via the UI) survive restarts.

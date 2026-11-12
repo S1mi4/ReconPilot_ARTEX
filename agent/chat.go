@@ -29,6 +29,7 @@ type ChatAgent struct {
 	tx             *transcript.Store
 	window         int
 	proxyAddr      string
+	proxyAddrFn    func() string
 	proxyCACert    string
 	webSearch      WebSearchOpts
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
@@ -65,7 +66,8 @@ func (c *ChatAgent) maxTokens() int {
 
 // SetProxy points the chat agent's WebFetch/Bash at the recording proxy plus the
 // CA cert it trusts (empty addr = direct). Kept for parity with the other agents.
-func (c *ChatAgent) SetProxy(addr, caCert string) { c.proxyAddr, c.proxyCACert = addr, caCert }
+func (c *ChatAgent) SetProxy(addr, caCert string)      { c.proxyAddr, c.proxyCACert = addr, caCert }
+func (c *ChatAgent) SetProxyProvider(fn func() string) { c.proxyAddrFn = fn }
 
 // SetWebSearch selects the web_search backend for the chat agent (off by default).
 func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }
@@ -124,33 +126,34 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	defer cleanup()
 
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
+	proxyAddr := c.proxyAddr
+	if c.proxyAddrFn != nil {
+		proxyAddr = c.proxyAddrFn()
+	}
 	opts := agentcore.Options{
 		Provider:        c.prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
-		Tools:           tools,
+		Tools:           append(tools, deepSeekTools(ws)...),
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
 		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
-		WebFetchProxy:   c.proxyAddr,
+		WebFetchProxy:   proxyAddr,
 		WebFetchCACert:  c.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       ws.Enabled,
-		WebSearchBackend:      ws.Backend,
-		BraveSearchAPIKey:     ws.BraveKey,
-		TavilySearchAPIKey:    ws.TavilyKey,
-		DeepSeekSearchBaseURL: ws.DeepSeekBaseURL,
-		DeepSeekSearchAPIKey:  ws.DeepSeekAPIKey,
-		DeepSeekSearchModel:   ws.DeepSeekModel,
-		WebSearchProxy:        ws.Proxy,
-		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            sessionWorkDir,
-		MaxTurns:              maxTurns,
-		MaxDuration:           maxDuration,
-		Compaction:            compactionConfig(c.window),
-		Todos:                 actool.NewTodoStore(),
+		EnableWebSearch:    ws.Enabled && ws.Backend != "deepseek",
+		WebSearchBackend:   ws.Backend,
+		BraveSearchAPIKey:  ws.BraveKey,
+		TavilySearchAPIKey: ws.TavilyKey,
+		WebSearchProxy:     ws.Proxy,
+		BashEnv:            proxyEnv(proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		WorkingDir:         sessionWorkDir,
+		MaxTurns:           maxTurns,
+		MaxDuration:        maxDuration,
+		Compaction:         compactionConfig(c.window),
+		Todos:              actool.NewTodoStore(),
 		// large tool output spills to cmd-output/ under the session dir.
 		// 截断上限用 SDK 默认(tool.Capture 的 30000 字符)。
 		ToolOutputDir: filepath.Join(sessionWorkDir, "cmd-output"),

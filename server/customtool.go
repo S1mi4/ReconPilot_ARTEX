@@ -368,7 +368,7 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	}
 	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, timeoutOr(spec.TimeoutMs, 120000))
 	if err != nil {
-		return actool.Errorf(err.Error()), nil
+		return actool.Errorf(maskSecrets(err.Error())), nil
 	}
 	return actool.Text(actool.Capture(tc, body)), nil
 }
@@ -436,7 +436,7 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	defer cancel()
 	req, err := http.NewRequestWithContext(runCtx, method, rawURL, bodyReader)
 	if err != nil {
-		return actool.Errorf(err.Error()), nil
+		return actool.Errorf(maskSecrets(err.Error())), nil
 	}
 	for k, v := range spec.Headers {
 		req.Header.Set(k, renderTemplate(v, params, identity))
@@ -447,7 +447,10 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return actool.Errorf("请求失败: " + err.Error()), nil
+		if spec.UseRecordingProxy || strings.TrimSpace(spec.Proxy) == strings.TrimSpace(s.m.GlobalProxy()) {
+			s.handleProxyToolFailure(runCtx, err)
+		}
+		return actool.Errorf("请求失败: " + maskSecrets(err.Error())), nil
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -462,9 +465,16 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
-		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
-			caFile = s.m.ProxyCACert()
+		// ProxyAddr is already a complete URL while capture is enabled, and
+		// returns the configured global proxy URL when capture is off. Keep both
+		// forms intact (including socks5:// and credentials).
+		if s.m.TrafficEnabled() {
+			if addr := s.m.ProxyAddr(); addr != "" {
+				proxyStr = addr
+				caFile = s.m.ProxyCACert()
+			}
+		} else if global := strings.TrimSpace(s.m.GlobalProxy()); global != "" {
+			proxyStr = global
 		}
 	}
 	if proxyStr == "" {
@@ -474,6 +484,9 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	if err != nil {
 		return nil
 	}
+	// Go 1.26+ supports http/https/socks5/socks5h in ProxyURL directly,
+	// including proxy userinfo. Keep one code path so existing HTTP tool
+	// behavior and proxy authentication remain unchanged.
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
 	if caFile != "" {
 		if pem, err := os.ReadFile(caFile); err == nil {

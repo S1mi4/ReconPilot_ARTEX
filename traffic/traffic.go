@@ -169,7 +169,9 @@ type Traffic struct {
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream atomic.Pointer[url.URL]
+	upstream        atomic.Pointer[url.URL]
+	upstreamMu      sync.RWMutex
+	upstreamFailure func(error)
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -327,6 +329,27 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
+// SetUpstreamFailureHandler observes failures from the configured global
+// upstream proxy. The callback is intentionally best-effort and must not block
+// the MITM request path.
+func (t *Traffic) SetUpstreamFailureHandler(fn func(error)) {
+	t.upstreamMu.Lock()
+	t.upstreamFailure = fn
+	t.upstreamMu.Unlock()
+}
+
+func (t *Traffic) reportUpstreamFailure(err error) {
+	if err == nil || t.upstream.Load() == nil {
+		return
+	}
+	t.upstreamMu.RLock()
+	fn := t.upstreamFailure
+	t.upstreamMu.RUnlock()
+	if fn != nil {
+		go fn(err)
+	}
+}
+
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
 // user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
@@ -400,7 +423,14 @@ func (s *sink) Response(f *mproxy.Flow) {
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
 // errors) — not a plain target-unreachable error — we flag the host for
 // transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
+func (s *sink) RequestError(f *mproxy.Flow, err error) {
+	s.t.reportUpstreamFailure(err)
+	s.t.maybePassthrough(f, err)
+}
+
+func (s *sink) HTTPConnectError(_ *mproxy.Flow, err error) {
+	s.t.reportUpstreamFailure(err)
+}
 
 // maybePassthrough marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
@@ -815,16 +845,51 @@ func ftsQuote(s string) string {
 // of -1 skip the response-size bounds. An empty Sort/Order defaults to
 // newest-first by timestamp.
 type PageQuery struct {
-	Host    string // host substring
-	Method  string // exact method (case-insensitive)
-	Query   string // broad search box: metadata columns OR captured text
-	Body    string // content box: captured request/response text only (full-text)
-	Path    string // url_template substring — the vulnerability's path
-	Status  string // exact code ("404") or class bucket ("4xx")
-	RespMin int64  // minimum resp_len, or -1 when unset
-	RespMax int64  // maximum resp_len, or -1 when unset
-	Sort    string // ts | status | resp_len (default ts)
-	Order   string // asc | desc (default desc)
+	Host    string   // host substring
+	Hosts   []string // task-scoped host candidates (exact host or host:port)
+	Method  string   // exact method (case-insensitive)
+	Query   string   // broad search box: metadata columns OR captured text
+	Body    string   // content box: captured request/response text only (full-text)
+	Path    string   // url_template substring — the vulnerability's path
+	Status  string   // exact code ("404") or class bucket ("4xx")
+	RespMin int64    // minimum resp_len, or -1 when unset
+	RespMax int64    // maximum resp_len, or -1 when unset
+	Sort    string   // ts | status | resp_len (default ts)
+	Order   string   // asc | desc (default desc)
+}
+
+// hostScopeClause limits traffic to the hosts attached to a task. Captures
+// store the request Host header, which may include a port, while asset rows
+// store normalized hostnames; match both forms without widening to subdomains.
+func hostScopeClause(hosts []string) (string, []any) {
+	conditions := make([]string, 0, len(hosts))
+	args := make([]any, 0, len(hosts)*2)
+	seen := make(map[string]struct{}, len(hosts))
+	for _, raw := range hosts {
+		host := strings.ToLower(strings.TrimSpace(raw))
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		if strings.HasPrefix(host, "*.") {
+			base := strings.TrimPrefix(host, "*.")
+			if base == "" {
+				continue
+			}
+			conditions = append(conditions, "(host=? OR host LIKE ? OR host LIKE ?)")
+			args = append(args, base, base+":%", "%."+base)
+			continue
+		}
+		conditions = append(conditions, "(host=? OR host LIKE ?)")
+		args = append(args, host, host+":%")
+	}
+	if len(conditions) == 0 {
+		return "", nil
+	}
+	return "(" + strings.Join(conditions, " OR ") + ")", args
 }
 
 // sortColumns whitelists the columns Page may order by, so the caller-supplied
@@ -877,6 +942,9 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if h := strings.TrimSpace(f.Host); h != "" {
 		add("host LIKE ?", "%"+h+"%")
 	}
+	if cond, scopeArgs := hostScopeClause(f.Hosts); cond != "" {
+		add(cond, scopeArgs...)
+	}
 	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
@@ -894,13 +962,13 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
-		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
+		const meta = "id LIKE ? OR host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
 		// Metadata match OR full-text match: one search box, widest recall. Terms
 		// too short for trigram silently fall back to metadata only.
 		if cond, arg, ok := t.ftsFilter(s); ok {
-			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, arg)
+			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, like, arg)
 		} else {
-			add("("+meta+")", like, like, like, like, like, like)
+			add("("+meta+")", like, like, like, like, like, like, like)
 		}
 	}
 	// Body is the dedicated content box: it only searches captured request/response
@@ -998,6 +1066,30 @@ type HostCount struct {
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
 	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HostCount
+	for rows.Next() {
+		var h HostCount
+		var last int64
+		if err := rows.Scan(&h.Host, &h.Count, &last); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// HostsForScope returns recorded hosts that belong to a task's normalized host
+// scope. It is used by the task HTTP history picker and never mutates traffic.
+func (t *Traffic) HostsForScope(scope []string) ([]HostCount, error) {
+	cond, args := hostScopeClause(scope)
+	if cond == "" {
+		return []HostCount{}, nil
+	}
+	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges WHERE `+cond+` GROUP BY host ORDER BY last DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2056,10 +2148,10 @@ func (t *Traffic) Tools() []actool.CoreTool {
 
 	get := actool.Build(actool.Spec{
 		Name:        "traffic_get",
-		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。配合 traffic_search 用，避免重复 curl。",
+		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。id 与流量页面展示的流量 ID、traffic_search 返回的 id 相同，须完整保留，不是列表行号。已知 ID 时直接读取，无需重新搜索或请求目标。",
 		Schema: map[string]any{
 			"type":       "object",
-			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "traffic_search 返回的 id"}},
+			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "流量页面或 traffic_search 返回的完整流量 ID（不是列表行号）"}},
 			"required":   []any{"id"},
 		},
 		ReadOnly:    ro,

@@ -115,6 +115,36 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 			return out, fmt.Errorf("终态任务不能执行暂停")
 		}
 		if lifecycle.Paused {
+			if pauseCause != agent.AbortPausedBySchedule {
+				if pauseCause == nil {
+					pauseCause = agent.AbortPausedByUser
+				}
+				reason := "paused_by_user"
+				if pauseCause == agent.AbortPausedByOrchestrator {
+					reason = "paused_by_orchestrator"
+				}
+				if pauseCause == agent.AbortPausedByProxy {
+					reason = "paused_by_proxy"
+				}
+				if _, err := s.m.pg.Exec(`UPDATE tasks SET schedule_paused=false, pause_reason=$2 WHERE id=$1`, t.ID, reason); err != nil {
+					return out, err
+				}
+				t.updateLifecycle(func(state *taskLifecycleState) {
+					state.PauseReason = reason
+					state.ReconnectAttempt = 0
+					state.ReconnectMax = 0
+					state.ReconnectNextAt = 0
+					state.ReconnectExhausted = false
+					state.ReconnectLastError = ""
+				})
+				// The lifecycle row may already have been paused by another
+				// actor. Reinstall the requested cause barrier while holding
+				// concMu instead of assuming the existing barrier is sufficient.
+				s.engine.Pause(t.ID, pauseCause)
+				out.Paused = true
+				out.Status = "paused"
+				return out, nil
+			}
 			return out, fmt.Errorf("任务已经暂停")
 		}
 		wasQueued := lifecycle.Queued
@@ -123,8 +153,22 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 			pauseCause = agent.AbortPausedByUser
 		}
 		s.engine.Pause(t.ID, pauseCause)
-		if err := s.m.ApplyTaskPause(t.ID); err != nil {
-			if !wasEnginePaused && !wasQueued {
+		reason := "paused_by_user"
+		if pauseCause == agent.AbortPausedBySchedule {
+			reason = "paused_by_schedule"
+		}
+		if pauseCause == agent.AbortPausedByOrchestrator {
+			reason = "paused_by_orchestrator"
+		}
+		if pauseCause == agent.AbortPausedByProxy {
+			reason = "paused_by_proxy"
+		}
+		if err := s.m.ApplyTaskPauseOriginReason(t.ID, reason, pauseCause == agent.AbortPausedBySchedule); err != nil {
+			// Do not compensate over a proxy pause that may have committed while
+			// this control request was failing. The persisted reason is the source
+			// of truth for which Engine barrier must remain installed.
+			stillProxyPaused := t.lifecycleSnapshot().PauseReason == "paused_by_proxy"
+			if !stillProxyPaused && !wasEnginePaused && !wasQueued {
 				s.engine.Resume(t)
 			}
 			return out, err
@@ -136,7 +180,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		out.Paused, out.Status = true, "paused"
 		go s.reconcileConcurrency()
 	case "resume":
-		queued, err := s.admitPausedTask(t)
+		queued, err := s.admitTaskWhenScheduled(t, "resume", true, pauseCause == agent.AbortPausedBySchedule)
 		if err != nil {
 			return out, err
 		}

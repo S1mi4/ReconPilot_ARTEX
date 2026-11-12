@@ -27,7 +27,9 @@ func Causef(code, short, format string, args ...any) *AbortCause {
 
 var (
 	// Task-level execution context.
-	AbortPausedByUser = cause("paused_by_user", "用户暂停了任务",
+	AbortPausedBySchedule = cause("paused_by_schedule", "计划窗口结束，暂停任务", "任务将在下一个计划窗口恢复，本次执行已停止")
+	AbortPausedByProxy    = cause("paused_by_proxy", "全局代理异常，暂停任务", "全局出口代理连接失败，任务已暂停；代理恢复后将自动继续")
+	AbortPausedByUser     = cause("paused_by_user", "用户暂停了任务",
 		"用户通过任务控制接口（POST /api/tasks/{id}/control，action=pause）暂停了任务。本次 Planner/Worker 运行被主动取消；运行中的意图会退回 frontier(open)，恢复任务后重新领取并从头执行")
 	AbortPausedByOrchestrator = cause("paused_by_orchestrator", "编排 Agent 暂停了任务",
 		"编排 Agent 调用了 pause_task 工具暂停本任务。本次 Planner/Worker 运行被主动取消；运行中的意图会退回 frontier(open)，恢复后重新执行")
@@ -37,6 +39,8 @@ var (
 		"后端启动时根据数据库中持久化的状态恢复了任务暂停。本次运行被取消；正常情况下恢复阶段没有正在运行的 Agent")
 	AbortGoalMet = cause("goal_met", "规划者判定任务目标已达成",
 		"规划者判定任务目标已达成并将任务置为 done，随后取消仍在运行的 Worker；这些意图会标记为 stopped，而不是失败")
+	AbortNoResultStop = cause("no_result_stop", "无成果止损收尾的等待时间已用尽",
+		"任务运行至无成果检查点仍未达到漏洞数量和等级要求，90 秒收尾宽限后执行硬取消；意图标记为 exhausted，已写入的事实和资产保留")
 	AbortSettleDrainTimeout = cause("settle_drain_timeout", "任务超时收尾的等待时间已用尽",
 		"任务到达 timeout 后等待正在运行的 Worker 优雅收尾，但 90 秒 drain 宽限仍不足，因此执行硬取消；意图会标记为 exhausted，收尾阶段已经写入的事实和资产会保留")
 

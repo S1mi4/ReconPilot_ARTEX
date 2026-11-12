@@ -5,7 +5,7 @@
 
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
+import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -28,15 +28,21 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredentialTrafficDetail,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
   Edge,
+  EgressReport,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
   Finding,
   FindingAssetTree,
+  FindingCaseDetail,
+  FindingCasePage,
+  FindingCaseReviewRun,
+  FindingCaseSuggestion,
   FindingDeepenResponse,
   FindingGroupsPage,
   FindingQuery,
@@ -46,6 +52,7 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
+  IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -71,6 +78,10 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  ProxyPoolEntry,
+  ProxySwitchLog,
+  RepeaterSendRequest,
+  RepeaterSendResponse,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -79,6 +90,7 @@ import type {
   SSProject,
   SSTask,
   Stats,
+  SystemMetrics,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -86,9 +98,12 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskFileListing,
   TaskGoal,
+  TaskIntelligence,
   TaskLLMResolutions,
   TaskNode,
+  TaskSchedule,
   TaskScopeRow,
   TaskTemplate,
   TokenTotal,
@@ -101,20 +116,68 @@ import type {
   TrafficHost,
   TrafficResp,
   UpdateCheck,
+  UpdateSettings,
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
+
+/**
+ * Read a download name from Content-Disposition. RFC 5987's filename* is
+ * preferred because it preserves UTF-8 names; older filename remains the
+ * fallback for clients that do not understand it.
+ */
+export function downloadFilename(contentDisposition: string, fallback: string): string {
+  const encoded = contentDisposition.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.replace(/^"|"$/g, ""));
+    } catch {
+      // Fall through to the legacy token when a malformed header is received.
+    }
+  }
+  const legacy = contentDisposition.match(/(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;\s]+))/i);
+  return (legacy?.[1] ?? legacy?.[2] ?? fallback).trim() || fallback;
+}
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("artex_token");
 }
 
+let basicAuthReloading = false;
+let basicAuthProbe: Promise<void> | null = null;
+
+// Renew the outer gate through a page navigation, where the browser can send
+// Basic credentials without replacing an API request's Bearer authorization.
+// Keep the admin token and collapse concurrent failures into one reload.
+export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
+  const response = await fetch(input, init);
+  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
+  if (response.status === 401 && response.headers.get("X-Artex-Auth") === "basic") {
+    basicAuthReloading = true;
+    window.location.reload();
+    throw new Error("访问验证已过期，正在重新验证");
+  }
+  return response;
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+    public readonly params?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
-  const r = await fetch(`/api${path}`, {
+  const r = await apiFetch(`/api${path}`, {
     ...init,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
@@ -122,26 +185,29 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers as Record<string, string> | undefined),
     },
   });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("未授权");
-  }
   if (!r.ok) {
-    const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    const fallback = r.status === 401 ? "未授权" : `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
+    let code: string | undefined = r.status === 401 ? "unauthorized" : undefined;
+    let params: Record<string, unknown> | undefined;
     try {
-      const payload = (await r.json()) as { error?: unknown };
+      const payload = (await r.json()) as { error?: unknown; code?: unknown; params?: unknown };
       if (typeof payload.error === "string" && payload.error.trim()) {
         message = payload.error.trim();
+      }
+      if (typeof payload.code === "string") code = payload.code;
+      if (payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)) {
+        params = payload.params as Record<string, unknown>;
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    if (r.status === 401 && typeof window !== "undefined") {
+      localStorage.removeItem("artex_token");
+      document.cookie = "artex_token=; path=/; max-age=0";
+      window.location.href = "/login";
+    }
+    throw new ApiError(message, code, params);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -197,6 +263,27 @@ export function sseUrl(path: string): string {
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
 }
 
+export function openSSE(path: string): EventSource {
+  const url = sseUrl(path);
+  const target = new URL(url, window.location.href);
+  // Same-origin streams already send cookies. Only opt into cross-port cookies
+  // for the local Next/Go dev pair; keep custom remote SSE endpoints unchanged.
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname);
+  const source = new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
+  source.addEventListener("error", () => {
+    // EventSource hides the response status. Probe a same-origin auth endpoint
+    // to distinguish an expired gate from an ordinary stream/network failure.
+    if (basicAuthProbe !== null || basicAuthReloading) return;
+    basicAuthProbe = apiFetch("/api/auth/status", { cache: "no-store" })
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        basicAuthProbe = null;
+      });
+  });
+  return source;
+}
+
 const get = <T>(p: string) => http<T>(p);
 const post = <T>(p: string, body?: unknown) =>
   http<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined });
@@ -209,6 +296,13 @@ const del = <T>(p: string, body?: unknown) =>
 
 // Go serializes nil slices as JSON null — coerce to [].
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
+
+// Empty Go slices can arrive as null from older servers. Keep proxy-pool
+// consumers safe across initial load, import, and health-check refreshes.
+function normalizeProxyPool<T extends { entries: ProxyPoolEntry[]; switch_log: ProxySwitchLog[] }>(pool: T): T {
+  return { ...pool, entries: arr(pool.entries), switch_log: arr(pool.switch_log) };
+}
+
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
 
 // findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
@@ -221,6 +315,9 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.task && q.task !== "all") p.set("task_id", q.task);
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
+  if (q.timeDirection) p.set("time_direction", q.timeDirection);
+  if (q.from) p.set("from", q.from);
+  if (q.to) p.set("to", q.to);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
   return p;
 }
@@ -229,12 +326,47 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  if (filter.q?.trim()) query.set("q", filter.q.trim());
+  if (filter.from) query.set("from", filter.from);
+  if (filter.to) query.set("to", filter.to);
   return query.toString();
 }
 
+export type ScheduleInput = {
+  name: string;
+  enabled?: boolean;
+  timezone_mode?: "beijing" | "system";
+  schedule_type: "once" | "weekly";
+  run_date?: string;
+  end_date?: string;
+  weekdays?: number[];
+  start_time: string;
+  end_time?: string;
+  start_immediately?: boolean;
+  task_ids: number[];
+};
+
+function schedulePayload(input: ScheduleInput) {
+  return {
+    name: input.name,
+    enabled: input.enabled ?? true,
+    timezone_mode: input.timezone_mode ?? "beijing",
+    schedule_type: input.schedule_type,
+    run_date: input.run_date ?? "",
+    end_date: input.end_date ?? "",
+    weekdays: input.weekdays ?? [],
+    start_time: input.start_time,
+    end_time: input.end_time ?? "",
+    start_immediately: input.start_immediately ?? false,
+    task_ids: input.task_ids,
+  };
+}
+
 export const api = {
-  // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
-  health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  // 健康检查受可选 Basic Auth 保护且不返回应用名称或版本；版本号仅向已登录管理员提供。
+  health: () => get<{ ok: boolean }>("/health"),
+  version: () => http<{ version: string }>("/version", { cache: "no-store" }),
+  systemMetrics: () => get<SystemMetrics>("/system/metrics"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
@@ -249,6 +381,7 @@ export const api = {
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
     name?: string;
+    remark?: string;
     categoryId?: number;
     description: string;
     goal: string;
@@ -256,13 +389,20 @@ export const api = {
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
+    noResultSeconds?: number;
+    noResultMinFindings?: number;
+    noResultMinSeverity?: "" | "low" | "medium" | "high" | "critical";
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
+    shareGlobalAssets?: boolean;
     coverageEnabled?: boolean;
+    workerCount?: number;
     interceptRules?: AssetInterceptRuleInput[];
+    schedule?: ScheduleInput;
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
+      remark: input.remark ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
       goal: input.goal,
@@ -270,13 +410,33 @@ export const api = {
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
+      no_result_seconds: input.noResultSeconds ?? 0,
+      no_result_min_findings: input.noResultMinFindings ?? 1,
+      no_result_min_severity: input.noResultMinSeverity ?? "",
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
+      share_global_assets: input.shareGlobalAssets ?? false,
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      worker_count: input.workerCount ?? 0, // 0 = 用全局默认 workers
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      schedule: input.schedule ? schedulePayload(input.schedule) : undefined,
     }),
+  schedules: () => get<{ schedules: TaskSchedule[] }>("/schedules").then((r) => arr(r.schedules)),
+  renameSchedule: (id: number, name: string) => patch<TaskSchedule>(`/schedules/${id}/metadata`, { name }),
+  updateScheduleRemark: (id: number, remark: string) => patch<TaskSchedule>(`/schedules/${id}/remark`, { remark }),
+  schedule: (id: number) => get<TaskSchedule>(`/schedules/${id}`),
+  createSchedule: (input: ScheduleInput) => post<TaskSchedule>("/schedules", schedulePayload(input)),
+  updateSchedule: (id: number, input: ScheduleInput) => patch<TaskSchedule>(`/schedules/${id}`, schedulePayload(input)),
+  deleteSchedule: (id: number) => del<{ ok: boolean }>(`/schedules/${id}`),
+  pauseSchedule: (id: number) => post<{ ok: boolean }>(`/schedules/${id}/pause`, {}),
+  resumeSchedule: (id: number) => post<{ ok: boolean }>(`/schedules/${id}/resume`, {}),
+  runScheduleNow: (id: number) =>
+    post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  updateTask: (
+    id: string,
+    input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean },
+  ) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
@@ -292,11 +452,19 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">,
+    input: Pick<
+      TaskTemplate,
+      "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+    >,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
+    input: Partial<
+      Pick<
+        TaskTemplate,
+        "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+      >
+    >,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
@@ -378,6 +546,10 @@ export const api = {
     }>(`/tasks/${id}/coverage`),
   // 资产覆盖图：范围内全部资产 + 连接用的根域名/公司节点，含 tested/in_scope。
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
+  startTopologyMapping: (id: string) =>
+    post<{ status: string; agent_key: string; conversation_id: number }>(`/tasks/${id}/topology-mapping`, {}),
+  topologyMappingStatus: (id: string) =>
+    get<{ running: boolean; conversation_id?: number }>(`/tasks/${id}/topology-mapping/status`),
   // 全局 llm_usage 聚合（仪表盘新版 token 视图）：按 profile 总量 + 按天分桶。
   usageStats: (days = 365) => get<UsageStats>(`/tokens/usage?days=${days}`),
   // ---- 目标管理（总览）----
@@ -431,6 +603,33 @@ export const api = {
   // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
 
+  taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
+  taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
+  taskFileRead: (id: string, path: string) =>
+    get<WorkspaceFile>(`/tasks/${id}/files/read?path=${encodeURIComponent(path)}`),
+  // Browser downloads stream to disk using the same auth cookie as SSE. Avoid
+  // fetching ZIPs into a Blob, which would buffer the entire archive in memory.
+  taskFileDownload: async (id: string, path: string, archive = false) => {
+    const action = archive ? "archive" : "download";
+    if (!MOCK) {
+      const token = getToken();
+      const response = await apiFetch(`/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`, {
+        method: "HEAD",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) throw new Error(response.status === 404 ? "taskFiles.unavailable" : "taskFiles.failed");
+    }
+    const a = document.createElement("a");
+    a.href = MOCK ? mockTaskFileURL(path, action) : `/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`;
+    a.download = archive ? `${path.split("/").pop() || `task-${id}`}.zip` : path.split("/").pop() || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (MOCK && a.href.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+  },
+  taskFilePreview: (id: string, path: string) =>
+    MOCK ? mockTaskFileURL(path, "preview") : `/api/tasks/${id}/files/preview?path=${encodeURIComponent(path)}`,
+
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),
   workspaceRead: (path: string) => get<WorkspaceFile>(`/workspace/read?path=${encodeURIComponent(path)}`),
@@ -443,7 +642,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await fetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
+    const r = await apiFetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -453,20 +652,22 @@ export const api = {
   },
   workspaceDownload: async (path: string) => {
     let blob: Blob;
+    let contentDisposition = "";
     if (MOCK) {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
       const token = getToken();
-      const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
+      const r = await apiFetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
+      contentDisposition = r.headers.get("Content-Disposition") ?? "";
       blob = await r.blob();
     }
     const objUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = objUrl;
-    a.download = path.split("/").pop() || "download";
+    a.download = downloadFilename(contentDisposition, path.split("/").pop() || "download");
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -555,7 +756,48 @@ export const api = {
   // 节点带子树聚合计数。不分页——树是导航结构,一次取完。
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
-  findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+
+  findingCases: (q: FindingQuery, originalRows = false) => {
+    const p = findingFilterParams(q);
+    p.set("page", String(q.page));
+    p.set("limit", String(q.pageSize));
+    if (originalRows) p.set("original_rows", "1");
+    return get<FindingCasePage>(`/exploration/finding-cases?${p}`);
+  },
+  getFindingCase: (id: string, contextTask?: string) =>
+    get<FindingCaseDetail>(
+      `/exploration/finding-cases/${id}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+    ),
+  findingCaseMembers: (id: string, page = 1, contextTask?: string, pageSize = 20) =>
+    get<FindingsPage>(
+      `/exploration/finding-cases/${id}/members?page=${page}&limit=${pageSize}${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
+    ),
+  removeFindingCaseMember: (id: string, fid: string, reason: string) =>
+    http<{ ok: boolean }>(`/exploration/finding-cases/${id}/members/${fid}`, {
+      method: "DELETE",
+      body: JSON.stringify({ reason }),
+    }),
+  findingCaseSuggestions: (task?: string) =>
+    get<FindingCaseSuggestion[]>(
+      `/exploration/finding-case-suggestions${task ? `?task_id=${encodeURIComponent(task)}` : ""}`,
+    ),
+  resolveFindingCaseSuggestion: (id: string, accept: boolean, excludeIds?: string[]) =>
+    post<{ case_id: string }>(`/exploration/finding-case-suggestions/${id}`, {
+      accept,
+      ...(excludeIds && excludeIds.length > 0 ? { exclude_ids: excludeIds } : {}),
+    }),
+  reviewFindingCases: (ids: string[]) =>
+    post<{ runs: { conversation_id: number; task_id: string }[] }>("/exploration/finding-case-review", {
+      finding_ids: ids,
+    }),
+  regenerateFindingCase: (id: string, contextTask?: string) =>
+    post<{ runs: { conversation_id: number; task_id: string }[] }>(
+      `/exploration/finding-case-review${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { case_id: id },
+    ),
+  findingCaseReviewRuns: () => get<FindingCaseReviewRun[]>("/exploration/finding-case-review"),
+  findingStats: (q: Omit<FindingQuery, "page" | "pageSize"> = {}) =>
+    get<FindingStats>(`/exploration/findings/stats?${findingFilterParams(q).toString()}`),
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {
@@ -563,23 +805,26 @@ export const api = {
     scope: "filtered" | "all" | "selected";
     filters?: Omit<FindingQuery, "page" | "pageSize">;
     ids?: string[];
+    includeOriginals?: boolean;
+    consolidated?: boolean;
   }) => {
     const p = new URLSearchParams({ format: opts.format, scope: opts.scope });
+    p.set("mode", opts.consolidated === false ? "raw" : "consolidated");
+    p.set("include_originals", String(opts.includeOriginals ?? false));
     if (opts.scope === "selected") {
       p.set("ids", (opts.ids ?? []).join(","));
     } else if (opts.scope === "filtered" && opts.filters) {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
     const token = getToken();
-    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
+    const r = await apiFetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`export: ${r.status}`);
     const blob = await r.blob();
     // 文件名优先取后端 Content-Disposition,取不到则用默认名。
     const disp = r.headers.get("Content-Disposition") ?? "";
-    const m = disp.match(/filename="?([^"]+)"?/);
-    const filename = m?.[1] ?? `findings-export`;
+    const filename = downloadFilename(disp, `findings-export`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -592,6 +837,11 @@ export const api = {
   getFinding: (id: string, contextTaskId?: string) =>
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
+    ),
+  generateFindingReport: (id: string) =>
+    post<{ queued: boolean; agent_key: "reporter"; finding_id: number; finding_node_id: number }>(
+      `/exploration/findings/${encodeURIComponent(id)}/generate-report`,
+      {},
     ),
   findingTraffic: (id: string, contextTask?: string) =>
     get<FindingTraffic>(
@@ -627,6 +877,7 @@ export const api = {
     get<FindingTrafficDetail>(
       `/exploration/findings/${id}/traffic/${bindingId}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
     ),
+  repeaterSend: (req: RepeaterSendRequest) => post<RepeaterSendResponse>("/repeater/send", req),
   findingTrafficBody: (
     id: string,
     bindingId: string,
@@ -644,7 +895,7 @@ export const api = {
     contextTask?: string,
   ) => {
     const token = getToken();
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
@@ -780,6 +1031,7 @@ export const api = {
     method = "",
     q = "",
     opts: {
+      taskId?: string;
       body?: string;
       path?: string;
       status?: string;
@@ -791,6 +1043,7 @@ export const api = {
   ) =>
     get<TrafficResp>(
       `/traffic?page=${page}&size=${size}` +
+        (opts.taskId ? `&task_id=${encodeURIComponent(opts.taskId)}` : "") +
         (host ? `&host=${encodeURIComponent(host)}` : "") +
         (method && method !== "all" ? `&method=${encodeURIComponent(method)}` : "") +
         (q ? `&q=${encodeURIComponent(q)}` : "") +
@@ -803,7 +1056,8 @@ export const api = {
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
-  trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
+  trafficHosts: (taskId?: string) =>
+    get<{ hosts: TrafficHost[] }>(`/traffic/hosts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
   // Purges every exchange and compacts the index; `reclaimed` is the bytes of
@@ -811,7 +1065,40 @@ export const api = {
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
   // ---- app settings (runtime toggles) ----
+  intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>
+    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`).then((page) => {
+      if (
+        !page ||
+        !Array.isArray(page.items) ||
+        !page.counts ||
+        typeof page.counts !== "object" ||
+        Array.isArray(page.counts) ||
+        !["credential", "lead", "sensitive_data"].every((kind) => {
+          const count = page.counts[kind as keyof typeof page.counts];
+          return Number.isSafeInteger(count) && count >= 0;
+        }) ||
+        !Number.isSafeInteger(page.total) ||
+        page.total < 0 ||
+        typeof page.enabled !== "boolean"
+      ) {
+        throw new ApiError("情报数据响应不完整，请刷新后重试", "intelligence_response_invalid");
+      }
+      return page;
+    }),
+  intelligenceDetail: (scope: "tasks" | "assets", id: string, intelligenceId: number) =>
+    get<TaskIntelligence>(`/${scope}/${id}/intelligence/${intelligenceId}`),
+  updateIntelligence: (taskId: number, intelligenceId: number, status: string) =>
+    patch<{ updated: boolean }>(`/tasks/${taskId}/intelligence/${intelligenceId}`, { status }),
+  retryCredentials: (taskId: number, intelligenceId: number) =>
+    post<{ queued: boolean }>(`/tasks/${taskId}/intelligence/${intelligenceId}/credentials/retry`),
+  credentialTraffic: (scope: "tasks" | "assets", scopeId: string, intelligenceId: number, trafficId: string) =>
+    get<CredentialTrafficDetail>(
+      `/${scope}/${scopeId}/intelligence/${intelligenceId}/traffic/${encodeURIComponent(trafficId)}`,
+    ),
   settings: () => get<Settings>(`/settings`),
+  basicAuthSettings: () => get<{ enabled: boolean; username: string; password_set: boolean }>("/settings/basic-auth"),
+  setBasicAuthSettings: (settings: { enabled: boolean; username: string; password: string }) =>
+    put<{ enabled: boolean; username: string; password_set: boolean }>("/settings/basic-auth", settings),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
@@ -819,14 +1106,56 @@ export const api = {
     web_search_proxy?: string;
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
+    deepseek_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
+
+  // global_proxy 传空=测直连；probe_url 省略=已保存地址，空串=默认，非空=临时覆盖。
+  testEgressProxy: (patch: { global_proxy?: string; probe_url?: string; resume?: boolean }) =>
+    post<EgressReport>(`/settings/proxy/test`, patch),
+  proxyPool: () =>
+    get<{ entries: ProxyPoolEntry[]; active_id: string; active_proxy: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool`,
+    ).then(normalizeProxyPool),
+  importProxyPool: (payload: Record<string, unknown>) =>
+    post<{
+      entries: ProxyPoolEntry[];
+      active_id: string;
+      switch_log: ProxySwitchLog[];
+      errors: Array<{ line: number; input: string; error: string }>;
+    }>(`/settings/proxy-pool/import`, payload).then((r) => ({ ...normalizeProxyPool(r), errors: arr(r.errors) })),
+  updateProxyPool: (id: string, payload: Partial<Pick<ProxyPoolEntry, "url" | "name" | "remark" | "enabled">>) =>
+    put<{ entry: ProxyPoolEntry }>(`/settings/proxy-pool/${encodeURIComponent(id)}`, payload),
+  deleteProxyPool: (id: string) => del<{ ok: boolean }>(`/settings/proxy-pool/${encodeURIComponent(id)}`),
+  testProxyPoolEntry: (id: string) =>
+    post<{ ok: boolean; result?: EgressReport["checks"][number]["result"] }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/test`,
+      {},
+    ),
+  testAllProxyPool: () =>
+    post<{ entries: ProxyPoolEntry[]; active_id: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool/test-all`,
+      {},
+    ).then(normalizeProxyPool),
+  activateProxyPool: (id: string) =>
+    post<{ ok: boolean; active_id: string; active_proxy: string }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/activate`,
+      {},
+    ),
+  testTaskProxy: (taskID: string) => post<{ ok: boolean; error?: string }>(`/tasks/${taskID}/proxy/test`, {}),
 
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
-  notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyMeta: () =>
+    get<NotificationMeta>(`/notify/meta`).then((meta) => {
+      // An empty demo/proxy response must enter the page's load-error path,
+      // rather than crash the render when it reads kinds.find or stats.
+      if (!meta || !Array.isArray(meta.kinds) || !meta.stats || !meta.defaults) {
+        throw new Error("通知配置响应不完整，请刷新后重试");
+      }
+      return meta;
+    }),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -866,7 +1195,7 @@ export const api = {
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
-    const r = await fetch(`/api/report${tq(task)}`, {
+    const r = await apiFetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`report: ${r.status}`);
@@ -894,7 +1223,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
+    const r = await apiFetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -1154,7 +1483,7 @@ export const api = {
     const fd = new FormData();
     fd.append("file", file);
     const token = getToken();
-    const r = await fetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
+    const r = await apiFetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
       method: "POST",
       body: fd,
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -1243,7 +1572,7 @@ export const api = {
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
     const token = getToken();
-    const r = await fetch("/api/intercept/tool-config", {
+    const r = await apiFetch("/api/intercept/tool-config", {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(await r.text());
@@ -1252,7 +1581,7 @@ export const api = {
   interceptSetToolConfig: async (enabledTools: string[]): Promise<void> => {
     if (MOCK) return;
     const token = getToken();
-    const r = await fetch("/api/intercept/tool-config", {
+    const r = await apiFetch("/api/intercept/tool-config", {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -1309,6 +1638,8 @@ export const api = {
   // 后端对 GitHub 的查询结果有 30 分钟缓存（未认证的 GitHub API 是 60 次/小时/IP，
   // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
   // 留给用户显式点「检查更新」时用。
+  getUpdateSettings: () => get<UpdateSettings>("/update/settings"),
+  saveUpdateSettings: (settings: UpdateSettings) => put<UpdateSettings>("/update/settings", settings),
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),

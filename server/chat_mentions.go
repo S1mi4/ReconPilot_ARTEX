@@ -17,10 +17,12 @@ const maxChatMentions = 10
 
 // The visible token survives drafts, uploads, retries and conversation history.
 // Labels are only for display: the server trusts only the type and numeric ID.
-var chatMentionPattern = regexp.MustCompile(`@\[(漏洞|资产|企业|接口|IP|应用|域名|子域名|服务)#([0-9]+)(?: [^\]\r\n]*)?\]`)
+var chatMentionPattern = regexp.MustCompile(`@\[(finding|asset|company|endpoint|ip|app|root_domain|subdomain|service|漏洞|资产|企业|接口|IP|应用|域名|子域名|服务)#([0-9]+)(?: [^\]\r\n]*)?\]`)
 var chatMentionKinds = map[string]string{
 	"漏洞": "finding", "资产": "asset", "企业": "company", "接口": "endpoint",
 	"IP": "ip", "应用": "app", "域名": "root_domain", "子域名": "subdomain", "服务": "service",
+	"finding": "finding", "asset": "asset", "company": "company", "endpoint": "endpoint",
+	"ip": "ip", "app": "app", "root_domain": "root_domain", "subdomain": "subdomain", "service": "service",
 }
 
 type chatMentionRef struct {
@@ -147,7 +149,36 @@ func loadChatMention(pg *db.DB, ref chatMentionRef) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"finding": f, "assets": assets}, nil
+		out := map[string]any{"finding": f, "assets": assets}
+		// Auto conversations opened from a finding must see the same three-layer
+		// topology that the coverage page renders. Keep this bounded so a large
+		// task does not turn every first question into an oversized context.
+		if f.TaskID != nil && *f.TaskID > 0 {
+			if graph, graphErr := pg.Assets().BuildCoverageGraph(*f.TaskID, 0); graphErr == nil {
+				type topologyNode struct {
+					Key, Kind, Label, Domain, IP, Zone, ZoneReason string
+					Port                                           int
+					Tested, InScope                                bool
+				}
+				counts := map[string]int{"internet": 0, "boundary": 0, "internal": 0}
+				nodes := make([]topologyNode, 0, 60)
+				for _, n := range graph.Nodes {
+					if _, ok := counts[n.Zone]; ok {
+						counts[n.Zone]++
+					}
+					if len(nodes) < 60 {
+						nodes = append(nodes, topologyNode{Key: n.Key, Kind: n.Kind, Label: n.Label,
+							Domain: n.Domain, IP: n.IP, Port: n.Port, Zone: n.Zone,
+							ZoneReason: n.ZoneReason, Tested: n.Tested, InScope: n.InScope})
+					}
+				}
+				out["asset_topology"] = map[string]any{
+					"zones": counts, "nodes": nodes,
+					"nodes_total": len(graph.Nodes), "truncated": len(graph.Nodes) > len(nodes),
+				}
+			}
+		}
+		return out, nil
 	case "company":
 		c, err := pg.Companies().GetCompany(ref.ID)
 		if err != nil || c == nil {

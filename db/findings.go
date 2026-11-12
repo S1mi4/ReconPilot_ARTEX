@@ -15,25 +15,29 @@ import (
 // DBFinding is a row in the standalone findings table. It persists across task
 // deletion unless the caller explicitly requests related finding cleanup.
 type DBFinding struct {
+	ExportCaseID    int64 // transient unified-export identity, never a finding handle
+	ExportMemberIDs []int64
+
 	TrafficCount          int
 	EvidenceVersion       int64
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
-	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
-	CreatedAt       time.Time
-	TaskDescription string // populated via LEFT JOIN on tasks
+	ID                   int64
+	TaskID               *int64
+	NodeID               *int64
+	VulnClass            string
+	Name                 string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity             string
+	Summary              string
+	Evidence             string
+	Worker               string
+	AssetIDs             []int64
+	Status               string
+	Report               string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	ReportConversationID *int64 `json:"report_conversation_id,omitempty"`
+	CreatedAt            time.Time
+	TaskDescription      string // populated via LEFT JOIN on tasks
 }
 
 // Finding triage states (findings.status).
@@ -103,9 +107,9 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 // findingSelectCols is the column list (with task_description join) every finding
 // list query selects, so scanFinding stays in sync across callers.
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
-	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
+		f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+	(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -147,15 +151,18 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 }
 
 // FindingFilter narrows a paginated findings query. Empty-string fields mean "no
-// filter on that column". Sort is "severity" (severity desc, then newest) or
-// anything else (newest first).
+// filter on that column". Sort is "severity" (severity desc, then time) or
+// anything else (time only). TimeDirection defaults to newest first.
 type FindingFilter struct {
-	Severity  string // high | medium | low
-	Status    string // pending | false_positive | ignored | resolved
-	VulnClass string
-	TaskID    string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
-	Query     string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
-	Sort      string // "severity" | "time"
+	Severity      string // high | medium | low
+	Status        string // pending | false_positive | ignored | resolved
+	VulnClass     string
+	TaskID        string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
+	Query         string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
+	Sort          string // "severity" | "time"
+	TimeDirection string // "asc" | "desc"; applies to time, not the severity ranking
+	From          string // RFC3339 timestamp, inclusive
+	To            string // RFC3339 timestamp, inclusive
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
@@ -164,6 +171,14 @@ type FindingFilter struct {
 	assetIDs  []int64 // 子树里所有资产 id
 	assetNone bool    // 只要「未关联资产」的发现
 	assetMiss bool    // 选中的节点在当前筛选下不存在 → 结果恒空
+}
+
+// timeOrder only returns SQL keywords from a fixed allowlist.
+func (f FindingFilter) timeOrder() string {
+	if f.TimeDirection == "asc" {
+		return "ASC"
+	}
+	return "DESC"
 }
 
 // FindingUnassignedTask is the task filter sentinel for findings whose task is
@@ -187,6 +202,18 @@ func (f FindingFilter) where() (string, []any) {
 	add("severity", f.Severity)
 	add("status", f.Status)
 	add("vulnclass", f.VulnClass)
+	if from := strings.TrimSpace(f.From); from != "" {
+		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
+			args = append(args, parsed)
+			conds = append(conds, fmt.Sprintf("f.created_at >= $%d", len(args)))
+		}
+	}
+	if to := strings.TrimSpace(f.To); to != "" {
+		if parsed, err := time.Parse(time.RFC3339, to); err == nil {
+			args = append(args, parsed)
+			conds = append(conds, fmt.Sprintf("f.created_at <= $%d", len(args)))
+		}
+	}
 	// task_id 是 bigint 列,按整数比较(不能走上面的文本 add);空/非法值忽略。
 	if f.TaskID == FindingUnassignedTask {
 		conds = append(conds, "(f.task_id IS NULL OR t.id IS NULL)")
@@ -256,10 +283,10 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 		return []*DBFinding{}, total, nil
 	}
 
-	order := "f.created_at DESC, f.id DESC"
+	order := "f.created_at " + f.timeOrder() + ", f.id DESC"
 	if f.Sort == "severity" {
-		// critical > high > medium > low > 其它, then newest first.
-		order = `CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, f.created_at DESC, f.id DESC`
+		// critical > high > medium > low > 其它, then the requested time direction.
+		order = `CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, ` + order
 	}
 	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	q := fmt.Sprintf(`
@@ -285,6 +312,7 @@ type FindingGroup struct {
 	TaskName        string    `json:"task_name"` // 可选任务名称;空=未命名
 	TaskDescription string    `json:"task_description"`
 	TaskStatus      string    `json:"task_status"`
+	TaskStopReason  string    `json:"task_stop_reason"`
 	Count           int       `json:"count"`
 	Critical        int       `json:"critical"`
 	High            int       `json:"high"`
@@ -309,7 +337,7 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 	}
 	where, args := f.where()
 	grouped := ` FROM findings f LEFT JOIN tasks t ON f.task_id=t.id` + where +
-		` GROUP BY t.id, t.name, t.description, t.status, t.paused, t.queued`
+		` GROUP BY t.id, t.name, t.description, t.status, t.paused, t.queued, t.stop_reason`
 
 	var groupTotal, findingTotal int
 	countQuery := `SELECT COUNT(*), COALESCE(SUM(finding_count),0) FROM (` +
@@ -321,9 +349,9 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 		return []FindingGroup{}, groupTotal, findingTotal, nil
 	}
 
-	order := "MAX(f.created_at) DESC, t.id DESC NULLS LAST"
+	order := "MAX(f.created_at) " + f.timeOrder() + ", t.id DESC NULLS LAST"
 	if f.Sort == "severity" {
-		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, MAX(f.created_at) DESC, t.id DESC NULLS LAST`
+		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, ` + order
 	}
 	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	query := fmt.Sprintf(`SELECT t.id, COALESCE(t.name,''), COALESCE(t.description,''), COALESCE(
@@ -332,7 +360,7 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 			WHEN t.queued THEN 'queued'
 			WHEN t.paused THEN 'paused'
 			ELSE t.status
-		END, ''),
+		END, ''), COALESCE(t.stop_reason,''),
 		COUNT(*),
 		COUNT(*) FILTER (WHERE f.severity='critical'),
 		COUNT(*) FILTER (WHERE f.severity='high'),
@@ -349,7 +377,7 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 	for rows.Next() {
 		var group FindingGroup
 		var taskID sql.NullInt64
-		if err := rows.Scan(&taskID, &group.TaskName, &group.TaskDescription, &group.TaskStatus, &group.Count,
+		if err := rows.Scan(&taskID, &group.TaskName, &group.TaskDescription, &group.TaskStatus, &group.TaskStopReason, &group.Count,
 			&group.Critical, &group.High, &group.Medium, &group.Low, &group.LastFoundAt); err != nil {
 			return nil, 0, 0, err
 		}
@@ -524,6 +552,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 // and vuln-class filter — computed server-side so it stays exact regardless of
 // pagination.
 type FindingStats struct {
+	Distinct *FindingDistinctStats `json:"distinct,omitempty"`
+
 	Total       int                 `json:"total"`
 	Pending     int                 `json:"pending"`
 	Critical    int                 `json:"critical"`
@@ -627,19 +657,56 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	return st, nil
 }
 
+// FilteredFindingStats uses the same row and asset filters as the findings list.
+// Options remain global so choosing a filter never removes other choices.
+// Counts cover matching hot rows, exactly like ListFindingCases; archive-only
+// aggregates cannot be filtered by record content and are not list results.
+func (d *DB) FilteredFindingStats(filter FindingFilter) (*FindingStats, error) {
+	st, err := d.FindingStats()
+	if err != nil {
+		return nil, err
+	}
+	filter, err = d.applyAssetScope(filter)
+	if err != nil {
+		return nil, err
+	}
+	where, args := filter.where()
+	st.Distinct = new(FindingDistinctStats)
+	err = d.QueryRow(`SELECT COUNT(*),
+		COUNT(*) FILTER (WHERE f.status='pending'),
+		COUNT(*) FILTER (WHERE f.severity='critical'),
+		COUNT(*) FILTER (WHERE f.severity='high'),
+		COUNT(*) FILTER (WHERE f.severity='medium'),
+		COUNT(*) FILTER (WHERE f.severity='low'),
+		COUNT(DISTINCT CASE WHEN m.case_id IS NULL THEN 'f:'||f.id ELSE 'c:'||m.case_id END)
+		FROM findings f LEFT JOIN tasks t ON t.id=f.task_id
+		LEFT JOIN finding_case_members m ON m.finding_id=f.id`+where, args...).Scan(
+		&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low, &st.Distinct.Total)
+	if err != nil {
+		return nil, err
+	}
+	// Severity buckets describe matching original reports, not a folder's rating.
+	st.Distinct.Reports = st.Total
+	st.Distinct.Critical, st.Distinct.High = st.Critical, st.High
+	st.Distinct.Medium, st.Distinct.Low = st.Medium, st.Low
+	st.Distinct.Unassessed = st.Total - st.Critical - st.High - st.Medium - st.Low
+	return st, nil
+}
+
 // GetFinding returns a single finding row (with task_description joined and the
 // full Markdown report), or nil when no row has that id. Unlike the list queries
 // it also selects `report` — that column is only needed on the detail page.
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
-	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
+	var reportConv sql.NullInt64
+	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, ''), f.report_conversation_id
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report, &reportConv)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -647,7 +714,49 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+	if reportConv.Valid {
+		f.ReportConversationID = &reportConv.Int64
+	}
+	if f.ReportConversationID == nil && strings.TrimSpace(f.Report) != "" {
+		if resolved, resolveErr := d.ResolveFindingReportConversation(f.ID); resolveErr == nil {
+			f.ReportConversationID = resolved
+		}
+	}
 	return f, nil
+}
+
+func (d *DB) SetFindingReportConversationID(findingID, conversationID int64) error {
+	_, err := d.Exec(`UPDATE findings SET report_conversation_id=$2 WHERE id=$1`, findingID, conversationID)
+	return err
+}
+
+// ResolveFindingReportConversation backfills links for reports generated before
+// report_conversation_id was persisted.
+func (d *DB) ResolveFindingReportConversation(findingID int64) (*int64, error) {
+	var id int64
+	err := d.QueryRow(`SELECT c.id FROM conversations c
+	JOIN conversation_activities a ON a.conversation_id=c.id
+	WHERE c.agent_key='reporter' AND (
+	 c.title = '漏洞报告 · finding#' || $1::text OR
+	 c.title ILIKE '%finding#' || $1::text || '%' OR
+	 a.detail ILIKE '%finding_id=' || $1::text || '%' OR
+	 a.detail ILIKE '%"finding_id":' || $1::text || '%'
+	)
+	ORDER BY CASE WHEN EXISTS (
+		SELECT 1 FROM conversation_activities r
+		WHERE r.conversation_id=c.id AND (r.tool='update_finding_report' OR r.summary ILIKE 'finding % report updated%')
+	) THEN 0 ELSE 1 END,
+	c.created_at ASC, c.id ASC LIMIT 1`, findingID).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := d.SetFindingReportConversationID(findingID, id); err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 // DeleteFinding removes a finding entirely: the standalone findings row and its

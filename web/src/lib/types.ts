@@ -4,8 +4,28 @@
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
+// Keep these limits aligned with db.MaxTaskRemarkRunes and db.MaxTaskWorkerCount.
+export const MAX_TASK_REMARK_RUNES = 2000;
+export const MAX_TASK_WORKER_COUNT = 50;
+
+// Parse the optional worker-count input without silently changing invalid values.
+// An empty field means 0 (use the global default); every other value must be an
+// integer in the backend's accepted range.
+export function parseWorkerCountInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (trimmed === "") return 0;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return null;
+  if (parsed < 0 || parsed > MAX_TASK_WORKER_COUNT) return null;
+  return parsed;
+}
+
 export interface Task {
+  numeric_id?: number; // Underlying numeric identity when demo route IDs use aliases.
+  distinct_findings?: FindingDistinctStats;
   id: string;
+  remark?: string;
+  worker_count?: number; // 本任务 Worker 数;0/缺省=用全局默认
   name?: string; // 可选任务名称;空/缺省=未命名,展示时回退到描述
   category_id?: number;
   category_name?: string;
@@ -14,12 +34,21 @@ export interface Task {
   description: string;
   goal: string;
   status: TaskStatus;
+  no_result_seconds?: number;
+  no_result_min_findings?: number;
+  no_result_min_severity?: "" | "low" | "medium" | "high" | "critical";
+  stop_reason?: string;
   created_at: string;
-  created_unix?: number; // created_at as unix seconds (run-duration calc)
+  created_unix?: number;
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
   completed_unix?: number; // completed_at as unix seconds (0/undef if unfinished)
   last_activity_unix?: number; // unix seconds of the last activity (0/undef if none)
+  run_seconds?: number; // backend-computed active runtime seconds
+  active_run_seconds?: number; // completed running segments in seconds
+  run_segment_started_unix?: number; // current running segment start; 0 when inactive
   paused?: boolean;
+  pause_reason?: string;
+  reconnect?: { attempt: number; max: number; next_at?: number; exhausted: boolean; last_error?: string };
   queued?: boolean;
   active?: boolean;
   in_flight?: number;
@@ -38,6 +67,7 @@ export interface Task {
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
+  share_global_assets?: boolean; // opt-in global asset visibility; default false
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
 }
 
@@ -54,8 +84,10 @@ export interface TaskTemplate {
   name: string;
   description: string;
   goal: string;
+  remark?: string; // 预设备注
   category_id?: number | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
+  worker_count?: number; // 预设 Worker 数;0/缺省=用全局默认
   created_at: string;
   updated_at: string;
 }
@@ -303,6 +335,8 @@ export interface CoverageGraphNode {
   app_name?: string;
   page_title?: string;
   status_code?: number;
+  zone?: "internet" | "boundary" | "internal";
+  zone_reason?: string;
 }
 
 export interface CoverageGraphEdge {
@@ -489,6 +523,7 @@ export interface FindingAsset {
 }
 
 export interface Finding {
+  case_id?: string;
   traffic_count?: number;
   evidence_version?: number;
   report_evidence_version?: number;
@@ -502,6 +537,7 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  report_conversation_id?: number;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -525,6 +561,7 @@ export interface FindingGroup {
   task_name?: string; // 可选任务名称;空/缺省=未命名
   task_description: string;
   task_status: string;
+  task_stop_reason?: string;
   count: number;
   critical: number;
   high: number;
@@ -548,8 +585,9 @@ export interface FindingDeepenResponse {
   queued: boolean;
 }
 
-// FindingStats 是发现全表聚合(统计卡 + 漏洞类型下拉),服务端计算,不受分页影响。
+// FindingStats 的计数跟随列表筛选，不受分页影响；类型和任务选项保留全局范围。
 export interface FindingStats {
+  distinct?: FindingDistinctStats;
   total: number;
   pending: number;
   critical: number;
@@ -579,6 +617,9 @@ export interface FindingQuery {
   task?: string; // 任务 id;"all"/空 = 不按任务筛选
   query?: string;
   sort?: "severity" | "time";
+  timeDirection?: "asc" | "desc"; // Missing = newest first; secondary to severity when sort="severity".
+  from?: string; // ISO timestamp, inclusive
+  to?: string; // ISO timestamp, inclusive
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
   assetScope?: string;
 }
@@ -710,6 +751,39 @@ export interface AgentTrigger {
   task_create_message: string;
   tool_names: string[]; // on_tool_call 选中的工具 key(至少一个)
   last_fire?: string;
+}
+
+export interface TaskSchedule {
+  id: number;
+  name: string;
+  remark?: string;
+  enabled: boolean;
+  timezone_mode: "beijing" | "system";
+  timezone?: string;
+  schedule_type: "once" | "weekly";
+  run_date?: string;
+  end_date?: string;
+  weekdays: number[];
+  start_time: string;
+  end_time?: string;
+  start_immediately: boolean;
+  status: "waiting" | "running" | "outside" | "completed" | "error" | "paused";
+  last_window_key?: string;
+  last_transition_at?: string;
+  last_error?: string;
+  next_start?: string;
+  next_end?: string;
+  run_count?: number;
+  last_run_at?: string;
+  task_ids: number[];
+  history?: Array<{
+    id: number;
+    task_id?: number;
+    action: string;
+    success: boolean;
+    message: string;
+    created_at: string;
+  }>;
 }
 
 // ---- Conversations (chat page) ----
@@ -910,6 +984,17 @@ export interface TrafficHost {
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
+  /** 是否向可见 Agent 暴露浏览器 MCP 的截图工具。默认关闭。 */
+  browser_screenshot_enabled?: boolean;
+  /** 是否在报告截图右上角显示截图保存时间。默认关闭。 */
+  browser_screenshot_timestamp_enabled?: boolean;
+  /** 是否向 Agent 注入统一 OPSEC 准则。默认关闭。 */
+  opsec_enabled?: boolean;
+  credential_agent_enabled: boolean;
+  credential_traffic_binding: boolean;
+  task_intelligence_enabled: boolean; // 默认关闭；关闭不注入情报工具或提示
+  task_auto_title_enabled: boolean; // Agent 创建任务时自动生成任务名称
+  chat_auto_title_enabled: boolean; // 对话首条消息后自动生成会话标题
   agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
@@ -918,16 +1003,33 @@ export interface Settings {
   web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
+  deepseek_search_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
+  deepseek_search_api_key?: string;
   // 独立出口代理(http/https/socks5)，用于访问搜索端点；与记录流量的 MITM 代理无关。空=直连。
   web_search_proxy?: string;
   // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
+  proxy_pool?: ProxyPoolEntry[];
+  proxy_pool_active_id?: string;
+  proxy_pool_switch_log?: ProxySwitchLog[];
+  proxy_rotate_timed_enabled?: boolean;
+  proxy_rotate_interval_seconds?: number;
+  proxy_rotate_on_failure?: boolean;
+  proxy_rotate_strategy?: "sequential" | "random";
+  proxy_health_fail_threshold?: number;
+  proxy_health_cooldown_seconds?: number;
+  proxy_health_check_interval_seconds?: number;
+  proxy_reconnect_max_attempts?: number;
+  proxy_reconnect_interval_seconds?: number;
+  show_egress_ip?: boolean; // 在顶栏显示直连 / 全局代理出口 IP；默认关闭
+  egress_probe_url?: string; // 自定义 IP 探测服务；空=默认公共回显服务
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
   workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  worker_pools: WorkerPool[];
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
@@ -947,6 +1049,32 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+}
+
+export interface ProxyPoolEntry {
+  id: string;
+  url: string;
+  name?: string;
+  remark?: string;
+  enabled: boolean;
+  egress_ip?: string;
+  latency_ms?: number;
+  last_error?: string;
+  last_checked_at?: string;
+  consecutive_failures: number;
+  health: "healthy" | "unhealthy-cooling" | "disabled" | string;
+}
+
+export interface ProxySwitchLog {
+  at: string;
+  from: string;
+  to: string;
+  reason: string;
+}
+
+export interface WorkerPool {
+  profile_id: string;
+  workers: number;
 }
 
 // ---- 漏洞 IM 推送 ----
@@ -1026,7 +1154,7 @@ export interface NotificationDelivery {
 export interface LLMProfile {
   id: string;
   name: string;
-  format: "openai" | "anthropic" | "openai-responses";
+  format: "openai" | "anthropic" | "openai-responses" | "jev";
   base_url?: string;
   proxy?: string;
   model: string;
@@ -1249,6 +1377,23 @@ export interface Stats {
   active_task?: Partial<Task>;
 }
 
+export interface SystemMetricValue {
+  used_bytes: number;
+  total_bytes: number;
+  percent: number;
+}
+
+export interface SystemMetrics {
+  scope: "container" | "unsupported" | string;
+  supported: boolean;
+  timestamp: string;
+  container_metrics: boolean;
+  cpu: SystemMetricValue;
+  memory: SystemMetricValue;
+  disk: SystemMetricValue;
+  data_disk: SystemMetricValue;
+}
+
 // ---- Intercept Rules ----
 export type InterceptAction = "allow" | "deny" | "ask";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
@@ -1306,7 +1451,7 @@ export interface AssetInterceptRule {
 }
 
 export interface InterceptPending {
-  decision_source?: "rule" | "model" | "unknown" | "";
+  decision_source?: "rule" | "model" | "manual" | "unknown" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1326,10 +1471,14 @@ export interface JudgeConfig {
   enabled: boolean;
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
-  timeout_seconds: number; // 模型调用超时
+  timeout_seconds: number; // 每次模型审批调用的超时
+  retry_count: number; // 审批失败后的额外重试次数，0 = 不重试
+  retry_interval_ms: number; // 审批重试间隔（毫秒），0 = 立即重试
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  incomplete_script_action: "ask" | "model"; // 脚本快照不完整时：人工审查或继续模型审查
+  confidence_threshold: number; // Jev 置信度低于此值时转人工
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。
@@ -1350,7 +1499,10 @@ export interface JudgeUsage {
 
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
-  decision_source?: "rule" | "model" | "unknown";
+  decision_source?: "rule" | "model" | "manual" | "unknown";
+  q?: string;
+  from?: string;
+  to?: string;
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1445,6 +1597,17 @@ export interface LLMTask {
 // The exact JSON sent to the review model, retained for all model verdicts.
 export interface InterceptReviewInput {
   version: number;
+  script_capture_status?: "not_applicable" | "complete" | "incomplete";
+  script_files?: {
+    path: string;
+    source?: "file" | "command";
+    sha256?: string;
+    bytes?: number;
+    content?: string;
+    complete?: boolean;
+    truncated?: boolean;
+    read_error?: string;
+  }[];
   background?: {
     // worker_summary is retained only for immutable v2/v3 snapshots.
     source: "user_message" | "worker_summary";
@@ -1561,6 +1724,34 @@ export interface FindingTrafficDetail {
   response: EvidenceBodyPreview;
 }
 
+export interface RepeaterSendRequest {
+  method: string;
+  http_version?: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeout_ms?: number;
+  insecure_skip_verify?: boolean;
+  use_recording_proxy?: boolean;
+}
+
+export interface RepeaterSendResponse {
+  status: number;
+  status_text: string;
+  proto: string;
+  headers: Record<string, string[]>;
+  body: string;
+  body_truncated: boolean;
+  body_bytes: number;
+  elapsed_ms: number;
+  url: string;
+  error?: string;
+}
+
+export interface UpdateSettings {
+  proxy: string;
+}
+
 /** GET /api/update/check —— 当前版本与 GitHub 最新正式版的比较结果。 */
 export interface UpdateCheck {
   /** 当前运行的版本；开发构建为 "dev" 或 git describe 的带后缀形式。 */
@@ -1609,4 +1800,200 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+export interface FindingDistinctStats {
+  total: number;
+  reports: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  unassessed: number;
+}
+export interface FindingCase {
+  id: string;
+  task_id: string | null;
+  title: string;
+  reason: string;
+  severity: Severity | "";
+  severity_reason: string;
+  report?: string;
+  version: number;
+  report_version: number;
+  active: boolean;
+  count: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  created_at: string;
+}
+export interface FindingCaseListRow {
+  task_name?: string;
+  task_description?: string;
+  assets?: FindingAsset[];
+  asset_count?: number;
+  last_found_at?: string;
+  case?: FindingCase | null;
+  finding?: Finding;
+  matched_ids: number[];
+}
+export interface FindingCasePage {
+  matching_reports?: number;
+  items: FindingCaseListRow[];
+  total: number;
+  page: number;
+  page_size: number;
+  stats: FindingDistinctStats;
+}
+export interface FindingCaseEvent {
+  id: string;
+  action: string;
+  actor: string;
+  reason: string;
+  finding_ids: number[];
+  created_at: string;
+}
+export interface FindingCaseDetail {
+  case: FindingCase;
+  events: FindingCaseEvent[];
+}
+export interface FindingCaseSuggestion {
+  id: string;
+  task_id: string;
+  left_id: string;
+  right_id: string;
+  finding_ids: string[];
+  title: string;
+  reason: string;
+  state: string;
+}
+export interface FindingCaseReviewRun {
+  conversation_id: number;
+  task_id: string;
+  state: "queued" | "running" | "done" | "failed";
+  error: string;
+}
+
+export type IntelligenceKind = "credential" | "lead" | "sensitive_data";
+export interface CredentialAccount {
+  label?: string;
+  username?: string;
+  password?: string;
+  token?: string;
+  cookie?: string;
+  endpoint?: string;
+  protocol?: string;
+}
+export interface CredentialTraffic {
+  id: string;
+  url: string;
+  method: string;
+  status: number;
+  side: string;
+  excerpt: string;
+  accounts: number[];
+}
+export interface CredentialAnalysis {
+  state: "queued" | "processing" | "ready" | "error";
+  method?: "rules" | "agent";
+  accounts: CredentialAccount[] | null;
+  traffic: CredentialTraffic[] | null;
+  traffic_state: string;
+  traffic_note?: string;
+  note?: string;
+  error?: string;
+  model?: string;
+  input_tokens: number;
+  output_tokens: number;
+  processed_at?: string;
+}
+export interface CredentialTrafficDetail {
+  reference: CredentialTraffic;
+  req?: string;
+  resp?: string;
+  unavailable: boolean;
+}
+export interface TaskIntelligence {
+  credentials?: CredentialAnalysis;
+  source_session?: string;
+  id: number;
+  task_id: number;
+  node_id?: number;
+  kind: IntelligenceKind;
+  title: string;
+  content: string;
+  evidence: string;
+  confidence: "observed" | "inferred";
+  status: string;
+  asset_ids: number[];
+  worker: string;
+  created_at: string;
+  updated_at: string;
+  inherited: boolean;
+}
+export interface IntelligencePage {
+  credential_agent_enabled: boolean;
+  credential_traffic_binding: boolean;
+  items: TaskIntelligence[];
+  total: number;
+  counts: Record<IntelligenceKind, number>;
+  enabled: boolean;
+}
+
+// ---- 出口代理连通性测试（POST /api/settings/proxy/test）----
+export interface EgressProbeResult {
+  ok: boolean;
+  exit_ip?: string;
+  via?: "direct" | "http" | "https" | "socks5";
+  via_label?: string;
+  latency_ms: number;
+  error?: string;
+  // 每个地址的明细：区分"连不上代理"和"代理通但出不了网"。
+  probes: {
+    url: string;
+    ok: boolean;
+    ip?: string;
+    latency_ms: number;
+    error?: string;
+  }[];
+}
+
+// 报告里的一行：① 直连 / ② 经全局代理。
+export interface EgressCheck {
+  key: "direct" | "global";
+  label: string;
+  path?: string;
+  skipped?: boolean;
+  skip_reason?: string;
+  skip_code?: string;
+  result: EgressProbeResult;
+}
+
+export interface EgressReport {
+  ok: boolean;
+  capture: boolean;
+  configured: string;
+  // agent_proxy 是 Agent 实际使用的代理地址：捕获开时是流量捕获的地址，不是输入框里的值。
+  agent_proxy: string;
+  checks: EgressCheck[];
+  warnings?: string[];
+  warning_details?: { code: string; params?: Record<string, unknown>; message: string }[];
+}
+
+// Task-relative, read-only file browser.
+export interface TaskFileEntry extends WorkspaceEntry {
+  symlink: boolean;
+  intent_id?: number;
+  intent_title?: string;
+  intent_state?: string;
+}
+export interface TaskFileListing {
+  path: string;
+  entries: TaskFileEntry[];
+  total: number;
+  size: number;
+  truncated: boolean;
+  missing: boolean;
 }

@@ -300,7 +300,7 @@ func (s *AssetStore) CoverageEnabled(taskID int64) bool {
 }
 
 // task_scope→assets match predicate, reused by the count / by-type / untested queries. $1=taskID.
-const covTargetCTE = `
+const covTargetCTE = directTaskContextCTE + taskAssetVisibilityCTE + `,
 target AS (
   SELECT DISTINCT a.id, a.type,
          COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
@@ -315,6 +315,7 @@ target AS (
          OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
        ))
   )
+  WHERE a.id IN (SELECT id FROM visible_assets)
 ),
 tested AS (
   SELECT DISTINCT ea.asset_id
@@ -381,6 +382,8 @@ type CoverageGraphNode struct {
 	AppName     string `json:"app_name,omitempty"`
 	PageTitle   string `json:"page_title,omitempty"`
 	StatusCode  int    `json:"status_code,omitempty"`
+	Zone        string `json:"zone,omitempty"` // internet|boundary|internal
+	ZoneReason  string `json:"zone_reason,omitempty"`
 }
 
 // CoverageGraphEdge is a child→parent containment link (endpoint→service→
@@ -416,6 +419,45 @@ func hostPortOf(n *CoverageGraphNode) (string, int) {
 	return host, port
 }
 
+// coverageZone assigns a conservative, evidence-based network layer. Public
+// domains and public IPs are internet-facing; services/apps/endpoints with a
+// public host are boundary exposure; private-address assets are internal.
+// Asset kind alone is not sufficient: a public endpoint must not be placed in
+// the internal zone merely because its kind is "endpoint".
+func coverageZone(n *CoverageGraphNode) {
+	if n == nil {
+		return
+	}
+	host := strings.TrimSpace(n.IP)
+	if host == "" {
+		host = strings.TrimSpace(n.Domain)
+	}
+	if host == "" && n.URL != "" {
+		parsed, _, _ := parseURL(normalizeURL(n.URL))
+		host = parsed
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			n.Zone, n.ZoneReason = "internal", "私有、回环或链路本地地址"
+			return
+		}
+	}
+	switch n.Kind {
+	case "company", "root_domain", "subdomain":
+		n.Zone, n.ZoneReason = "internet", "公网域名或外部入口"
+	case "service", "app", "endpoint":
+		if host != "" {
+			n.Zone, n.ZoneReason = "boundary", "存在可访问的域名、IP或URL暴露面"
+		} else {
+			n.Zone, n.ZoneReason = "internal", "未发现公网主机证据，按业务资产处理"
+		}
+	case "ip":
+		n.Zone, n.ZoneReason = "internet", "未识别为私有地址的IP入口"
+	default:
+		n.Zone, n.ZoneReason = "internal", "按业务资产默认归类"
+	}
+}
+
 // BuildCoverageGraph assembles the full coverage graph for a task and its direct
 // read-only sources: every in-scope asset plus connector root domains/companies,
 // with current-or-source fact anchors reflected in Tested. The legacy expID
@@ -447,6 +489,9 @@ ORDER BY a.id`, taskID)
 	companyIDs := map[int64]bool{} // referenced company ids (need a node)
 
 	add := func(n CoverageGraphNode) *CoverageGraphNode {
+		if n.Zone == "" {
+			coverageZone(&n)
+		}
 		if _, ok := byKey[n.Key]; ok {
 			return byKey[n.Key]
 		}
@@ -510,8 +555,8 @@ ORDER BY a.id`, taskID)
 	}
 	for root := range missingRoots {
 		var id, companyID int64
-		err := s.db.QueryRow(`SELECT id, COALESCE(company_id,0) FROM assets
-WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
+		err := s.db.QueryRow(`WITH `+scopeTargetCTE+` SELECT id, COALESCE(company_id,0) FROM assets
+WHERE type='root_domain' AND domain=$2 AND id IN (SELECT id FROM target) LIMIT 1`, taskID, root).Scan(&id, &companyID)
 		var node CoverageGraphNode
 		if err == nil && id > 0 {
 			node = CoverageGraphNode{Key: assetKey(id), Kind: "root_domain", AssetID: id,
@@ -570,7 +615,12 @@ WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
 				link(n.Key, companyKey(n.CompanyID))
 			}
 		case "service":
-			link(n.Key, firstOf(subByDomain[n.Domain], ipByAddr[n.IP], rootByDomain[n.RootDomain]))
+			host, _ := hostPortOf(n)
+			link(n.Key, firstOf(
+				subByDomain[n.Domain], subByDomain[host],
+				ipByAddr[n.IP], ipByAddr[host],
+				rootByDomain[n.RootDomain],
+			))
 		case "endpoint":
 			host, port := hostPortOf(n)
 			parent := firstOf(

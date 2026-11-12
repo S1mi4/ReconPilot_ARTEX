@@ -1,6 +1,10 @@
 package db
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"sort"
+)
 
 // Settings is a tiny key-value store for global app config the UI toggles at
 // runtime (e.g. traffic_capture). Missing keys fall back to caller defaults.
@@ -19,10 +23,41 @@ func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
 
 // SetSetting upserts a setting value.
 func (d *DB) SetSetting(key, value string) error {
-	_, err := d.Exec(`
+	return d.SetSettingContext(context.Background(), key, value)
+}
+
+// SetSettingContext upserts a setting and respects cancellation or a deadline.
+func (d *DB) SetSettingContext(ctx context.Context, key, value string) error {
+	_, err := d.ExecContext(ctx, `
 INSERT INTO settings(key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, value)
 	return err
+}
+
+// SetSettingsAtomic upserts several settings in one transaction. Keys are
+// sorted so concurrent callers acquire row locks in a deterministic order.
+func (d *DB) SetSettingsAtomic(ctx context.Context, values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // commit makes this a no-op
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, values[key]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // InsertSettingIfAbsent 只在 key 尚未存在时写入，已存在则原样保留并返回 inserted=false。

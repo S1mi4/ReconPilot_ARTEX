@@ -63,6 +63,14 @@ const severity: Record<string, StatusMeta> = {
   low: { label: "低危", tone: "slate" },
 };
 
+export const SEVERITY_FILTER_OPTIONS = [
+  ["all", "全部"],
+  ["critical", severity.critical.label],
+  ["high", severity.high.label],
+  ["medium", severity.medium.label],
+  ["low", severity.low.label],
+] as const;
+
 const finding: Record<string, StatusMeta> = {
   pending: { label: "待处理", tone: "amber" },
   in_progress: { label: "处理中", tone: "blue" },
@@ -109,7 +117,15 @@ const delivery: Record<string, StatusMeta> = {
   skipped: { label: "已跳过", tone: "neutral" },
 };
 
+// Intelligence category colors are shared by task, asset and detail views.
+const intelligence: Record<string, StatusMeta> = {
+  credential: { label: "凭据", tone: "violet" },
+  lead: { label: "重要线索", tone: "blue" },
+  sensitive_data: { label: "敏感数据", tone: "amber" },
+};
+
 const maps = {
+  intelligence,
   intent,
   task,
   severity,
@@ -123,6 +139,8 @@ const maps = {
 
 export type StatusDomain = keyof typeof maps;
 
-export function statusMeta(domain: StatusDomain, key: string): StatusMeta {
-  return maps[domain][key] ?? { label: key, tone: "neutral" };
+export function statusMeta(domain: StatusDomain, key: string, translate?: (key: string) => string): StatusMeta {
+  const meta = maps[domain][key];
+  if (!meta) return { label: key, tone: "neutral" };
+  return { ...meta, label: translate ? translate(`status.${domain}.${key}`) : meta.label };
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/Autumn-27/norma/llm"
 )
 
 const (
@@ -102,6 +103,10 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.LLMProfileID != nil {
+		if p, err := pg.ProfileByID(*req.LLMProfileID); err == nil && p != nil && p.Format == "jev" {
+			writeErr(w, 400, db.ErrJevProfileJudgeOnly.Error())
+			return
+		}
 		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
@@ -135,6 +140,10 @@ func (s *Server) pgUpdateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.LLMProfileID != nil {
+		if p, err := pg.ProfileByID(*req.LLMProfileID); err == nil && p != nil && p.Format == "jev" {
+			writeErr(w, 400, db.ErrJevProfileJudgeOnly.Error())
+			return
+		}
 		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
@@ -446,6 +455,60 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 			title = "附件消息"
 		}
 		_ = pg.RenameConversation(c.ID, title)
+		if s.m.pg.GetBool(db.SettingChatAutoTitle, false) {
+			conversationID := c.ID
+			agentKey := c.AgentKey
+			pinnedProfile := c.LLMProfileID
+			promptContent := msg
+			if len(req.Attachments) > 0 {
+				var names []string
+				for _, attachment := range req.Attachments {
+					if name := strings.TrimSpace(attachment.Name); name != "" {
+						names = append(names, name)
+					}
+				}
+				if len(names) > 0 {
+					if promptContent != "" {
+						promptContent += "\n"
+					}
+					promptContent += "附件：" + strings.Join(names, "、")
+				}
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				profileID := s.effectiveProfileForAgent(agentKey, pinnedProfile)
+				var prov llm.Provider
+				providerOK := false
+				if profileID != nil {
+					prov, _, providerOK = s.providerForProfile(*profileID)
+				}
+				if !providerOK {
+					if active, activeErr := s.m.pg.ActiveProfile(); activeErr == nil && active != nil {
+						profileID = &active.ID
+						prov, _, providerOK = s.providerForProfile(active.ID)
+					} else if activeErr != nil {
+						log.Printf("[auto-title] conversation %d active profile lookup failed: %v", conversationID, activeErr)
+					}
+				}
+				if profileID == nil || !providerOK || prov == nil {
+					log.Printf("[auto-title] conversation %d: no effective profile", conversationID)
+					return
+				}
+				generated, err := agent.GenerateAutoTitle(ctx, prov, promptContent)
+				if err != nil {
+					log.Printf("[auto-title] conversation %d: %v", conversationID, err)
+					return
+				}
+				if !autoTitleIsUsable(generated) {
+					log.Printf("[auto-title] conversation %d: generated title is empty or placeholder", conversationID)
+					return
+				}
+				if err := s.m.pg.RenameConversationIfTitle(conversationID, generated, title); err != nil {
+					log.Printf("[auto-title] conversation %d rename failed: %v", conversationID, err)
+				}
+			}()
+		}
 	}
 	_ = pg.TouchConversation(c.ID)
 
@@ -456,6 +519,16 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	baseDir := filepath.Join(s.m.dir, "sessions", busyKey)
 	s.runConversation(c, composeAgentMessage(agentMessage, req.Attachments, baseDir), busyKey, msg)
 	writeJSON(w, 202, map[string]any{"status": "accepted"})
+}
+
+// autoTitleMayReplace protects a user's later rename while allowing the
+// asynchronous title completion to replace the initial placeholder/preview.
+func autoTitleMayReplace(current, initial string) bool {
+	return current == "" || current == "新对话" || current == initial
+}
+
+func autoTitleIsUsable(generated string) bool {
+	return generated != "" && generated != "新对话"
 }
 
 // runConversation runs ONE agent turn on a conversation in a background goroutine
@@ -503,7 +576,35 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	}()
 	// Only the first turn executes a historical retest. Follow-up conversation
 	// turns may explain the sealed result; the result tool refuses to overwrite it.
-	finishStatus, finishReason := "failed", "复测未能启动"
+	finishStatus, finishReason := "failed", "Agent 未能启动"
+	if c.AgentKey == "reporter" {
+		manualReview, err := s.isHistoricalFindingReview(c.ID)
+		if err != nil {
+			finishReason = err.Error()
+			_, _ = s.m.pg.Exec(`UPDATE finding_case_review_runs SET state='failed',error=$2 WHERE conversation_id=$1`, c.ID, finishReason)
+			return
+		}
+		if manualReview {
+			ctx = agent.WithFindingCaseReview(ctx)
+		}
+		defer func() {
+			state := "done"
+			reason := ""
+			if finishStatus != "completed" || ctx.Err() != nil {
+				state = "failed"
+				reason = finishReason
+				if ctx.Err() != nil {
+					reason = "整理已停止或服务关闭"
+				}
+			}
+			if state == "done" && manualReview {
+				if err := s.validateFindingReviewCompletion(c.ID); err != nil {
+					state, reason = "failed", err.Error()
+				}
+			}
+			_, _ = s.m.pg.Exec(`UPDATE finding_case_review_runs SET state=$2,error=$3 WHERE conversation_id=$1 AND state='running'`, c.ID, state, reason)
+		}()
+	}
 	if c.AgentKey == db.FindingRetestAgentKey {
 		// Read without the run cancellation so an immediate stop still seals pending.
 		r, err := s.m.pg.FindingRetestForConversation(context.Background(), c.ID)
@@ -608,15 +709,38 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 // merging by task / all / none); parallel → run each fire in its own concurrent
 // conversation up to trigger_max_parallel. Distinct agents always run concurrently.
 func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string) {
+	s.startTriggeredRun(agentKey, title, message, taskID, mergeable, taskDesc, taskGoal, 0)
+}
+
+func (s *Server) StartTriggeredRunWithConversation(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string, conversationID int64) {
+	s.startTriggeredRun(agentKey, title, message, taskID, mergeable, taskDesc, taskGoal, conversationID)
+}
+
+func (s *Server) startTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string, conversationID int64) {
 	if s.m.pg == nil || s.chatAgentRef() == nil {
 		return
+	}
+	// A trigger body can outlive a prompt/trigger migration when it was queued
+	// before a restart. Never let the retired structured-reproduction contract
+	// enter a new reporter conversation; keep the tool event context after the
+	// marker so the report still has the original finding payload.
+	if agentKey == "reporter" && strings.Contains(message, "update_finding_reproduction") {
+		message = normalizeReporterTriggerMessage(message)
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
 	s.queueMu.Lock()
 	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{conversationID: conversationID, agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
+}
+
+func normalizeReporterTriggerMessage(message string) string {
+	const marker = "【本次由工具调用触发】"
+	if i := strings.Index(message, marker); i >= 0 {
+		return reporterToolCallMessage + message[i:]
+	}
+	return reporterToolCallMessage
 }
 
 // pumpLocked launches queued fires for one agent up to its concurrency limit, then
@@ -668,11 +792,17 @@ func (s *Server) runAndPump(agentKey string, item triggeredRun) {
 // Caller holds queueMu.
 func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredRun {
 	q := s.triggerQ[agentKey]
-	if cfg.runMode == "parallel" || cfg.mergeMode == "none" {
+	if q[0].conversationID > 0 || cfg.runMode == "parallel" || cfg.mergeMode == "none" {
 		s.triggerQ[agentKey] = q[1:]
 		return q[0]
 	}
-	if cfg.mergeMode == "all" {
+	hasManual := false
+	for _, item := range q {
+		if item.conversationID > 0 {
+			hasManual = true
+		}
+	}
+	if cfg.mergeMode == "all" && !hasManual {
 		s.triggerQ[agentKey] = q[:0:0]
 		return mergeAllRuns(q)
 	}
@@ -685,7 +815,7 @@ func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredR
 	group := []triggeredRun{head}
 	rest := q[:0:0] // keep non-matching items in order
 	for _, it := range q[1:] {
-		if it.mergeable && it.taskID == head.taskID {
+		if it.conversationID == 0 && it.mergeable && it.taskID == head.taskID {
 			group = append(group, it)
 		} else {
 			rest = append(rest, it)
@@ -798,12 +928,25 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 func (s *Server) runTriggeredRun(item triggeredRun) {
 	defer func() {
 		if r := recover(); r != nil {
+			if item.conversationID > 0 {
+				_, _ = s.m.pg.Exec(`UPDATE finding_case_review_runs SET state='failed',error=$2 WHERE conversation_id=$1`, item.conversationID, fmt.Sprint(r))
+			}
 			log.Printf("[trigger] run for %s panicked: %v", item.agentKey, r)
 		}
 	}()
 	pg := s.m.pg
-	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
-	if err != nil {
+	var c *db.Conversation
+	var err error
+	if item.conversationID > 0 {
+		c, err = pg.GetConversation(item.conversationID)
+		_, _ = pg.Exec(`UPDATE finding_case_review_runs SET state='running' WHERE conversation_id=$1`, item.conversationID)
+	} else {
+		c, err = pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+	}
+	if err != nil || c == nil {
+		if item.conversationID > 0 {
+			_, _ = pg.Exec(`UPDATE finding_case_review_runs SET state='failed',error='整理会话不可用' WHERE conversation_id=$1`, item.conversationID)
+		}
 		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
 		return
 	}

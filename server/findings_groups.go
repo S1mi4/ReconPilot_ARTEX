@@ -33,10 +33,13 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Status:    normFilter(q.Get("status")),
 		VulnClass: normFilter(q.Get("vulnclass")),
 		// task_id(独立于会切到「按任务节点」分支的 task 参数):全局表按任务筛选。
-		TaskID:     normFilter(q.Get("task_id")),
-		Query:      q.Get("q"),
-		Sort:       q.Get("sort"),
-		AssetScope: strings.TrimSpace(q.Get("asset_scope")),
+		TaskID:        normFilter(q.Get("task_id")),
+		Query:         q.Get("q"),
+		Sort:          q.Get("sort"),
+		TimeDirection: q.Get("time_direction"),
+		From:          strings.TrimSpace(q.Get("from")),
+		To:            strings.TrimSpace(q.Get("to")),
+		AssetScope:    strings.TrimSpace(q.Get("asset_scope")),
 	}
 }
 
@@ -73,7 +76,9 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if task, ok := s.m.Task(i64s(*groups[i].TaskID)); ok {
-				groups[i].TaskStatus = s.resolvedTaskStatus(task)
+				state := task.lifecycleSnapshot()
+				groups[i].TaskStatus = s.resolvedTaskStatusFromSnapshot(task, state)
+				groups[i].TaskStopReason = state.StopReason
 			}
 		}
 	}

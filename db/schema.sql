@@ -362,7 +362,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
-    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses')),
+    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','jev')),
     base_url         TEXT,
     proxy            TEXT,
     model            TEXT NOT NULL,
@@ -415,11 +415,11 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL 
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
 -- 流式开关；补旧库。默认 true = 保持既有的流式行为，旧配置无感升级。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS streaming    BOOLEAN NOT NULL DEFAULT true;
--- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)；补旧库。
+-- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)和 Jev System One；补旧库。
 -- 每次启动执行,幂等:先删旧 CHECK 再建含三值的新 CHECK。
 ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_format_check;
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_format_check
-    CHECK (format IN ('openai','anthropic','openai-responses'));
+    CHECK (format IN ('openai','anthropic','openai-responses','jev'));
 
 -- 输出上限及其字段名；补旧库。默认 0 / '' = 不发送上限、沿用 max_tokens 字段名，
 -- 旧配置行为完全不变。
@@ -513,6 +513,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status         TEXT NOT NULL DEFAULT 'created'
                      CHECK (status IN ('created','running','paused','done','failed','timeout')),
     paused         BOOLEAN NOT NULL DEFAULT false,
+    pause_reason   TEXT NOT NULL DEFAULT '',
     queued         BOOLEAN NOT NULL DEFAULT false,
     queued_at      TIMESTAMPTZ,
     queue_mode     TEXT NOT NULL DEFAULT '',
@@ -522,17 +523,33 @@ CREATE TABLE IF NOT EXISTS tasks (
     company_id     BIGINT REFERENCES companies(id) ON DELETE SET NULL,
     parent_ref     TEXT,
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
+    no_result_seconds INTEGER NOT NULL DEFAULT 0,
+    no_result_min_findings INTEGER NOT NULL DEFAULT 1,
+    no_result_min_severity TEXT NOT NULL DEFAULT '',
+    no_result_base_seconds BIGINT NOT NULL DEFAULT 0,
+    no_result_checked_at TIMESTAMPTZ,
+    stop_reason TEXT NOT NULL DEFAULT '',
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
+    worker_count   INTEGER NOT NULL DEFAULT 0, -- 0=用全局默认 workers
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
+    active_run_seconds BIGINT NOT NULL DEFAULT 0,
+    run_segment_started_at TIMESTAMPTZ,
     archived_at    TIMESTAMPTZ,
     deleted_at     TIMESTAMPTZ,
     completed_at   TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Opt-in checkpoint based on active runtime; defaults preserve existing tasks.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_seconds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_min_findings INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_min_severity TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_base_seconds BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_checked_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stop_reason TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tasks_alive  ON tasks(created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)          WHERE deleted_at IS NULL;
 DROP TRIGGER IF EXISTS trg_tasks_upd ON tasks;
@@ -546,6 +563,10 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false
 -- 给 agent 开放 add_task_scope/list_untested_assets;false=全部关闭(见 task_scope.go)。
 -- 存量任务默认 true 保持原行为;company 关联(task_scope kind=company)不受此开关影响。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEFAULT true;
+-- Global asset reuse is opt-in, including for pre-existing tasks.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS share_global_assets BOOLEAN NOT NULL DEFAULT false;
+-- 任务级 Worker 运行数量;0=用全局默认(settings.workers)。补旧库。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS worker_count INTEGER NOT NULL DEFAULT 0;
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.
@@ -553,11 +574,15 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS remark TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_run_seconds BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_segment_started_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pause_reason TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
@@ -616,16 +641,21 @@ CREATE TABLE IF NOT EXISTS task_templates (
     nkey        TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
     goal        TEXT NOT NULL,
+    remark      TEXT NOT NULL DEFAULT '',
     -- 预设的任务分类；分类删除时置空（与 tasks.category_id 一致，不阻断）。
     category_id     BIGINT REFERENCES task_categories(id) ON DELETE SET NULL,
     -- 预设的任务级拦截/允许规则快照(AssetInterceptRuleInput 数组)；应用模板时灌进新任务。
     intercept_rules JSONB NOT NULL DEFAULT '[]',
+    -- 预设的任务级 Worker 运行数量;0=用全局默认。
+    worker_count INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- 补旧库(已发版,加列带 IF NOT EXISTS)。
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS remark TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS worker_count INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates
@@ -1028,6 +1058,54 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
 );
 
 -- =====================================================================
+-- J1. Calendar based task schedules
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS task_schedules (
+    id                 BIGSERIAL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    timezone_mode      TEXT NOT NULL DEFAULT 'beijing'
+                       CHECK (timezone_mode IN ('beijing','system')),
+    schedule_type      TEXT NOT NULL DEFAULT 'weekly'
+                       CHECK (schedule_type IN ('once','weekly')),
+    run_date           DATE,
+    end_date           DATE,
+    weekdays           TEXT NOT NULL DEFAULT '',
+    start_time         TIME NOT NULL,
+    end_time           TIME,
+    start_immediately  BOOLEAN NOT NULL DEFAULT false,
+    status             TEXT NOT NULL DEFAULT 'waiting'
+                       CHECK (status IN ('waiting','running','outside','completed','error','paused')),
+    last_window_key    TEXT NOT NULL DEFAULT '',
+    last_transition_at TIMESTAMPTZ,
+    last_error         TEXT NOT NULL DEFAULT '',
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((schedule_type = 'once' AND run_date IS NOT NULL) OR
+           (schedule_type = 'weekly' AND run_date IS NULL)),
+    CHECK ((schedule_type = 'once') OR weekdays <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_task_schedules_enabled ON task_schedules(enabled, id);
+ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS end_date DATE;
+ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS remark TEXT NOT NULL DEFAULT '';
+DROP TRIGGER IF EXISTS trg_task_schedules_upd ON task_schedules;
+CREATE TRIGGER trg_task_schedules_upd BEFORE UPDATE ON task_schedules
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS task_schedule_tasks (
+    schedule_id BIGINT NOT NULL REFERENCES task_schedules(id) ON DELETE CASCADE,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    paused_by_schedule BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (schedule_id, task_id)
+);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS schedule_paused BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS schedule_manual_until TIMESTAMPTZ;
+UPDATE tasks SET pause_reason='paused_by_schedule' WHERE paused AND schedule_paused AND pause_reason='';
+CREATE INDEX IF NOT EXISTS idx_task_schedule_tasks_task ON task_schedule_tasks(task_id);
+ALTER TABLE task_schedule_tasks ADD COLUMN IF NOT EXISTS paused_by_schedule BOOLEAN NOT NULL DEFAULT false;
+
+-- =====================================================================
 -- K. 拦截规则
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS intercept_rules (
@@ -1067,6 +1145,7 @@ CREATE TABLE IF NOT EXISTS intercept_pending (
 );
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_status ON intercept_pending(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_task   ON intercept_pending(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intercept_pending_created ON intercept_pending(created_at DESC);
 -- 补旧库:reason 列(已发版,加列要带 IF NOT EXISTS)。
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 -- Detail payloads are lazy-loaded; NULL preserves the meaning of legacy history.
@@ -1074,6 +1153,10 @@ ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS audit JSONB;
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decision_source TEXT NOT NULL DEFAULT '';
 UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 'rule'
  WHEN reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
+-- 审批请求的初判来源可能是规则/模型，但最终由用户允许或拒绝；保留最终人工判定来源。
+UPDATE intercept_pending SET decision_source='manual'
+ WHERE decision_source <> 'manual'
+   AND (audit->>'decision_reason' LIKE '人工允许%' OR audit->>'decision_reason' LIKE '人工拒绝%');
 
 -- =====================================================================
 -- L. 漏洞发现持久化
@@ -1097,11 +1180,13 @@ CREATE TABLE IF NOT EXISTS findings (
     status      TEXT NOT NULL DEFAULT 'pending',
     -- 漏洞详细报告(Markdown)；默认空,仅详情页读取/展示,不进列表接口以免 payload 膨胀。
     report      TEXT NOT NULL DEFAULT '',
+    report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
@@ -1192,17 +1277,25 @@ CREATE TABLE IF NOT EXISTS side_question_sessions (
     task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
     exploration_id BIGINT REFERENCES explorations(id) ON DELETE CASCADE,
     intent_id BIGINT REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+    approval_id BIGINT REFERENCES intercept_pending(id) ON DELETE CASCADE,
     run_id BIGINT NOT NULL,
     version BIGINT NOT NULL,
     snapshot JSONB NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
-    CHECK ((conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
+    CHECK (approval_id IS NOT NULL OR
+        (conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
         OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL))
 );
+ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS approval_id BIGINT REFERENCES intercept_pending(id) ON DELETE CASCADE;
+ALTER TABLE side_question_sessions DROP CONSTRAINT IF EXISTS side_question_sessions_check;
+ALTER TABLE side_question_sessions ADD CONSTRAINT side_question_sessions_check CHECK (approval_id IS NOT NULL OR
+    (conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
+    OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL));
 CREATE INDEX IF NOT EXISTS idx_side_sessions_conv ON side_question_sessions(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_side_sessions_task ON side_question_sessions(task_id);
 CREATE INDEX IF NOT EXISTS idx_side_sessions_exp ON side_question_sessions(exploration_id);
 CREATE INDEX IF NOT EXISTS idx_side_sessions_intent ON side_question_sessions(intent_id);
+CREATE INDEX IF NOT EXISTS idx_side_sessions_approval ON side_question_sessions(approval_id);
 
 CREATE TABLE IF NOT EXISTS side_question_requests (
     id TEXT PRIMARY KEY,
@@ -1384,3 +1477,177 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- A case collects repeated observations of one defect without rewriting findings.
+CREATE TABLE IF NOT EXISTS finding_cases (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    origin_task_id BIGINT NOT NULL,
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT '',
+    severity_reason TEXT NOT NULL DEFAULT '',
+    report TEXT NOT NULL DEFAULT '',
+    version BIGINT NOT NULL DEFAULT 1,
+    report_version BIGINT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS finding_case_members (
+    finding_id BIGINT PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+    case_id BIGINT NOT NULL REFERENCES finding_cases(id),
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_case_members_case ON finding_case_members(case_id);
+CREATE TABLE IF NOT EXISTS finding_case_events (
+    id BIGSERIAL PRIMARY KEY,
+    case_id BIGINT NOT NULL REFERENCES finding_cases(id),
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    finding_ids JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS finding_case_suggestions (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    left_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    right_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(left_id,right_id),
+    CHECK(left_id < right_id)
+);
+-- A suggestion is a group.  left_id/right_id remain compatibility anchors for
+-- old clients and are kept at the two smallest surviving member ids.
+ALTER TABLE finding_case_suggestions DROP CONSTRAINT IF EXISTS finding_case_suggestions_left_id_right_id_key;
+CREATE TABLE IF NOT EXISTS finding_case_suggestion_members (
+    suggestion_id BIGINT NOT NULL REFERENCES finding_case_suggestions(id) ON DELETE CASCADE,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    PRIMARY KEY (suggestion_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_case_suggestion_members_finding
+    ON finding_case_suggestion_members(finding_id);
+INSERT INTO finding_case_suggestion_members(suggestion_id, finding_id)
+    SELECT id, left_id FROM finding_case_suggestions ON CONFLICT DO NOTHING;
+INSERT INTO finding_case_suggestion_members(suggestion_id, finding_id)
+    SELECT id, right_id FROM finding_case_suggestions ON CONFLICT DO NOTHING;
+-- Anchors have cascading foreign keys.  Re-anchor a group before an anchor
+-- finding is deleted so a 3+ member suggestion survives the cascade.
+CREATE OR REPLACE FUNCTION finding_case_suggestion_reanchor() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    sid BIGINT;
+    new_left BIGINT;
+    new_right BIGINT;
+BEGIN
+    FOR sid IN
+        SELECT id FROM finding_case_suggestions
+        WHERE left_id = OLD.id OR right_id = OLD.id
+    LOOP
+        SELECT min(m.finding_id) INTO new_left
+        FROM finding_case_suggestion_members m
+        JOIN findings f ON f.id = m.finding_id
+        WHERE m.suggestion_id = sid AND m.finding_id <> OLD.id;
+        SELECT min(m.finding_id) INTO new_right
+        FROM finding_case_suggestion_members m
+        JOIN findings f ON f.id = m.finding_id
+        WHERE m.suggestion_id = sid AND m.finding_id <> OLD.id
+          AND m.finding_id > new_left;
+        IF new_left IS NOT NULL AND new_right IS NOT NULL THEN
+            UPDATE finding_case_suggestions
+            SET left_id = new_left, right_id = new_right
+            WHERE id = sid;
+        END IF;
+    END LOOP;
+    RETURN OLD;
+END $$;
+DROP TRIGGER IF EXISTS finding_case_suggestion_reanchor ON findings;
+CREATE TRIGGER finding_case_suggestion_reanchor
+BEFORE DELETE ON findings FOR EACH ROW
+EXECUTE FUNCTION finding_case_suggestion_reanchor();
+-- Rejected/detached pairs are a durable human veto, also checked on group unions.
+CREATE TABLE IF NOT EXISTS finding_case_blocks (
+    left_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    right_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(left_id,right_id), CHECK(left_id < right_id)
+);
+CREATE OR REPLACE FUNCTION finding_case_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE cid BIGINT; remaining INTEGER;
+BEGIN
+    IF TG_TABLE_NAME = 'findings' THEN
+        IF OLD IS NOT DISTINCT FROM NEW THEN RETURN NEW; END IF;
+        SELECT case_id INTO cid FROM finding_case_members WHERE finding_id=NEW.id;
+    ELSE
+        cid := OLD.case_id;
+    END IF;
+    IF cid IS NOT NULL THEN
+        UPDATE finding_cases SET version=version+1 WHERE id=cid;
+        IF TG_OP='DELETE' THEN
+            SELECT count(*) INTO remaining FROM finding_case_members WHERE case_id=cid;
+            INSERT INTO finding_case_events(case_id,action,actor,reason,finding_ids)
+                VALUES(cid,'member_deleted','system','成员移出或删除',jsonb_build_array(OLD.finding_id));
+            IF remaining < 2 THEN
+                UPDATE finding_cases SET active=false WHERE id=cid;
+                DELETE FROM finding_case_members WHERE case_id=cid;
+            END IF;
+        END IF;
+    END IF;
+    RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS finding_case_content_changed ON findings;
+CREATE TRIGGER finding_case_content_changed AFTER UPDATE ON findings
+FOR EACH ROW EXECUTE FUNCTION finding_case_changed();
+DROP TRIGGER IF EXISTS finding_case_member_deleted ON finding_case_members;
+CREATE TRIGGER finding_case_member_deleted AFTER DELETE ON finding_case_members
+FOR EACH ROW EXECUTE FUNCTION finding_case_changed();
+CREATE TABLE IF NOT EXISTS finding_case_review_runs (
+    conversation_id BIGINT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+ALTER TABLE finding_case_review_runs ADD COLUMN IF NOT EXISTS finding_ids JSONB NOT NULL DEFAULT '[]';
+
+ALTER TABLE finding_case_review_runs ADD COLUMN IF NOT EXISTS reviewed_ids JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE finding_case_review_runs ADD COLUMN IF NOT EXISTS conclusion JSONB NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_finding_case_reviews_active_task ON finding_case_review_runs(task_id) WHERE state IN ('queued','running');
+
+CREATE TABLE IF NOT EXISTS task_schedule_history (
+ id BIGSERIAL PRIMARY KEY,
+ schedule_id BIGINT NOT NULL REFERENCES task_schedules(id) ON DELETE CASCADE,
+ task_id BIGINT,
+ action TEXT NOT NULL,
+ success BOOLEAN NOT NULL,
+ message TEXT NOT NULL DEFAULT '',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_history ON task_schedule_history(schedule_id,id DESC);
+
+-- Task intelligence is separate from shared asset authentication and graph compaction.
+CREATE TABLE IF NOT EXISTS task_intelligence (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    node_id BIGINT REFERENCES exploration_nodes(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('credential','lead','sensitive_data')),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL CHECK (confidence IN ('observed','inferred')),
+    status TEXT NOT NULL,
+    asset_ids JSONB NOT NULL DEFAULT '[]',
+    worker TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(task_id,kind,fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_task_intelligence_task ON task_intelligence(task_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USING gin(asset_ids);
+
+-- Optional derived credential presentation; raw intelligence remains authoritative.
+ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
