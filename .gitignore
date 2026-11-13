@@ -33,6 +33,7 @@ web/public/demo-version.json
 !/docs/agents/
 /docs/agents/*
 !/docs/agents/*.md
+!/docs/java-binary-audit.md
 
 # os
 .DS_Store

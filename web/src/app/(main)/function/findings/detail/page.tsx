@@ -93,6 +93,25 @@ function FindingCodeAuditEvidenceCard({
           服务：{evidence.service_name} · 路径：{evidence.relative_path} · 版本：{evidence.version_id} · 范围：
           {evidence.scope_path}
         </div>
+        {evidence.candidate.provenance ? (
+          <section className="space-y-2 rounded-md border p-3">
+            <h3 className="font-medium text-sm">反编译来源</h3>
+            <p className="break-all text-xs text-muted-foreground">
+              {evidence.candidate.provenance.decompiler} · {evidence.candidate.provenance.artifact_name} · SHA-256{" "}
+              {evidence.candidate.provenance.artifact_sha256}
+            </p>
+            <p className="break-all font-mono text-xs">
+              Source：{evidence.candidate.provenance.source.original_class_file} →{" "}
+              {evidence.candidate.provenance.source.package ? `${evidence.candidate.provenance.source.package}.` : ""}
+              {evidence.candidate.provenance.source.class}.{evidence.candidate.provenance.source.method}
+            </p>
+            <p className="break-all font-mono text-xs">
+              Sink：{evidence.candidate.provenance.sink.original_class_file} →{" "}
+              {evidence.candidate.provenance.sink.package ? `${evidence.candidate.provenance.sink.package}.` : ""}
+              {evidence.candidate.provenance.sink.class}.{evidence.candidate.provenance.sink.method}
+            </p>
+          </section>
+        ) : null}
         {evidence.history?.length ? (
           <section className="space-y-2 rounded-md border p-3">
             <h3 className="font-medium text-sm">代码版本与审计历史</h3>

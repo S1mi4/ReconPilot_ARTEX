@@ -46,6 +46,7 @@ import { parseCompanyScopeText } from "@/lib/company-scope";
 import { taskAssetSourceLabel } from "@/lib/task-assets";
 import type {
   Asset,
+  CodeAuditProvenance,
   LLMProfile,
   NewAssetType,
   TaskCodeAuditConfig,
@@ -589,9 +590,9 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     if (
       auditConfigs.length !== auditTargets.length ||
       auditConfigErrors.length > 0 ||
-      auditConfigs.some(({ config }) => !config.source_available || !config.llm.available)
+      auditConfigs.some(({ config }) => !config.audit_available || !config.llm.available)
     ) {
-      toast.error("请先确认所选服务都有可审计源码和可用的 LLM 配置");
+      toast.error("请先确认所选服务都有可审计源码或已配置反编译器，并且 LLM 配置可用");
       return;
     }
     const budgetTokens = Number(auditBudget);
@@ -756,6 +757,11 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   } else if (auditConfigs.length > 0) {
     const firstConfig = auditConfigs[0].config;
     const productionFiles = auditConfigs.reduce((sum, item) => sum + item.config.production_source_files, 0);
+    const binaryClassFiles = auditConfigs.reduce((sum, item) => sum + item.config.binary_class_files, 0);
+    const binaryOnlyClassFiles = auditConfigs.reduce(
+      (sum, item) => sum + (item.config.binary_only ? item.config.binary_class_files : 0),
+      0,
+    );
     const testFiles = auditConfigs.reduce((sum, item) => sum + item.config.test_java_files, 0);
     const configFiles = auditConfigs.reduce((sum, item) => sum + item.config.config_files, 0);
     auditConfigContent = (
@@ -763,6 +769,12 @@ export function AssetsTab({ taskId }: { taskId: string }) {
         <p>
           已选择 {auditTargets.length} 个服务，范围内合计 {productionFiles} 个生产 Java/JSP 文件。
         </p>
+        {binaryClassFiles > 0 ? (
+          <p className="text-muted-foreground text-xs">
+            所选范围还包含 {binaryClassFiles} 个 class 文件；其中 {binaryOnlyClassFiles} 个来自 binary-only
+            服务，将在审计运行中由 Vineflower 反编译。
+          </p>
+        ) : null}
         <p>
           <span className="font-medium">模型：</span>
           {firstConfig.llm.model || "不可用"}（{firstConfig.llm.profile_name || "未配置"}）
@@ -775,12 +787,16 @@ export function AssetsTab({ taskId }: { taskId: string }) {
           所选服务合计 {testFiles} 个测试上下文文件、{configFiles} 个构建/框架配置文件。
         </p>
         {auditConfigs.map(({ service, config }) =>
-          !config.source_available || !config.llm.available ? (
+          !config.audit_available || !config.llm.available ? (
             <p className="text-destructive text-xs" key={service.id}>
               {service.name}：
-              {!config.source_available
-                ? config.source_notice || "没有可审计源码"
+              {!config.audit_available
+                ? config.audit_notice || config.source_notice || "没有可审计源码或未配置反编译器"
                 : config.llm.reason || "LLM 配置不可用"}
+            </p>
+          ) : config.binary_only ? (
+            <p className="text-muted-foreground text-xs" key={service.id}>
+              {service.name}：{config.audit_notice || "审计时将反编译 Java class 文件。"}
             </p>
           ) : null,
         )}
@@ -806,7 +822,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     auditTargets.length > 0 &&
     auditConfigs.length === auditTargets.length &&
     auditConfigErrors.length === 0 &&
-    auditConfigs.every(({ config }) => config.source_available && config.llm.available);
+    auditConfigs.every(({ config }) => config.audit_available && config.llm.available);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -1308,6 +1324,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                       const candidate = item.candidate;
                       const source = candidate.source as Record<string, unknown> | undefined;
                       const sink = candidate.sink as Record<string, unknown> | undefined;
+                      const provenance = candidate.provenance as CodeAuditProvenance | undefined;
                       return (
                         <div key={item.id} className="rounded-md border bg-muted/20 p-3">
                           <div className="flex flex-wrap items-center gap-2">
@@ -1319,6 +1336,24 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                             Source: {String(source?.file ?? "?")}:{String(source?.line ?? "?")} → Sink:{" "}
                             {String(sink?.file ?? "?")}:{String(sink?.line ?? "?")}
                           </p>
+                          {provenance ? (
+                            <div className="mt-2 space-y-1 rounded-md bg-muted/50 p-2 text-xs">
+                              <p>
+                                {provenance.decompiler} · 原始包 {provenance.artifact_name}（SHA-256{" "}
+                                {provenance.artifact_sha256.slice(0, 12)}…）
+                              </p>
+                              <p className="break-all font-mono">
+                                Source：{provenance.source.original_class_file} ·{" "}
+                                {provenance.source.package ? `${provenance.source.package}.` : ""}
+                                {provenance.source.class}.{provenance.source.method}
+                              </p>
+                              <p className="break-all font-mono">
+                                Sink：{provenance.sink.original_class_file} ·{" "}
+                                {provenance.sink.package ? `${provenance.sink.package}.` : ""}
+                                {provenance.sink.class}.{provenance.sink.method}
+                              </p>
+                            </div>
+                          ) : null}
                           {typeof candidate.why_unobstructed === "string" ? (
                             <p className="mt-2 whitespace-pre-wrap text-sm">{candidate.why_unobstructed}</p>
                           ) : null}
@@ -1418,7 +1453,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                 onChange={(event) => setAuditSourceAcknowledged(event.target.checked)}
               />
               <span>
-                我确认所选服务源码会发送给上方显示的 LLM
+                我确认所选服务源码或反编译源码会发送给上方显示的 LLM
                 端点用于分析。平台默认不保存包含源码的请求和响应正文，仅保留用量、审计摘要和最小证据片段。
               </span>
             </label>

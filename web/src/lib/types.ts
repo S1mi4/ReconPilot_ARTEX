@@ -554,6 +554,25 @@ export interface CodeAuditCandidateEvidence {
   why_unobstructed: string;
   evidence_excerpt: string;
   remediation: string;
+  provenance?: CodeAuditProvenance;
+}
+
+export interface CodeAuditProvenanceLocation {
+  reconstructed_file: string;
+  original_class_file: string;
+  package: string;
+  class: string;
+  method: string;
+}
+
+export interface CodeAuditProvenance {
+  decompiler: string;
+  decompiler_sha256: string;
+  artifact_name: string;
+  artifact_format: string;
+  artifact_sha256: string;
+  source: CodeAuditProvenanceLocation;
+  sink: CodeAuditProvenanceLocation;
 }
 
 export interface CodeAuditReviewEvidence {
@@ -2175,8 +2194,14 @@ export interface TaskCodeAuditConfig {
   production_source_files: number;
   test_java_files: number;
   config_files: number;
+  binary_class_files: number;
+  binary_only: boolean;
   source_available: boolean;
+  audit_available: boolean;
   source_notice?: string;
+  audit_notice?: string;
+  decompiler_available: boolean;
+  decompiler_notice?: string;
   llm: TaskCodeAuditLLMConfig;
 }
 

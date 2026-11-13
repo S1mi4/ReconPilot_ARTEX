@@ -663,8 +663,13 @@ export const api = {
         production_source_files: 0,
         test_java_files: 0,
         config_files: 0,
+        binary_class_files: 0,
+        binary_only: false,
         source_available: false,
+        audit_available: false,
         source_notice: "演示数据没有 Java 源码。",
+        audit_notice: "演示数据没有 Java 源码或 class 文件。",
+        decompiler_available: false,
         llm: {
           profile_name: "任务默认配置",
           profile_source: "task_chain",

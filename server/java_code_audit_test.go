@@ -23,6 +23,7 @@ import (
 type taskCodeAuditReviewTestProvider struct {
 	calls int
 	final string
+	paths []string
 }
 
 func (p *taskCodeAuditReviewTestProvider) Complete(_ context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
@@ -31,6 +32,9 @@ func (p *taskCodeAuditReviewTestProvider) Complete(_ context.Context, _ llm.Comp
 		path := "src/main/java/app/Controller.java"
 		if p.calls == 2 {
 			path = "src/main/java/app/Dao.java"
+		}
+		if len(p.paths) >= p.calls {
+			path = p.paths[p.calls-1]
 		}
 		input, _ := json.Marshal(map[string]any{"path": path, "start_line": 1, "end_line": 10})
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{
@@ -312,6 +316,22 @@ func TestTaskCodeAuditRetryEndpointRequeuesFailedServiceRun(t *testing.T) {
 	taskID := *baseFinding.TaskID
 	codebaseID := fmt.Sprintf("retry-codebase-%d", taskID)
 	versionID := fmt.Sprintf("%032x", taskID)
+	version := taskCodebaseVersion{ID: versionID, CodebaseID: codebaseID, Name: "repository", Kind: "directory", Format: "directory"}
+	versionRoot := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	serviceRoot := filepath.Join(versionRoot, "contents", "repository", "service")
+	if err := os.MkdirAll(filepath.Join(serviceRoot, "src/main/java/app"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serviceRoot, "src/main/java/app/Retry.java"), []byte("package app; class Retry {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := json.Marshal(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(versionRoot, taskCodebaseManifestName), manifest, 0o640); err != nil {
+		t.Fatal(err)
+	}
 	var serviceID int64
 	if err := s.m.pg.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,latest_version_id,latest_present)
 VALUES($1,$2,'service','retry-service','confirmed','manual',$3,true) RETURNING id`, taskID, codebaseID, versionID).Scan(&serviceID); err != nil {

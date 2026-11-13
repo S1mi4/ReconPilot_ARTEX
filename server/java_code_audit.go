@@ -53,15 +53,21 @@ type taskCodeAuditLLMConfig struct {
 }
 
 type taskCodeAuditConfigResponse struct {
-	Service         pgdb.TaskCodeService   `json:"service"`
-	Version         taskCodebaseVersion    `json:"version"`
-	ScopePath       string                 `json:"scope_path"`
-	ProductionFiles int                    `json:"production_source_files"`
-	TestFiles       int                    `json:"test_java_files"`
-	ConfigFiles     int                    `json:"config_files"`
-	SourceAvailable bool                   `json:"source_available"`
-	SourceNotice    string                 `json:"source_notice,omitempty"`
-	LLM             taskCodeAuditLLMConfig `json:"llm"`
+	Service             pgdb.TaskCodeService   `json:"service"`
+	Version             taskCodebaseVersion    `json:"version"`
+	ScopePath           string                 `json:"scope_path"`
+	ProductionFiles     int                    `json:"production_source_files"`
+	TestFiles           int                    `json:"test_java_files"`
+	ConfigFiles         int                    `json:"config_files"`
+	BinaryClassFiles    int                    `json:"binary_class_files"`
+	BinaryOnly          bool                   `json:"binary_only"`
+	SourceAvailable     bool                   `json:"source_available"`
+	AuditAvailable      bool                   `json:"audit_available"`
+	SourceNotice        string                 `json:"source_notice,omitempty"`
+	AuditNotice         string                 `json:"audit_notice,omitempty"`
+	DecompilerAvailable bool                   `json:"decompiler_available"`
+	DecompilerNotice    string                 `json:"decompiler_notice,omitempty"`
+	LLM                 taskCodeAuditLLMConfig `json:"llm"`
 }
 
 type taskCodeAuditStartRequest struct {
@@ -83,15 +89,25 @@ type taskCodeAuditFile struct {
 }
 
 type taskCodeAuditCodebase struct {
-	TaskID        int64
-	ServiceRoot   string
-	ArchivePath   string
-	ArchiveKind   string
-	ArchivePrefix string
-	ScopePath     string
-	Files         []taskCodeAuditFile
-	ByPath        map[string]taskCodeAuditFile
-	Skipped       int
+	TaskID           int64
+	ServiceRoot      string
+	ArchivePath      string
+	ArchiveKind      string
+	ArchiveName      string
+	ArchivePrefix    string
+	ScopePath        string
+	Files            []taskCodeAuditFile
+	ByPath           map[string]taskCodeAuditFile
+	BinaryClassFiles []string
+	BinaryOnlyAudit  bool
+	ProvenanceByPath map[string]taskCodeAuditProvenanceLocation
+	ArtifactName     string
+	ArtifactFormat   string
+	ArtifactSHA256   string
+	DecompilerName   string
+	DecompilerSHA256 string
+	TempDir          string
+	Skipped          int
 }
 
 type taskCodeAuditToolState struct {
@@ -124,18 +140,19 @@ type taskCodeAuditControl struct {
 }
 
 type taskCodeAuditCandidate struct {
-	Title           string                  `json:"title"`
-	Category        string                  `json:"category"`
-	Severity        string                  `json:"severity"`
-	Confidence      string                  `json:"confidence"`
-	Source          taskCodeAuditLocation   `json:"source"`
-	Sink            taskCodeAuditLocation   `json:"sink"`
-	EntryPoint      taskCodeAuditLocation   `json:"entry_point"`
-	Flow            []taskCodeAuditFlowStep `json:"flow"`
-	ControlsChecked []taskCodeAuditControl  `json:"controls_checked"`
-	WhyUnobstructed string                  `json:"why_unobstructed"`
-	EvidenceExcerpt string                  `json:"evidence_excerpt"`
-	Remediation     string                  `json:"remediation"`
+	Title           string                   `json:"title"`
+	Category        string                   `json:"category"`
+	Severity        string                   `json:"severity"`
+	Confidence      string                   `json:"confidence"`
+	Source          taskCodeAuditLocation    `json:"source"`
+	Sink            taskCodeAuditLocation    `json:"sink"`
+	EntryPoint      taskCodeAuditLocation    `json:"entry_point"`
+	Flow            []taskCodeAuditFlowStep  `json:"flow"`
+	ControlsChecked []taskCodeAuditControl   `json:"controls_checked"`
+	WhyUnobstructed string                   `json:"why_unobstructed"`
+	EvidenceExcerpt string                   `json:"evidence_excerpt"`
+	Remediation     string                   `json:"remediation"`
+	Provenance      *taskCodeAuditProvenance `json:"provenance,omitempty"`
 }
 
 type taskCodeAuditAnalysis struct {
@@ -207,11 +224,12 @@ func (s *Server) taskCodeAuditConfigHandler(w http.ResponseWriter, r *http.Reque
 	if scope == "" {
 		scope = "."
 	}
-	codebase, err := s.loadTaskCodeAuditCodebase(numericTaskID, service, version, scope)
+	codebase, err := s.loadTaskCodeAuditCodebase(r.Context(), numericTaskID, service, version, scope, false)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	defer codebase.cleanup()
 	profileID, err := optionalPositiveInt64(r.URL.Query().Get("profile_id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "无效的 LLM 配置")
@@ -224,10 +242,28 @@ func (s *Server) taskCodeAuditConfigHandler(w http.ResponseWriter, r *http.Reque
 	}
 	response := taskCodeAuditConfigResponse{Service: service, Version: version, ScopePath: scope,
 		ProductionFiles: countAuditProductionFiles(codebase.Files), TestFiles: countAuditFiles(codebase.Files, "test"),
-		ConfigFiles: countAuditFiles(codebase.Files, "config"), LLM: llmConfig}
+		ConfigFiles: countAuditFiles(codebase.Files, "config"), BinaryClassFiles: len(codebase.BinaryClassFiles), LLM: llmConfig}
 	response.SourceAvailable = response.ProductionFiles > 0
+	response.BinaryOnly = !response.SourceAvailable && response.BinaryClassFiles > 0
+	if response.BinaryClassFiles > 0 {
+		decompiler := configuredTaskJavaDecompiler()
+		response.DecompilerAvailable = decompiler.Ready
+		response.DecompilerNotice = decompiler.Notice
+	}
+	response.AuditAvailable = response.SourceAvailable || (response.BinaryOnly && response.DecompilerAvailable)
 	if !response.SourceAvailable {
-		response.SourceNotice = "当前版本没有 Java 源码，JAR/class 反编译能力尚未接入；可上传源码后再审计。"
+		if response.BinaryClassFiles == 0 {
+			response.SourceNotice = "当前范围没有 Java 源码或 class 文件；可上传源码或 Java 二进制包后再审计。"
+		} else if response.DecompilerAvailable {
+			response.SourceNotice = fmt.Sprintf("当前范围仅发现 %d 个 class 文件，将在审计运行中反编译。", response.BinaryClassFiles)
+		} else {
+			response.SourceNotice = response.DecompilerNotice
+		}
+	}
+	if response.AuditAvailable && response.BinaryOnly {
+		response.AuditNotice = fmt.Sprintf("检测到 %d 个 class 文件；审计开始后将由 Vineflower 反编译。", response.BinaryClassFiles)
+	} else if !response.AuditAvailable {
+		response.AuditNotice = response.SourceNotice
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -279,9 +315,15 @@ func (s *Server) taskCodeAuditStartHandler(w http.ResponseWriter, r *http.Reques
 	if scope == "" {
 		scope = "."
 	}
-	codebase, err := s.loadTaskCodeAuditCodebase(numericTaskID, service, version, scope)
+	codebase, err := s.loadTaskCodeAuditCodebase(r.Context(), numericTaskID, service, version, scope, false)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer codebase.cleanup()
+	decompiler := configuredTaskJavaDecompiler()
+	if !taskCodeAuditAvailable(codebase, decompiler) {
+		writeErr(w, http.StatusServiceUnavailable, taskCodeAuditUnavailableNotice(codebase, decompiler))
 		return
 	}
 	llmConfig, err := s.resolveTaskCodeAuditLLM(numericTaskID, req.ProfileID)
@@ -369,6 +411,18 @@ func (s *Server) taskCodeAuditResumeHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	defer s.engine.decInflight(taskID)
+	binaryOnly, err := s.taskCodeAuditRunIsBinaryOnly(taskNum, runID)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "无法读取待恢复审计使用的代码版本")
+		return
+	}
+	if binaryOnly {
+		decompiler := configuredTaskJavaDecompiler()
+		if !decompiler.Ready {
+			writeErr(w, http.StatusServiceUnavailable, taskJavaDecompilerNotice(decompiler))
+			return
+		}
+	}
 	run, err := s.m.pg.ResumeTaskCodeAudit(taskNum, runID, req.AdditionalBudget)
 	if err != nil {
 		writeErr(w, http.StatusConflict, "审计未处于可恢复状态，或追加预算超出限制")
@@ -400,6 +454,18 @@ func (s *Server) taskCodeAuditRetryHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer s.engine.decInflight(taskID)
+	binaryOnly, err := s.taskCodeAuditRunIsBinaryOnly(taskNum, runID)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "无法读取待重试审计使用的代码版本")
+		return
+	}
+	if binaryOnly {
+		decompiler := configuredTaskJavaDecompiler()
+		if !decompiler.Ready {
+			writeErr(w, http.StatusServiceUnavailable, taskJavaDecompilerNotice(decompiler))
+			return
+		}
+	}
 	run, err := s.m.pg.RetryTaskCodeAudit(taskNum, runID, req.AdditionalBudget)
 	if err != nil {
 		writeErr(w, http.StatusConflict, "仅失败的审计可重试，且需追加 1,000 到 500,000 Token")
@@ -407,6 +473,27 @@ func (s *Server) taskCodeAuditRetryHandler(w http.ResponseWriter, r *http.Reques
 	}
 	s.notifyTaskCodeAuditWorkers()
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": run})
+}
+
+func (s *Server) taskCodeAuditRunIsBinaryOnly(taskID, runID int64) (bool, error) {
+	run, err := s.m.pg.GetTaskCodeAudit(taskID, runID)
+	if err != nil {
+		return false, err
+	}
+	service, err := s.m.pg.ValidateTaskCodeAuditService(taskID, run.CodeServiceID)
+	if err != nil || service.CodebaseID != run.CodebaseID || service.LatestVersionID != run.VersionID {
+		return false, errors.New("code service version changed")
+	}
+	version, err := s.loadTaskCodebaseVersion(strconv.FormatInt(taskID, 10), run.VersionID)
+	if err != nil || version.CodebaseID != run.CodebaseID {
+		return false, errors.New("codebase snapshot is unavailable")
+	}
+	codebase, err := s.loadTaskCodeAuditCodebase(context.Background(), taskID, service, version, run.ScopePath, false)
+	if err != nil {
+		return false, err
+	}
+	defer codebase.cleanup()
+	return codebase.BinaryOnly(), nil
 }
 
 func (s *Server) taskCodeAuditCandidateReviewHandler(w http.ResponseWriter, r *http.Request) {
@@ -470,14 +557,19 @@ func (s *Server) taskCodeAuditCandidateReviewHandler(w http.ResponseWriter, r *h
 		writeErr(w, http.StatusConflict, "审计使用的代码版本不可读取，请重新运行白盒审计")
 		return
 	}
-	codebase, err := s.loadTaskCodeAuditCodebase(taskNum, service, version, run.ScopePath)
+	codebase, err := s.loadTaskCodeAuditCodebase(r.Context(), taskNum, service, version, run.ScopePath, true)
 	if err != nil {
 		writeErr(w, http.StatusConflict, "审计代码范围不可读取，请重新运行白盒审计")
 		return
 	}
+	defer codebase.cleanup()
 	var candidate taskCodeAuditCandidate
 	if err := json.Unmarshal(candidateRow.Candidate, &candidate); err != nil {
 		writeErr(w, http.StatusConflict, "候选格式无效，无法复核")
+		return
+	}
+	if codebase.BinaryOnly() && !taskCodeAuditCandidateProvenanceMatches(candidate, codebase) {
+		writeErr(w, http.StatusConflict, "二进制审计候选缺少与当前反编译结果匹配的来源证据，请重新运行审计")
 		return
 	}
 	provider, _, err := s.taskCodeAuditRuntime(run)
@@ -739,13 +831,16 @@ func safeAuditEndpoint(raw string) string {
 	return strings.TrimRight(parsed.String(), "?")
 }
 
-func (s *Server) loadTaskCodeAuditCodebase(taskID int64, service pgdb.TaskCodeService, version taskCodebaseVersion, scope string) (*taskCodeAuditCodebase, error) {
+func (s *Server) loadTaskCodeAuditCodebase(ctx context.Context, taskID int64, service pgdb.TaskCodeService, version taskCodebaseVersion, scope string, decompileBinary bool) (*taskCodeAuditCodebase, error) {
 	if scope != "." {
 		if _, err := safeTaskCodebasePath(scope); err != nil {
 			return nil, errors.New("子目录路径无效")
 		}
 	}
-	codebase := &taskCodeAuditCodebase{TaskID: taskID, ScopePath: scope, ByPath: map[string]taskCodeAuditFile{}}
+	codebase := &taskCodeAuditCodebase{
+		TaskID: taskID, ScopePath: scope, ByPath: map[string]taskCodeAuditFile{},
+		ProvenanceByPath: map[string]taskCodeAuditProvenanceLocation{}, ArtifactName: version.Name, ArtifactFormat: version.Format,
+	}
 	contents := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), version.ID, "contents")
 	serviceRel := service.RelativePath
 	if serviceRel != "." {
@@ -777,20 +872,58 @@ func (s *Server) loadTaskCodeAuditCodebase(taskID int64, service pgdb.TaskCodeSe
 			return nil, errors.New("代码包不是普通文件")
 		}
 		codebase.ArchiveKind = version.Format
+		codebase.ArchiveName = version.Name
 		if err := codebase.collectArchiveFiles(serviceRel); err != nil {
 			return nil, err
 		}
 	} else {
 		return nil, errors.New("不支持的代码库类型")
 	}
-	sort.Slice(codebase.Files, func(i, j int) bool {
-		if codebase.Files[i].Kind != codebase.Files[j].Kind {
-			order := map[string]int{"java": 0, "config": 1, "test": 2}
-			return order[codebase.Files[i].Kind] < order[codebase.Files[j].Kind]
+	codebase.BinaryOnlyAudit = countAuditProductionFiles(codebase.Files) == 0 && len(codebase.BinaryClassFiles) > 0
+	if decompileBinary && codebase.BinaryOnly() {
+		if err := codebase.decompileBinary(ctx, configuredTaskJavaDecompiler()); err != nil {
+			codebase.cleanup()
+			return nil, err
 		}
-		return codebase.Files[i].Path < codebase.Files[j].Path
-	})
+	}
+	sortTaskCodeAuditFiles(codebase.Files)
 	return codebase, nil
+}
+
+func (c *taskCodeAuditCodebase) BinaryOnly() bool {
+	return c != nil && (c.BinaryOnlyAudit || (countAuditProductionFiles(c.Files) == 0 && len(c.BinaryClassFiles) > 0))
+}
+
+func taskCodeAuditAvailable(codebase *taskCodeAuditCodebase, decompiler taskJavaDecompilerConfig) bool {
+	if codebase == nil {
+		return false
+	}
+	if countAuditProductionFiles(codebase.Files) > 0 {
+		return true
+	}
+	return len(codebase.BinaryClassFiles) > 0 && decompiler.Ready
+}
+
+func taskCodeAuditUnavailableNotice(codebase *taskCodeAuditCodebase, decompiler taskJavaDecompilerConfig) string {
+	if codebase != nil && len(codebase.BinaryClassFiles) > 0 {
+		return taskJavaDecompilerNotice(decompiler)
+	}
+	return "所选范围没有可审计的 Java 源码或 class 文件。"
+}
+
+func taskJavaDecompilerNotice(decompiler taskJavaDecompilerConfig) string {
+	if decompiler.Notice != "" {
+		return decompiler.Notice
+	}
+	return "二进制审计需要配置 Vineflower 和 Java 17 或更高版本。"
+}
+
+func taskCodeAuditCandidateProvenanceMatches(candidate taskCodeAuditCandidate, codebase *taskCodeAuditCodebase) bool {
+	if candidate.Provenance == nil {
+		return false
+	}
+	expected, ok := candidateTaskCodeAuditProvenance(candidate, codebase)
+	return ok && *candidate.Provenance == expected
 }
 
 func (c *taskCodeAuditCodebase) addFile(rel string, size int64, disk string) {
@@ -940,6 +1073,14 @@ func (c *taskCodeAuditCodebase) collectArchiveFiles(serviceRel string) error {
 			if rel == "" {
 				continue
 			}
+			if strings.EqualFold(path.Ext(rel), ".class") {
+				if c.ArchiveKind != "jar" && c.ArchiveKind != "war" && hasExcludedAuditPath(rel) {
+					c.Skipped++
+					continue
+				}
+				c.BinaryClassFiles = append(c.BinaryClassFiles, entry.Name)
+				continue
+			}
 			if hasExcludedAuditPath(rel) {
 				c.Skipped++
 				continue
@@ -975,15 +1116,27 @@ func (c *taskCodeAuditCodebase) collectArchiveFiles(serviceRel string) error {
 				continue
 			}
 			rel := strings.TrimPrefix(header.Name, prefix)
-			if rel == "" || hasExcludedAuditPath(rel) {
+			if rel == "" {
+				c.Skipped++
+				continue
+			}
+			if strings.EqualFold(path.Ext(rel), ".class") {
+				c.Skipped++
+				continue
+			}
+			if hasExcludedAuditPath(rel) {
 				c.Skipped++
 				continue
 			}
 			c.addFile(rel, header.Size, "")
 		}
+	case "class":
+		if c.ScopePath != "." || serviceRel != "." {
+			return errors.New("单个 class 文件不支持子目录审计范围")
+		}
+		c.BinaryClassFiles = append(c.BinaryClassFiles, c.ArchiveName)
 	default:
-		// JAR/WAR/class archives may contain bytecode but no source. Decompilation
-		// is intentionally a later integration; never treat bytecode as source.
+		return errors.New("不支持的代码包格式")
 	}
 	if !scopeFound {
 		return errors.New("指定的服务子目录不存在")
@@ -1204,17 +1357,18 @@ func (s *Server) executeTaskCodeAudit(run *pgdb.TaskCodeAuditRun, workerID int) 
 	if err != nil || version.CodebaseID != run.CodebaseID {
 		return errors.New("codebase snapshot is unavailable")
 	}
-	codebase, err := s.loadTaskCodeAuditCodebase(run.TaskID, service, version, run.ScopePath)
+	codebase, err := s.loadTaskCodeAuditCodebase(s.ctx, run.TaskID, service, version, run.ScopePath, true)
 	if err != nil {
 		return err
 	}
+	defer codebase.cleanup()
 	if countAuditProductionFiles(codebase.Files) == 0 {
 		progress := taskAuditProgressFromRun(run)
 		progress.FilesTotal = 0
 		progress.FilesSkipped = codebase.Skipped
 		progress.ChunksTotal = 0
-		progress.Summary = "当前版本未发现 Java 源码；JAR/class 反编译器尚未接入，未对字节码生成审计结论。"
-		return s.m.pg.IncompleteTaskCodeAudit(run.ID, progress, "未发现 Java 源码；请上传源码，或待反编译能力接入后重新审计")
+		progress.Summary = "当前版本没有可审计的 Java 源码；未生成审计结论。"
+		return s.m.pg.IncompleteTaskCodeAudit(run.ID, progress, "未发现可审计的 Java 源码；请检查所选服务范围或上传 Java 源码")
 	}
 	provider, _, err := s.taskCodeAuditRuntime(run)
 	if err != nil {
@@ -1286,6 +1440,13 @@ func (s *Server) executeTaskCodeAudit(run *pgdb.TaskCodeAuditRun, workerID int) 
 		for _, candidate := range analysis.Candidates {
 			if !validTaskCodeAuditCandidate(candidate, chunkState) {
 				continue
+			}
+			if codebase.BinaryOnly() {
+				provenance, ok := candidateTaskCodeAuditProvenance(candidate, codebase)
+				if !ok {
+					continue
+				}
+				candidate.Provenance = &provenance
 			}
 			if progress.UsedTokens >= run.BudgetTokens {
 				progress.Summary = "已达到 Token 预算上限，候选复核尚未完成；追加预算后可从此分块继续。"
