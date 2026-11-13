@@ -38,7 +38,9 @@ var (
 	ErrProjectHasRunningRun = errors.New("project still has running tasks")
 	// ErrProjectRequired 表示调用方没有给出项目上下文。项目是最高级分层，
 	// 任何写入都必须显式落到某一个项目，绝不允许悄悄写进「默认项目」。
-	ErrProjectRequired = errors.New("project context is required")
+	ErrProjectRequired   = errors.New("项目上下文缺失")
+	ErrProjectNotDeleted = errors.New("项目未标记删除，无法清理")
+	ErrProjectRetention  = errors.New("项目保留期未到，暂不清理")
 )
 
 // Project is one engagement / workspace. It is the top-level isolation boundary.
@@ -304,6 +306,33 @@ ORDER BY deleted_at`, now.Add(-ProjectRetention))
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// Purge physically removes a project once its retention window has elapsed. The
+// project's rows go with it (every project_id column references projects with ON
+// DELETE CASCADE), which is exactly why this must stay behind PurgeCandidates.
+func (s *ProjectStore) Purge(id int64) error {
+	var deletedAt sql.NullTime
+	if err := s.db.QueryRow(`SELECT deleted_at FROM projects WHERE id = $1`, id).Scan(&deletedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrProjectNotFound
+		}
+		return err
+	}
+	if !deletedAt.Valid {
+		return ErrProjectNotDeleted
+	}
+	if time.Now().Before(PurgeAt(deletedAt.Time)) {
+		return ErrProjectRetention
+	}
+	res, err := s.db.Exec(`DELETE FROM projects WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrProjectNotFound
+	}
+	return nil
 }
 
 // Stats returns the per-project counters.

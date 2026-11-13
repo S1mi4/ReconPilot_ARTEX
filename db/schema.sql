@@ -1848,16 +1848,38 @@ CREATE TABLE IF NOT EXISTS schema_state (
 INSERT INTO schema_state(id) VALUES (1) ON CONFLICT DO NOTHING;
 
 -- 顶层内容表：先加可空列，回填完成后再置 NOT NULL（见下方 DO 块）。
-ALTER TABLE companies                 ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE assets                    ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE company_scope             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE tasks                     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE task_categories           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE conversations             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE task_schedules            ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE intercept_rules           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE asset_intercept_rules     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
-ALTER TABLE traffic_evidence_snapshots ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
+ALTER TABLE companies                 ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE assets                    ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE company_scope             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE tasks                     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_categories           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE conversations             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_schedules            ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE intercept_rules           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE asset_intercept_rules     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE traffic_evidence_snapshots ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+-- 项目删除=保留期到点后的物理清理，所以项目外键按 CASCADE 建；存量库在这里重建约束。
+ALTER TABLE companies DROP CONSTRAINT IF EXISTS companies_project_id_fkey;
+ALTER TABLE companies ADD CONSTRAINT companies_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_project_id_fkey;
+ALTER TABLE assets ADD CONSTRAINT assets_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS company_scope_project_id_fkey;
+ALTER TABLE company_scope ADD CONSTRAINT company_scope_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
+ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_categories DROP CONSTRAINT IF EXISTS task_categories_project_id_fkey;
+ALTER TABLE task_categories ADD CONSTRAINT task_categories_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_project_id_fkey;
+ALTER TABLE conversations ADD CONSTRAINT conversations_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_schedules DROP CONSTRAINT IF EXISTS task_schedules_project_id_fkey;
+ALTER TABLE task_schedules ADD CONSTRAINT task_schedules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_project_id_fkey;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE asset_intercept_rules DROP CONSTRAINT IF EXISTS asset_intercept_rules_project_id_fkey;
+ALTER TABLE asset_intercept_rules ADD CONSTRAINT asset_intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE traffic_evidence_snapshots DROP CONSTRAINT IF EXISTS traffic_evidence_snapshots_project_id_fkey;
+ALTER TABLE traffic_evidence_snapshots ADD CONSTRAINT traffic_evidence_snapshots_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+
 -- share_global_assets 在项目模型下语义变为「项目内共享」，见 db/task_assets_context.go。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS share_project_assets BOOLEAN NOT NULL DEFAULT false;
 

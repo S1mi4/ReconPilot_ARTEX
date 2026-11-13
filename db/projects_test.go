@@ -210,6 +210,54 @@ func TestProjectAssetIdentityIsScopedToProject(t *testing.T) {
 	}
 }
 
+func TestProjectPurgeRemovesScopedRowsAfterRetention(t *testing.T) {
+	d := openProjectTestDB(t)
+	stamp := time.Now().Format("150405.000000")
+	project := newTestProject(t, d, "Purge "+stamp)
+
+	if _, err := d.Exec(`INSERT INTO assets(project_id, type, domain, root_domain)
+VALUES ($1, 'root_domain', $2, $2)`, project.ID, "purge-"+stamp+".example.com"); err != nil {
+		t.Fatalf("seed asset: %v", err)
+	}
+	task, err := d.CreateTask(project.ID, "purge task", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	store := d.Projects()
+	if err := store.Purge(project.ID); !errors.Is(err, ErrProjectNotDeleted) {
+		t.Fatalf("purge of a live project must be refused, got %v", err)
+	}
+	if err := store.SoftDelete(project.ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if err := store.Purge(project.ID); !errors.Is(err, ErrProjectRetention) {
+		t.Fatalf("purge inside the retention window must be refused, got %v", err)
+	}
+	if _, err := d.Exec(`UPDATE projects SET deleted_at = now() - $2::interval WHERE id = $1`,
+		project.ID, ProjectRetention+time.Minute); err != nil {
+		t.Fatalf("age deleted_at: %v", err)
+	}
+	if err := store.Purge(project.ID); err != nil {
+		t.Fatalf("purge after retention: %v", err)
+	}
+	for _, q := range []string{
+		`SELECT count(*) FROM assets WHERE project_id = $1`,
+		`SELECT count(*) FROM tasks WHERE project_id = $1`,
+		`SELECT count(*) FROM projects WHERE id = $1`,
+	} {
+		var n int
+		if err := d.QueryRow(q, project.ID).Scan(&n); err != nil {
+			t.Fatalf("count after purge: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("purge left %d rows behind for %s", n, q)
+		}
+	}
+	if gone, err := d.GetTask(task.ID); err != nil || gone != nil {
+		t.Fatalf("purged project's task is still readable: %+v %v", gone, err)
+	}
+}
+
 // testProjectID returns a stable project for fixtures to run in.
 // testProjectIDs caches the project per handle: tests routinely defer d.Close()
 // while a later t.Cleanup still asks for the project, and re-querying a closed

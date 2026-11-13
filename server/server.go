@@ -316,6 +316,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		s.seedCredentialProcessor()
 		go s.runCredentialProcessor()
+		go s.runProjectPurgeWorker()
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s

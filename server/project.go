@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -76,6 +78,46 @@ func (s *Server) requireProject(w http.ResponseWriter, r *http.Request, allowArc
 		return 0, false
 	}
 	return id, true
+}
+
+// runProjectPurgeWorker physically removes soft-deleted projects once their
+// retention window elapses. Deleting a project is a slow, uninteresting task, so it
+// runs off the request path; the interval only has to be small relative to the
+// retention window, not to user patience.
+func (s *Server) runProjectPurgeWorker() {
+	const interval = time.Hour
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.purgeExpiredProjects()
+	}
+}
+
+// purgeExpiredProjects removes every project whose retention window has elapsed.
+func (s *Server) purgeExpiredProjects() {
+	if s.m == nil || s.m.pg == nil {
+		return
+	}
+	projects := s.m.pg.Projects()
+	candidates, err := projects.PurgeCandidates(time.Now())
+	if err != nil {
+		if s.ctx.Err() == nil {
+			log.Printf("[projects] 清理候选查询失败: %v", err)
+		}
+		return
+	}
+	for _, project := range candidates {
+		if err := projects.Purge(project.ID); err != nil {
+			log.Printf("[projects] 清理项目 #%d (%s) 失败: %v", project.ID, project.Name, err)
+			continue
+		}
+		log.Printf("[projects] 已清理过期项目 #%d (%s)", project.ID, project.Name)
+	}
 }
 
 // --- handlers ---
