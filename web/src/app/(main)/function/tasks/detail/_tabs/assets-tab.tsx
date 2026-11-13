@@ -81,6 +81,11 @@ function firstText(values: Array<string | undefined>, fallback: string): string 
   return values.find((value) => value?.trim()) ?? fallback;
 }
 
+type TaskCodeAuditServiceConfig = {
+  service: TaskCodeService;
+  config: TaskCodeAuditConfig;
+};
+
 function codeServicePresenceLabel(present: unknown): string {
   if (present === false) return "新版本中缺失";
   if (present === true) return "存在";
@@ -91,6 +96,18 @@ function codeAuditStatusVariant(status: TaskCodeAuditRun["status"]): "destructiv
   if (status === "failed") return "destructive";
   if (status === "completed") return "secondary";
   return "outline";
+}
+
+function codeAuditCandidateStatusLabel(status: string): string {
+  switch (status) {
+    case "published":
+      return "已发布 Finding";
+    case "rejected":
+    case "dismissed":
+      return "复核拒绝";
+    default:
+      return "待独立复核";
+  }
 }
 
 function assetLabel(asset: Asset): string {
@@ -382,8 +399,10 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const [codeServices, setCodeServices] = React.useState<TaskCodeService[]>([]);
   const [discoveryRuns, setDiscoveryRuns] = React.useState<TaskCodebaseDiscoveryRun[]>([]);
   const [auditRuns, setAuditRuns] = React.useState<TaskCodeAuditRun[]>([]);
-  const [auditTarget, setAuditTarget] = React.useState<TaskCodeService | null>(null);
-  const [auditConfig, setAuditConfig] = React.useState<TaskCodeAuditConfig | null>(null);
+  const [selectedAuditServiceIDs, setSelectedAuditServiceIDs] = React.useState<Set<number>>(() => new Set());
+  const [auditTargets, setAuditTargets] = React.useState<TaskCodeService[]>([]);
+  const [auditConfigs, setAuditConfigs] = React.useState<TaskCodeAuditServiceConfig[]>([]);
+  const [auditConfigErrors, setAuditConfigErrors] = React.useState<string[]>([]);
   const [auditProfiles, setAuditProfiles] = React.useState<LLMProfile[]>([]);
   const [auditScope, setAuditScope] = React.useState("");
   const [auditProfileID, setAuditProfileID] = React.useState("default");
@@ -392,6 +411,8 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const [auditConfigLoading, setAuditConfigLoading] = React.useState(false);
   const [auditStarting, setAuditStarting] = React.useState(false);
   const [resumingAuditID, setResumingAuditID] = React.useState<number | null>(null);
+  const [retryingAuditID, setRetryingAuditID] = React.useState<number | null>(null);
+  const [reviewingCandidateID, setReviewingCandidateID] = React.useState<number | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState<NewAssetType>("root_domain");
   const [page, setPage] = React.useState(0);
@@ -487,35 +508,51 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     setLoaded(false);
     setRefreshKey((current) => current + 1);
   }, []);
-  const auditTargetID = auditTarget?.id;
+  const auditTarget = auditTargets[0] ?? null;
 
   React.useEffect(() => {
-    if (auditTargetID === undefined) return;
+    if (auditTargets.length === 0) {
+      setAuditConfigs([]);
+      setAuditConfigErrors([]);
+      setAuditConfigLoading(false);
+      return;
+    }
     let active = true;
-    setAuditConfig(null);
+    setAuditConfigs([]);
+    setAuditConfigErrors([]);
     setAuditConfigLoading(true);
     const profileID = auditProfileID === "default" ? undefined : Number(auditProfileID);
     const timer = setTimeout(() => {
-      void api
-        .taskCodeAuditConfig(taskId, auditTargetID, auditScope.trim() || ".", profileID)
-        .then((config) => {
-          if (active) setAuditConfig(config);
-        })
-        .catch((reason) => {
-          if (active) toast.error(`无法读取审计配置：${String((reason as Error)?.message ?? reason)}`);
-        })
-        .finally(() => {
-          if (active) setAuditConfigLoading(false);
+      void Promise.allSettled(
+        auditTargets.map(async (service) => ({
+          service,
+          config: await api.taskCodeAuditConfig(taskId, service.id, auditScope.trim() || ".", profileID),
+        })),
+      ).then((results) => {
+        if (!active) return;
+        const configs: TaskCodeAuditServiceConfig[] = [];
+        const errors: string[] = [];
+        results.forEach((result, index) => {
+          if (result.status === "fulfilled") {
+            configs.push(result.value);
+          } else {
+            const message = String((result.reason as Error)?.message ?? result.reason);
+            errors.push(`${auditTargets[index].name}：${message}`);
+          }
         });
+        setAuditConfigs(configs);
+        setAuditConfigErrors(errors);
+        setAuditConfigLoading(false);
+      });
     }, 250);
     return () => {
       active = false;
       clearTimeout(timer);
     };
-  }, [auditProfileID, auditScope, auditTargetID, taskId]);
+  }, [auditProfileID, auditScope, auditTargets, taskId]);
 
   React.useEffect(() => {
-    if (auditTargetID === undefined) return;
+    if (auditTargets.length === 0) return;
     let active = true;
     void api
       .llmProfiles()
@@ -528,10 +565,35 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     return () => {
       active = false;
     };
-  }, [auditTargetID]);
+  }, [auditTargets.length]);
+
+  const openCodeAudit = (targets: TaskCodeService[]) => {
+    setAuditTargets(targets);
+    setAuditScope("");
+    setAuditProfileID("default");
+    setAuditBudget("120000");
+    setAuditSourceAcknowledged(false);
+  };
+
+  const toggleAuditServiceSelection = (serviceID: number, checked: boolean) => {
+    setSelectedAuditServiceIDs((current) => {
+      const next = new Set(current);
+      if (checked) next.add(serviceID);
+      else next.delete(serviceID);
+      return next;
+    });
+  };
 
   const startCodeAudit = async () => {
-    if (!auditTarget || !auditSourceAcknowledged) return;
+    if (auditTargets.length === 0 || !auditSourceAcknowledged) return;
+    if (
+      auditConfigs.length !== auditTargets.length ||
+      auditConfigErrors.length > 0 ||
+      auditConfigs.some(({ config }) => !config.source_available || !config.llm.available)
+    ) {
+      toast.error("请先确认所选服务都有可审计源码和可用的 LLM 配置");
+      return;
+    }
     const budgetTokens = Number(auditBudget);
     if (!Number.isInteger(budgetTokens) || budgetTokens < 1000 || budgetTokens > 500000) {
       toast.error("Token 预算必须在 1,000 到 500,000 之间");
@@ -539,20 +601,50 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     }
     setAuditStarting(true);
     try {
-      await api.startTaskCodeAudit(taskId, auditTarget.id, {
-        scope_path: auditScope.trim() || ".",
-        ...(auditProfileID === "default" ? {} : { profile_id: Number(auditProfileID) }),
-        budget_tokens: budgetTokens,
-        source_acknowledged: true,
+      const results = await Promise.allSettled(
+        auditTargets.map((service) =>
+          api.startTaskCodeAudit(taskId, service.id, {
+            scope_path: auditScope.trim() || ".",
+            ...(auditProfileID === "default" ? {} : { profile_id: Number(auditProfileID) }),
+            budget_tokens: budgetTokens,
+            source_acknowledged: true,
+          }),
+        ),
+      );
+      const startedIDs = new Set<number>();
+      const failures: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          startedIDs.add(auditTargets[index].id);
+        } else {
+          failures.push(`${auditTargets[index].name}：${String((result.reason as Error)?.message ?? result.reason)}`);
+        }
       });
-      toast.success(`已将 ${auditTarget.name} 的白盒审计加入队列`);
-      setAuditTarget(null);
-      setAuditSourceAcknowledged(false);
-      refresh();
+      if (startedIDs.size > 0) {
+        toast.success(`已将 ${startedIDs.size} 个服务的白盒审计加入并行队列`);
+        setSelectedAuditServiceIDs((current) => new Set([...current].filter((id) => !startedIDs.has(id))));
+        setAuditTargets([]);
+        setAuditSourceAcknowledged(false);
+        refresh();
+      }
+      if (failures.length > 0) toast.error(`以下服务未能加入队列：${failures.join("；")}`);
     } catch (reason) {
       toast.error(`无法启动白盒审计：${String((reason as Error)?.message ?? reason)}`);
     } finally {
       setAuditStarting(false);
+    }
+  };
+
+  const retryCodeAudit = async (run: TaskCodeAuditRun) => {
+    setRetryingAuditID(run.id);
+    try {
+      await api.retryTaskCodeAudit(taskId, run.id, 50000);
+      toast.success(`已单独重试 ${run.service_name}，追加 50,000 Token 并加入队列`);
+      refresh();
+    } catch (reason) {
+      toast.error(`无法重试 ${run.service_name}：${String((reason as Error)?.message ?? reason)}`);
+    } finally {
+      setRetryingAuditID(null);
     }
   };
 
@@ -566,6 +658,23 @@ export function AssetsTab({ taskId }: { taskId: string }) {
       toast.error(`无法恢复审计：${String((reason as Error)?.message ?? reason)}`);
     } finally {
       setResumingAuditID(null);
+    }
+  };
+
+  const reviewCodeAuditCandidate = async (run: TaskCodeAuditRun, candidateID: number) => {
+    setReviewingCandidateID(candidateID);
+    try {
+      const response = await api.reviewTaskCodeAuditCandidate(taskId, run.id, candidateID);
+      if (response.review.status === "published") {
+        toast.success(`独立复核通过，Finding #${response.review.finding_id ?? ""} 已发布`);
+      } else {
+        toast.success("独立复核未确认漏洞，拒绝原因已保留在审计记录");
+      }
+      refresh();
+    } catch (reason) {
+      toast.error(`无法复核候选：${String((reason as Error)?.message ?? reason)}`);
+    } finally {
+      setReviewingCandidateID(null);
     }
   };
 
@@ -612,6 +721,12 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const commonCardProps = { loaded, onPage: setPage, onSize: setSize, page, size, total };
   const totalAll = TABS(ui).reduce((sum, item) => sum + (counts[item.key] ?? 0), 0);
   const pendingCodeServices = codeServices.filter((service) => service.decision === "pending");
+  const selectableCodeServices = codeServices.filter(
+    (service) => service.decision === "confirmed" && service.latest_present,
+  );
+  const selectedAuditTargets = selectableCodeServices.filter((service) => selectedAuditServiceIDs.has(service.id));
+  const runningAuditCount = auditRuns.filter((run) => run.status === "running").length;
+  const queuedAuditCount = auditRuns.filter((run) => run.status === "queued").length;
   const activeDiscoveryRuns = discoveryRuns.filter((run) => run.status === "queued" || run.status === "running");
   const discoveryErrors = discoveryRuns.filter((run) => run.error);
   const codeServiceHistory = new Map(
@@ -638,29 +753,60 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   );
   if (auditConfigLoading) {
     auditConfigContent = <Spinner />;
-  } else if (auditConfig) {
+  } else if (auditConfigs.length > 0) {
+    const firstConfig = auditConfigs[0].config;
+    const productionFiles = auditConfigs.reduce((sum, item) => sum + item.config.production_source_files, 0);
+    const testFiles = auditConfigs.reduce((sum, item) => sum + item.config.test_java_files, 0);
+    const configFiles = auditConfigs.reduce((sum, item) => sum + item.config.config_files, 0);
     auditConfigContent = (
       <>
         <p>
+          已选择 {auditTargets.length} 个服务，范围内合计 {productionFiles} 个生产 Java/JSP 文件。
+        </p>
+        <p>
           <span className="font-medium">模型：</span>
-          {auditConfig.llm.model || "不可用"}（{auditConfig.llm.profile_name || "未配置"}）
+          {firstConfig.llm.model || "不可用"}（{firstConfig.llm.profile_name || "未配置"}）
         </p>
         <p className="break-all font-mono text-xs">
           <span className="font-medium font-sans">端点：</span>
-          {auditConfig.llm.endpoint || "未解析"}
+          {firstConfig.llm.endpoint || "未解析"}
         </p>
         <p className="text-muted-foreground text-xs">
-          范围内 {auditConfig.production_source_files} 个生产 Java/JSP 文件、{auditConfig.test_java_files}{" "}
-          个测试上下文文件、
-          {auditConfig.config_files} 个构建/框架配置文件。
+          所选服务合计 {testFiles} 个测试上下文文件、{configFiles} 个构建/框架配置文件。
         </p>
-        {!auditConfig.source_available ? <p className="text-amber-700 text-xs">{auditConfig.source_notice}</p> : null}
-        {!auditConfig.llm.available ? (
-          <p className="text-destructive text-xs">{auditConfig.llm.reason || "LLM 配置不可用"}</p>
-        ) : null}
+        {auditConfigs.map(({ service, config }) =>
+          !config.source_available || !config.llm.available ? (
+            <p className="text-destructive text-xs" key={service.id}>
+              {service.name}：
+              {!config.source_available
+                ? config.source_notice || "没有可审计源码"
+                : config.llm.reason || "LLM 配置不可用"}
+            </p>
+          ) : null,
+        )}
+        {auditConfigErrors.map((error) => (
+          <p className="text-destructive text-xs" key={error}>
+            {error}
+          </p>
+        ))}
       </>
     );
+  } else if (auditConfigErrors.length > 0) {
+    auditConfigContent = (
+      <div className="space-y-1">
+        {auditConfigErrors.map((error) => (
+          <p className="text-destructive text-xs" key={error}>
+            {error}
+          </p>
+        ))}
+      </div>
+    );
   }
+  const auditConfigsReady =
+    auditTargets.length > 0 &&
+    auditConfigs.length === auditTargets.length &&
+    auditConfigErrors.length === 0 &&
+    auditConfigs.every(({ config }) => config.source_available && config.llm.available);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -993,8 +1139,20 @@ export function AssetsTab({ taskId }: { taskId: string }) {
         </TabsContent>
 
         <TabsContent value="code_service" className="mt-0 flex min-h-0 flex-1 flex-col">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-muted-foreground text-xs">选择多个已确认服务，可一次加入并行审计队列。</p>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={selectedAuditTargets.length === 0}
+              onClick={() => openCodeAudit(selectedAuditTargets)}
+            >
+              <PlayIcon data-icon="inline-start" />
+              批量审计（{selectedAuditTargets.length}）
+            </Button>
+          </div>
           <AssetCard
-            cols={["服务", "代码库路径", "版本历史", "最新版本状态", "代码库", "来源", "操作"]}
+            cols={["选择", "服务", "代码库路径", "版本历史", "最新版本状态", "代码库", "来源", "操作"]}
             {...commonCardProps}
           >
             {rows.map((asset) => {
@@ -1004,8 +1162,19 @@ export function AssetsTab({ taskId }: { taskId: string }) {
               const present = asset.extra?.present;
               const history = codeServiceHistory.get(asset.id) ?? [];
               const service = codeServiceByAssetID.get(asset.id);
+              const selectable = service?.decision === "confirmed" && service.latest_present;
               return (
                 <TableRow key={asset.id}>
+                  <TableCell>
+                    <input
+                      aria-label={`选择 ${service?.name ?? relativePath} 进行白盒审计`}
+                      checked={Boolean(selectable && selectedAuditServiceIDs.has(service.id))}
+                      className="size-4 accent-primary"
+                      disabled={!selectable}
+                      type="checkbox"
+                      onChange={(event) => service && toggleAuditServiceSelection(service.id, event.target.checked)}
+                    />
+                  </TableCell>
                   <TableCell className="font-medium">{asset.service_name || relativePath}</TableCell>
                   <TableCell className="max-w-sm break-all font-mono text-xs">{relativePath}</TableCell>
                   <TableCell>
@@ -1034,18 +1203,8 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                   </TableCell>
                   <TableCell className="w-36 whitespace-nowrap">
                     <div className="flex items-center gap-1">
-                      {service?.decision === "confirmed" && service.latest_present ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setAuditTarget(service);
-                            setAuditScope("");
-                            setAuditProfileID("default");
-                            setAuditBudget("120000");
-                            setAuditSourceAcknowledged(false);
-                          }}
-                        >
+                      {selectable ? (
+                        <Button variant="outline" size="sm" onClick={() => openCodeAudit([service])}>
                           <PlayIcon data-icon="inline-start" />
                           审计
                         </Button>
@@ -1061,8 +1220,13 @@ export function AssetsTab({ taskId }: { taskId: string }) {
             <div>
               <h3 className="font-medium text-sm">Java 白盒审计</h3>
               <p className="text-muted-foreground text-xs">
-                审计由用户手动启动。模型初审和独立复核通过的候选保存在这里，等待人工复核，不会自动写入 Findings。
+                扫描由用户手动选择并启动。初筛候选需点击“独立复核并发布”；只有复核确认的漏洞会进入 Findings。
               </p>
+              {(runningAuditCount > 0 || queuedAuditCount > 0) && (
+                <p className="mt-1 text-muted-foreground text-xs">
+                  本任务运行中 {runningAuditCount} 个服务，排队 {queuedAuditCount} 个服务；全局最多 4 个服务并行扫描。
+                </p>
+              )}
             </div>
             {auditRuns.length === 0 ? (
               <Card className="p-4 text-muted-foreground text-sm">暂无审计记录。</Card>
@@ -1090,7 +1254,8 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                     </div>
                     <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground text-xs">
                       <span>
-                        源码覆盖 {run.files_analyzed}/{run.files_total}
+                        源码覆盖 {run.files_total > 0 ? Math.round((run.files_analyzed / run.files_total) * 100) : 0}%
+                        （{run.files_analyzed}/{run.files_total}，跳过 {run.files_skipped}）
                       </span>
                       <span>
                         分块 {run.chunks_completed}/{run.chunks_total}
@@ -1122,6 +1287,23 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                         </Button>
                       </div>
                     ) : null}
+                    {run.status === "failed" ? (
+                      <div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={retryingAuditID === run.id}
+                          onClick={() => void retryCodeAudit(run)}
+                        >
+                          {retryingAuditID === run.id ? (
+                            <Spinner data-icon="inline-start" />
+                          ) : (
+                            <RotateCcwIcon data-icon="inline-start" />
+                          )}
+                          单独重试（追加 50,000 Token）
+                        </Button>
+                      </div>
+                    ) : null}
                     {(run.candidates ?? []).map((item) => {
                       const candidate = item.candidate;
                       const source = candidate.source as Record<string, unknown> | undefined;
@@ -1130,7 +1312,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                         <div key={item.id} className="rounded-md border bg-muted/20 p-3">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-medium text-sm">{String(candidate.title ?? "污点候选")}</span>
-                            <Badge variant="outline">待人工复核</Badge>
+                            <Badge variant="outline">{codeAuditCandidateStatusLabel(item.review_status)}</Badge>
                             <Badge variant="outline">{String(candidate.severity ?? "unknown")}</Badge>
                           </div>
                           <p className="mt-2 break-all font-mono text-xs">
@@ -1146,7 +1328,23 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                             </pre>
                           ) : null}
                           {item.reviewer_summary ? (
-                            <p className="mt-2 text-muted-foreground text-xs">独立复核：{item.reviewer_summary}</p>
+                            <p className="mt-2 text-muted-foreground text-xs">初筛复核：{item.reviewer_summary}</p>
+                          ) : null}
+                          {item.verification_summary ? (
+                            <p className="mt-2 text-sm">发布复核：{item.verification_summary}</p>
+                          ) : null}
+                          {item.review_status === "pending_review" &&
+                          (run.status === "completed" || run.status === "incomplete") ? (
+                            <Button
+                              className="mt-3"
+                              size="sm"
+                              variant="outline"
+                              disabled={reviewingCandidateID !== null}
+                              onClick={() => void reviewCodeAuditCandidate(run, item.id)}
+                            >
+                              {reviewingCandidateID === item.id ? <Spinner data-icon="inline-start" /> : null}
+                              独立复核并发布
+                            </Button>
                           ) : null}
                         </div>
                       );
@@ -1161,12 +1359,16 @@ export function AssetsTab({ taskId }: { taskId: string }) {
 
       <AddTaskAssetsSheet onAttached={refresh} onOpenChange={setAddOpen} open={addOpen} taskId={taskId} />
 
-      <Sheet open={Boolean(auditTarget)} onOpenChange={(open) => !open && setAuditTarget(null)}>
+      <Sheet open={auditTargets.length > 0} onOpenChange={(open) => !open && setAuditTargets([])}>
         <SheetContent className="w-full sm:max-w-2xl">
           <SheetHeader>
-            <SheetTitle>启动 Java 白盒审计{auditTarget ? `：${auditTarget.name}` : ""}</SheetTitle>
+            <SheetTitle>
+              {auditTargets.length > 1
+                ? `启动 ${auditTargets.length} 个服务的 Java 白盒审计`
+                : `启动 Java 白盒审计${auditTarget ? `：${auditTarget.name}` : ""}`}
+            </SheetTitle>
             <SheetDescription>
-              只读分析已确认服务的最新代码库版本。每次审计使用独立上下文，最多 4 个服务同时扫描。
+              只读分析所选服务的最新代码库版本。每个服务使用独立上下文；全局最多 4 个服务 同时扫描，其余服务排队等待。
             </SheetDescription>
           </SheetHeader>
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
@@ -1216,21 +1418,21 @@ export function AssetsTab({ taskId }: { taskId: string }) {
                 onChange={(event) => setAuditSourceAcknowledged(event.target.checked)}
               />
               <span>
-                我确认该服务源码会发送给上方显示的 LLM
+                我确认所选服务源码会发送给上方显示的 LLM
                 端点用于分析。平台默认不保存包含源码的请求和响应正文，仅保留用量、审计摘要和最小证据片段。
               </span>
             </label>
           </div>
           <SheetFooter>
-            <Button variant="outline" onClick={() => setAuditTarget(null)} disabled={auditStarting}>
+            <Button variant="outline" onClick={() => setAuditTargets([])} disabled={auditStarting}>
               取消
             </Button>
             <Button
               onClick={() => void startCodeAudit()}
-              disabled={auditStarting || auditConfigLoading || !auditConfig?.llm.available || !auditSourceAcknowledged}
+              disabled={auditStarting || auditConfigLoading || !auditConfigsReady || !auditSourceAcknowledged}
             >
               {auditStarting ? <Spinner data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}
-              手动启动审计
+              手动加入审计队列
             </Button>
           </SheetFooter>
         </SheetContent>

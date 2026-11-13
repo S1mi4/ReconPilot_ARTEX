@@ -522,6 +522,83 @@ export interface FindingAsset {
   label: string;
 }
 
+export interface CodeAuditLocation {
+  file: string;
+  line: number;
+  symbol: string;
+  description: string;
+  parameter?: string;
+}
+
+export interface CodeAuditFlowStep {
+  file: string;
+  line: number;
+  symbol: string;
+  propagation: string;
+}
+
+export interface CodeAuditControl {
+  file: string;
+  line: number;
+  control: string;
+}
+
+export interface CodeAuditCandidateEvidence {
+  title: string;
+  category: string;
+  source: CodeAuditLocation;
+  sink: CodeAuditLocation;
+  entry_point: CodeAuditLocation;
+  flow: CodeAuditFlowStep[];
+  controls_checked: CodeAuditControl[];
+  why_unobstructed: string;
+  evidence_excerpt: string;
+  remediation: string;
+}
+
+export interface CodeAuditReviewEvidence {
+  accepted: boolean;
+  reason: string;
+  vulnerability_type: string;
+  severity: Severity;
+  summary: string;
+  exploitability: string;
+  blocking_conditions: string;
+  source_verified: boolean;
+  sink_verified: boolean;
+  flow_verified: boolean;
+  no_effective_block: boolean;
+  exploitable: boolean;
+}
+
+export interface CodeAuditHistoryEvent {
+  kind: "observed" | "fixed" | "reproduced" | string;
+  version_id: string;
+  scope_path?: string;
+  audit_run_id?: number;
+  candidate_key?: string;
+  observed_at?: string;
+  reason?: string;
+  candidate?: CodeAuditCandidateEvidence;
+  review?: CodeAuditReviewEvidence;
+}
+
+export interface CodeAuditFindingEvidence {
+  candidate_key: string;
+  service_name: string;
+  relative_path: string;
+  codebase_id: string;
+  version_id: string;
+  scope_path: string;
+  identity_key?: string;
+  first_seen_version_id?: string;
+  last_seen_version_id?: string;
+  fixed_in_version_id?: string;
+  history?: CodeAuditHistoryEvent[];
+  candidate: CodeAuditCandidateEvidence;
+  review: CodeAuditReviewEvidence;
+}
+
 export interface Finding {
   case_id?: string;
   traffic_count?: number;
@@ -536,6 +613,7 @@ export interface Finding {
   status: FindingStatus;
   summary: string;
   evidence: string;
+  code_audit_evidence?: CodeAuditFindingEvidence;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
   report_conversation_id?: number;
   intent_id?: string;
@@ -2037,9 +2115,10 @@ export interface TaskCodeAuditCandidate {
   id: number;
   run_id: number;
   candidate_key: string;
-  review_status: "pending_review" | "dismissed";
+  review_status: "pending_review" | "rejected" | "published" | "dismissed";
   candidate: Record<string, unknown>;
   reviewer_summary: string;
+  verification_summary: string;
   created_at: string;
   updated_at: string;
 }

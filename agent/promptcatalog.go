@@ -64,12 +64,14 @@ const javaWhiteboxAuditDefaultTmpl = `你是用户手动启动的 Java 白盒审
 3. source 到 sink 的逐跳数据流（方法/参数/字段/返回值及行号）；
 4. 对照链路中的校验、编码、白名单、权限或其它阻断条件，并说明为什么它们没有阻断这条具体路径。
 
+首期只报告 SQL_INJECTION、COMMAND_INJECTION、PATH_TRAVERSAL、SSRF、XSS、UNSAFE_DESERIALIZATION 六类；访问控制和业务逻辑问题不进入候选。
+
 只有 source、sink 和连续数据流都明确，且没有有效阻断条件时，才输出候选。间接调用、反射、框架装配、配置来源或净化效果不明确时，排除候选并在 summary 标为待确认。不要把危险函数命中、依赖版本、注释或猜测单独当成漏洞。严重等级和置信度要与代码证据相称。
 
 每个候选仅给最小证据片段（总计不超过 800 个字符），不要复制整段文件。行号必须来自 read_file 返回的行号。不要输出完整源文件。没有候选时返回空数组。
 
 最终只返回 JSON，不要 Markdown：
-{"summary":"本分块分析摘要","candidates":[{"title":"简短中文标题","category":"漏洞类型","severity":"critical|high|medium|low|info","confidence":"high|medium","source":{"file":"范围内相对路径","line":1,"symbol":"方法或字段","description":"不可信数据来源"},"sink":{"file":"范围内相对路径","line":1,"symbol":"危险调用","parameter":"受影响参数"},"entry_point":{"file":"范围内相对路径","line":1,"description":"入口及暴露条件"},"flow":[{"file":"范围内相对路径","line":1,"symbol":"方法/字段","propagation":"参数|字段|返回值|配置"}],"controls_checked":[{"file":"范围内相对路径","line":1,"control":"实际检查的控制及其效果"}],"why_unobstructed":"为何 source 到 sink 的这条路径没有被有效阻断","evidence_excerpt":"最小代码证据，含行号","remediation":"针对该路径的修复建议"}]}`
+{"summary":"本分块分析摘要","candidates":[{"title":"简短中文标题","category":"SQL_INJECTION|COMMAND_INJECTION|PATH_TRAVERSAL|SSRF|XSS|UNSAFE_DESERIALIZATION","severity":"critical|high|medium|low|info","confidence":"high|medium","source":{"file":"范围内相对路径","line":1,"symbol":"方法或字段","description":"不可信数据来源"},"sink":{"file":"范围内相对路径","line":1,"symbol":"危险调用","parameter":"受影响参数"},"entry_point":{"file":"范围内相对路径","line":1,"description":"入口及暴露条件"},"flow":[{"file":"范围内相对路径","line":1,"symbol":"方法/字段","propagation":"参数|字段|返回值|配置"}],"controls_checked":[{"file":"范围内相对路径","line":1,"control":"实际检查的控制及其效果"}],"why_unobstructed":"为何 source 到 sink 的这条路径没有被有效阻断","evidence_excerpt":"最小代码证据，含行号","remediation":"针对该路径的修复建议"}]}`
 
 // pentestDefaultTmpl is the built-in "渗透测试" (solo pentest) agent's prompt. Unlike
 // the orchestration roles (goals/planner/worker), it runs standalone via the chat page
@@ -168,14 +170,14 @@ const ReporterDefaultPrompt = `你是一个授权渗透测试系统里的**漏�
 // source while the same string stays as the in-code render fallback.
 func BuiltinPromptSeeds() map[string]string {
 	return map[string]string{
-		"goals":              goalsDefaultTmpl,
-		"planner":            plannerDefaultTmpl,
-		"mainagent":          mainAgentDefaultTmpl,
-		"worker":             workerDefaultTmpl,
-		"auto":               autoDefaultTmpl,
-		"asset_mapper":       assetMapperDefaultTmpl,
-		"codebase_discovery": codebaseDiscoveryDefaultTmpl,
+		"goals":               goalsDefaultTmpl,
+		"planner":             plannerDefaultTmpl,
+		"mainagent":           mainAgentDefaultTmpl,
+		"worker":              workerDefaultTmpl,
+		"auto":                autoDefaultTmpl,
+		"asset_mapper":        assetMapperDefaultTmpl,
+		"codebase_discovery":  codebaseDiscoveryDefaultTmpl,
 		"whitebox_java_audit": javaWhiteboxAuditDefaultTmpl,
-		"pentest":            pentestDefaultTmpl,
+		"pentest":             pentestDefaultTmpl,
 	}
 }

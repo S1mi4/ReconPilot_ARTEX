@@ -795,13 +795,18 @@ CREATE TABLE IF NOT EXISTS task_code_audit_candidates (
     id                BIGSERIAL PRIMARY KEY,
     run_id            BIGINT NOT NULL REFERENCES task_code_audit_runs(id) ON DELETE CASCADE,
     candidate_key     TEXT NOT NULL,
-    review_status     TEXT NOT NULL DEFAULT 'pending_review' CHECK (review_status IN ('pending_review','dismissed')),
+    review_status     TEXT NOT NULL DEFAULT 'pending_review',
     candidate         JSONB NOT NULL,
     reviewer_summary  TEXT NOT NULL DEFAULT '',
+    verification_summary TEXT NOT NULL DEFAULT '',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (run_id, candidate_key)
 );
+ALTER TABLE task_code_audit_candidates ADD COLUMN IF NOT EXISTS verification_summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_code_audit_candidates DROP CONSTRAINT IF EXISTS task_code_audit_candidates_review_status_check;
+ALTER TABLE task_code_audit_candidates ADD CONSTRAINT task_code_audit_candidates_review_status_check
+    CHECK (review_status IN ('pending_review','rejected','published','dismissed'));
 CREATE INDEX IF NOT EXISTS idx_task_code_audit_candidates_run
     ON task_code_audit_candidates(run_id, created_at, id);
 
@@ -1305,6 +1310,7 @@ CREATE TABLE IF NOT EXISTS findings (
     severity    TEXT NOT NULL DEFAULT '',
     summary     TEXT NOT NULL DEFAULT '',
     evidence    TEXT NOT NULL DEFAULT '',
+    code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
     worker      TEXT NOT NULL DEFAULT '',
     asset_ids   JSONB NOT NULL DEFAULT '[]',
     -- 处置状态：pending 待处理 / in_progress 处理中 / confirmed 已确认 / resolved 已处理 / fixed 已修复 /
@@ -1320,6 +1326,14 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pend
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- White-box findings are deduplicated by a stable service/source/sink identity in
+-- the application. A candidate key includes line coordinates and changes across
+-- versions, so it must not be a uniqueness constraint on the long-lived Finding.
+DROP INDEX IF EXISTS idx_findings_code_audit_candidate;
+CREATE INDEX IF NOT EXISTS idx_findings_code_audit_identity
+    ON findings(task_id,(code_audit_evidence->>'identity_key'))
+    WHERE code_audit_evidence ? 'identity_key';
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);

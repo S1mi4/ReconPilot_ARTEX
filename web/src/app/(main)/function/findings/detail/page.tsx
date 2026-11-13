@@ -26,7 +26,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, Severity } from "@/lib/types";
+import type { CodeAuditFindingEvidence, Finding, FindingStatus, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -60,6 +60,138 @@ function FieldRow({ label, children }: { label: string; children: React.ReactNod
       <span className="shrink-0 pt-0.5 text-xs text-muted-foreground">{label}</span>
       <div className="flex min-w-0 flex-col items-end gap-1 text-right text-sm">{children}</div>
     </div>
+  );
+}
+
+function FindingCodeAuditEvidenceCard({
+  evidence,
+  status,
+  ui,
+}: {
+  evidence: CodeAuditFindingEvidence;
+  status: FindingStatus;
+  ui: UITranslate;
+}) {
+  const location = (label: string, item: CodeAuditFindingEvidence["candidate"]["source"]) => (
+    <div className="rounded-md border p-3">
+      <p className="font-medium text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 break-all font-mono text-xs">
+        {item.file}:{item.line} · {item.symbol}
+        {item.parameter ? ` (${item.parameter})` : ""}
+      </p>
+      <p className="mt-1 text-sm">{item.description}</p>
+    </div>
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">白盒污点路径与复核证据</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="text-xs text-muted-foreground">
+          服务：{evidence.service_name} · 路径：{evidence.relative_path} · 版本：{evidence.version_id} · 范围：
+          {evidence.scope_path}
+        </div>
+        {evidence.history?.length ? (
+          <section className="space-y-2 rounded-md border p-3">
+            <h3 className="font-medium text-sm">代码版本与审计历史</h3>
+            <p className="text-xs text-muted-foreground">
+              首次发现：
+              {evidence.first_seen_version_id ??
+                evidence.history.find((event) => event.kind === "observed")?.version_id ??
+                "—"}
+              {evidence.last_seen_version_id ? ` · 最近复现：${evidence.last_seen_version_id}` : ""}
+            </p>
+            {status === "fixed" && evidence.fixed_in_version_id ? (
+              <p className="text-sm">
+                完整审计在版本 {evidence.fixed_in_version_id} 中未再复现，Finding 已标记为已修复。
+              </p>
+            ) : null}
+            <ol className="space-y-2">
+              {evidence.history.map((event, index) => {
+                let label = "再次复现";
+                if (event.kind === "observed") label = "复核确认";
+                if (event.kind === "fixed") label = "未再复现";
+                return (
+                  <li
+                    className="rounded-md bg-muted/50 p-2"
+                    key={`${event.kind}:${event.audit_run_id ?? index}:${event.version_id}`}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="outline">{label}</Badge>
+                      <span className="break-all font-mono text-xs">版本 {event.version_id}</span>
+                      {event.audit_run_id ? (
+                        <span className="text-xs text-muted-foreground">审计 #{event.audit_run_id}</span>
+                      ) : null}
+                      {event.observed_at ? (
+                        <span className="text-xs text-muted-foreground">{fmtTime(event.observed_at, ui)}</span>
+                      ) : null}
+                    </div>
+                    {event.candidate ? (
+                      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                        {event.candidate.source.file}:{event.candidate.source.line} · {event.candidate.source.symbol} →{" "}
+                        {event.candidate.sink.file}:{event.candidate.sink.line} · {event.candidate.sink.symbol}
+                      </p>
+                    ) : null}
+                    {event.reason ? <p className="mt-1 text-xs">{event.reason}</p> : null}
+                  </li>
+                );
+              })}
+            </ol>
+          </section>
+        ) : null}
+        <div className="grid gap-3 md:grid-cols-2">
+          {location("Source", evidence.candidate.source)}
+          {location("Sink", evidence.candidate.sink)}
+          {location("可访问入口", evidence.candidate.entry_point)}
+        </div>
+        <section>
+          <h3 className="mb-2 font-medium text-sm">完整数据流</h3>
+          <ol className="space-y-2">
+            {evidence.candidate.flow.map((step, index) => (
+              <li
+                className="rounded-md border p-2"
+                key={`${step.file}:${step.line}:${step.symbol}:${step.propagation}`}
+              >
+                <p className="break-all font-mono text-xs">
+                  {index + 1}. {step.file}:{step.line} · {step.symbol}
+                </p>
+                <p className="mt-1 text-sm">{step.propagation}</p>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section>
+          <h3 className="mb-2 font-medium text-sm">阻断条件检查</h3>
+          <ul className="space-y-2">
+            {evidence.candidate.controls_checked.map((control) => (
+              <li className="text-sm" key={`${control.file}:${control.line}:${control.control}`}>
+                <span className="font-mono text-xs">
+                  {control.file}:{control.line}
+                </span>{" "}
+                — {control.control}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-2 whitespace-pre-wrap text-sm">初筛说明：{evidence.candidate.why_unobstructed}</p>
+          <p className="mt-2 whitespace-pre-wrap text-sm">独立复核：{evidence.review.blocking_conditions}</p>
+        </section>
+        <section className="space-y-2">
+          <h3 className="font-medium text-sm">可利用性确认</h3>
+          <p className="whitespace-pre-wrap text-sm">{evidence.review.exploitability}</p>
+          <p className="whitespace-pre-wrap text-sm text-muted-foreground">复核结论：{evidence.review.reason}</p>
+        </section>
+        {evidence.candidate.evidence_excerpt ? (
+          <pre className="max-h-48 overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+            {evidence.candidate.evidence_excerpt}
+          </pre>
+        ) : null}
+        {evidence.candidate.remediation ? (
+          <p className="whitespace-pre-wrap text-sm">修复建议：{evidence.candidate.remediation}</p>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -245,6 +377,13 @@ function FindingDetailInner() {
                     </p>
                   </CardContent>
                 </Card>
+                {finding.code_audit_evidence ? (
+                  <FindingCodeAuditEvidenceCard
+                    evidence={finding.code_audit_evidence}
+                    status={finding.status}
+                    ui={ui}
+                  />
+                ) : null}
                 {structuredReproduction ? (
                   <FindingReproductionPanel finding={finding} contextTask={contextTaskId || undefined} />
                 ) : (

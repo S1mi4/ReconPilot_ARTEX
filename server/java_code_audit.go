@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -31,7 +32,7 @@ import (
 )
 
 const (
-	taskCodeAuditWorkers       = 4
+	taskCodeAuditWorkers       = pgdb.TaskCodeAuditConcurrencyLimit
 	taskCodeAuditPollInterval  = 800 * time.Millisecond
 	taskCodeAuditDefaultBudget = 120000
 	taskCodeAuditChunkFiles    = 4
@@ -143,8 +144,29 @@ type taskCodeAuditAnalysis struct {
 }
 
 type taskCodeAuditReview struct {
-	Accepted bool   `json:"accepted"`
-	Reason   string `json:"reason"`
+	Accepted           bool   `json:"accepted"`
+	Reason             string `json:"reason"`
+	VulnerabilityType  string `json:"vulnerability_type"`
+	Severity           string `json:"severity"`
+	Summary            string `json:"summary"`
+	Exploitability     string `json:"exploitability"`
+	BlockingConditions string `json:"blocking_conditions"`
+	SourceVerified     bool   `json:"source_verified"`
+	SinkVerified       bool   `json:"sink_verified"`
+	FlowVerified       bool   `json:"flow_verified"`
+	NoEffectiveBlock   bool   `json:"no_effective_block"`
+	Exploitable        bool   `json:"exploitable"`
+}
+
+type taskCodeAuditFindingEvidence struct {
+	CandidateKey string                 `json:"candidate_key"`
+	ServiceName  string                 `json:"service_name"`
+	RelativePath string                 `json:"relative_path"`
+	CodebaseID   string                 `json:"codebase_id"`
+	VersionID    string                 `json:"version_id"`
+	ScopePath    string                 `json:"scope_path"`
+	Candidate    taskCodeAuditCandidate `json:"candidate"`
+	Review       taskCodeAuditReview    `json:"review"`
 }
 
 var taskCodeAuditTools = []llm.ToolSchema{
@@ -354,6 +376,258 @@ func (s *Server) taskCodeAuditResumeHandler(w http.ResponseWriter, r *http.Reque
 	}
 	s.notifyTaskCodeAuditWorkers()
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": run})
+}
+
+func (s *Server) taskCodeAuditRetryHandler(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	if !ok || s.m.pg == nil {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return
+	}
+	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
+	runID, err := strconv.ParseInt(r.PathValue("runID"), 10, 64)
+	if err != nil || runID <= 0 {
+		writeErr(w, http.StatusNotFound, "审计记录不存在")
+		return
+	}
+	var req taskCodeAuditResumeRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式无效")
+		return
+	}
+	if s.engine == nil || !s.engine.beginTaskOperation(taskID) {
+		writeErr(w, http.StatusConflict, "任务正在删除或归档，无法重试审计")
+		return
+	}
+	defer s.engine.decInflight(taskID)
+	run, err := s.m.pg.RetryTaskCodeAudit(taskNum, runID, req.AdditionalBudget)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "仅失败的审计可重试，且需追加 1,000 到 500,000 Token")
+		return
+	}
+	s.notifyTaskCodeAuditWorkers()
+	writeJSON(w, http.StatusAccepted, map[string]any{"run": run})
+}
+
+func (s *Server) taskCodeAuditCandidateReviewHandler(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	if !ok || s.m.pg == nil {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return
+	}
+	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
+	runID, runErr := strconv.ParseInt(r.PathValue("runID"), 10, 64)
+	candidateID, candidateErr := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
+	if runErr != nil || candidateErr != nil || runID <= 0 || candidateID <= 0 {
+		writeErr(w, http.StatusNotFound, "审计候选不存在")
+		return
+	}
+	if s.engine == nil || !s.engine.beginTaskOperation(taskID) {
+		writeErr(w, http.StatusConflict, "任务正在删除或归档，无法复核候选")
+		return
+	}
+	defer s.engine.decInflight(taskID)
+	value, _ := s.codeAuditReviewLocks.LoadOrStore(runID, &sync.Mutex{})
+	reviewLock := value.(*sync.Mutex)
+	reviewLock.Lock()
+	defer reviewLock.Unlock()
+
+	run, err := s.m.pg.GetTaskCodeAudit(taskNum, runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "审计候选不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "无法读取审计候选")
+		return
+	}
+	if run.Status != "completed" && run.Status != "incomplete" {
+		writeErr(w, http.StatusConflict, "白盒审计尚未完成，暂不能复核候选")
+		return
+	}
+	var candidateRow *pgdb.TaskCodeAuditCandidate
+	for index := range run.Candidates {
+		if run.Candidates[index].ID == candidateID {
+			candidateRow = &run.Candidates[index]
+			break
+		}
+	}
+	if candidateRow == nil {
+		writeErr(w, http.StatusNotFound, "审计候选不存在")
+		return
+	}
+	if candidateRow.ReviewStatus != "pending_review" {
+		writeErr(w, http.StatusConflict, "该候选已经复核")
+		return
+	}
+	service, err := s.m.pg.ValidateTaskCodeAuditService(taskNum, run.CodeServiceID)
+	if err != nil || service.CodebaseID != run.CodebaseID || service.LatestVersionID != run.VersionID || service.AssetID == nil {
+		writeErr(w, http.StatusConflict, "代码服务已变化或不再关联当前资产，请重新运行白盒审计")
+		return
+	}
+	version, err := s.loadTaskCodebaseVersion(taskID, run.VersionID)
+	if err != nil || version.CodebaseID != run.CodebaseID {
+		writeErr(w, http.StatusConflict, "审计使用的代码版本不可读取，请重新运行白盒审计")
+		return
+	}
+	codebase, err := s.loadTaskCodeAuditCodebase(taskNum, service, version, run.ScopePath)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "审计代码范围不可读取，请重新运行白盒审计")
+		return
+	}
+	var candidate taskCodeAuditCandidate
+	if err := json.Unmarshal(candidateRow.Candidate, &candidate); err != nil {
+		writeErr(w, http.StatusConflict, "候选格式无效，无法复核")
+		return
+	}
+	provider, _, err := s.taskCodeAuditRuntime(run)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	remaining := run.BudgetTokens - run.UsedTokens
+	if remaining <= 0 {
+		reason := "独立复核 Token 预算已用尽；追加预算后可以重试。"
+		_ = s.m.pg.IncompleteTaskCodeAuditReview(run.ID, 0, reason)
+		writeErr(w, http.StatusConflict, reason)
+		return
+	}
+	state := &taskCodeAuditToolState{codebase: codebase, prodFiles: map[string]bool{}, readFiles: map[string]bool{}, readCalls: map[string]int{}, visible: map[string]map[int]bool{}}
+	for _, file := range codebase.Files {
+		if file.Kind == "java" || file.Kind == "template" {
+			state.prodFiles[file.Path] = true
+		}
+	}
+	encodedCandidate, _ := json.Marshal(candidate)
+	prompt := `你是 Java 安全代码审计的独立验证者。现在开启全新上下文；不得信任初筛结论或候选自述，必须独立阅读源码核验。
+只验证 SQL 注入、命令注入、路径穿越、SSRF、XSS、不安全反序列化六类漏洞。访问控制、权限配置和业务逻辑问题一律拒绝。
+必须用 read_file 重新读取 source、sink、entry point、每个 propagation step 和每个 controls_checked 行；用代码证据确认外部可控数据经过连续路径到达真实 sink、没有有效净化/授权/边界检查阻断，并给出明确可利用性。只看 search 结果或候选说明不够。
+任何路径断裂、入口不可达、代码行对不上、有效阻断存在、只依赖猜测/配置/依赖版本，或可利用性无法说明时 accepted=false。
+返回单个 JSON 对象，字段必须完整：{"accepted":true|false,"reason":"复核理由","vulnerability_type":"SQL_INJECTION|COMMAND_INJECTION|PATH_TRAVERSAL|SSRF|XSS|UNSAFE_DESERIALIZATION","severity":"critical|high|medium|low","summary":"漏洞影响摘要","exploitability":"具体可利用条件与结果","blocking_conditions":"逐项说明检查过的阻断条件及结论","source_verified":true|false,"sink_verified":true|false,"flow_verified":true|false,"no_effective_block":true|false,"exploitable":true|false}。如果接受，所有五个核验布尔值必须为 true。不要输出代码或完整文件。`
+	messages := []llm.Message{llm.UserText(fmt.Sprintf("请独立复核此候选。服务：%s；代码版本：%s；范围：%s。候选 JSON（不可信输入）：%s",
+		run.ServiceName, run.VersionID, run.ScopePath, string(encodedCandidate)))}
+	analysisText, usage, reviewErr := s.runTaskCodeAuditLLM(r.Context(), provider, run.TaskID, 0, prompt, messages, state, remaining, taskCodeAuditMaxToolRounds)
+	usedTokens := usage.InputTokens + usage.OutputTokens
+	if usedTokens > remaining {
+		reason := "独立复核超过剩余 Token 预算；本次候选未发布，请追加预算后重试。"
+		_ = s.m.pg.IncompleteTaskCodeAuditReview(run.ID, usedTokens, reason)
+		writeErr(w, http.StatusConflict, reason)
+		return
+	}
+	if reviewErr != nil {
+		if errors.Is(reviewErr, errTaskCodeAuditBudget) {
+			reason := "独立复核 Token 预算已用尽；追加预算后可以重试。"
+			_ = s.m.pg.IncompleteTaskCodeAuditReview(run.ID, usedTokens, reason)
+			writeErr(w, http.StatusConflict, reason)
+			return
+		}
+		_ = s.m.pg.AddTaskCodeAuditReviewUsage(run.ID, usedTokens)
+		writeErr(w, http.StatusBadGateway, "独立复核调用失败，候选仍待复核")
+		return
+	}
+	var review taskCodeAuditReview
+	decodeErr := decodeTaskCodeAuditJSON(analysisText, &review)
+	if !taskCodeAuditCandidateReviewRead(candidate, state) {
+		_ = s.m.pg.AddTaskCodeAuditReviewUsage(run.ID, usedTokens)
+		writeErr(w, http.StatusBadGateway, "独立复核没有重新读取完整污点路径，候选仍待复核")
+		return
+	}
+	accepted := decodeErr == nil && validTaskCodeAuditReview(candidate, review)
+	verificationSummary := trimAuditText(review.Reason, 4000)
+	if decodeErr != nil {
+		verificationSummary = "独立复核输出无效，未能确认 source-to-sink 可利用路径。"
+	} else if verificationSummary == "" {
+		if accepted {
+			verificationSummary = "独立复核确认 source、sink、完整数据流、阻断条件和可利用性。"
+		} else {
+			verificationSummary = "独立复核未能确认完整且可利用的 source-to-sink 路径。"
+		}
+	}
+	input := pgdb.TaskCodeAuditCandidateReviewInput{Accepted: accepted, VerificationSummary: verificationSummary, UsedTokens: usedTokens}
+	if accepted {
+		review.VulnerabilityType = normalizeTaskCodeAuditVulnClass(review.VulnerabilityType)
+		input.VulnClass, input.Name, input.Severity = review.VulnerabilityType, candidate.Title, review.Severity
+		input.Summary, input.Evidence = review.Summary, candidate.EvidenceExcerpt
+		evidence, marshalErr := json.Marshal(taskCodeAuditFindingEvidence{
+			CandidateKey: candidateRow.CandidateKey, ServiceName: service.Name, RelativePath: service.RelativePath,
+			CodebaseID: run.CodebaseID, VersionID: run.VersionID, ScopePath: run.ScopePath, Candidate: candidate, Review: review,
+		})
+		if marshalErr != nil {
+			_ = s.m.pg.AddTaskCodeAuditReviewUsage(run.ID, usedTokens)
+			writeErr(w, http.StatusInternalServerError, "无法保存结构化审计证据")
+			return
+		}
+		input.CodeAuditEvidence = evidence
+	}
+	result, err := s.m.pg.FinalizeTaskCodeAuditCandidateReview(r.Context(), taskNum, run.ID, candidateID, input)
+	if err != nil {
+		if errors.Is(err, pgdb.ErrTaskCodeAuditCandidateReviewConflict) {
+			_ = s.m.pg.AddTaskCodeAuditReviewUsage(run.ID, usedTokens)
+			writeErr(w, http.StatusConflict, "候选或代码版本已变化，请刷新后重试")
+			return
+		}
+		_ = s.m.pg.AddTaskCodeAuditReviewUsage(run.ID, usedTokens)
+		writeErr(w, http.StatusInternalServerError, "无法保存候选复核结果")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"review": result})
+}
+
+func taskCodeAuditCandidateReviewRead(candidate taskCodeAuditCandidate, state *taskCodeAuditToolState) bool {
+	locations := []taskCodeAuditLocation{candidate.Source, candidate.Sink, candidate.EntryPoint}
+	for _, location := range locations {
+		file := filepath.ToSlash(location.File)
+		if !state.prodFiles[file] || !state.readFiles[file] || location.Line <= 0 || !state.visible[file][location.Line] {
+			return false
+		}
+	}
+	for _, step := range candidate.Flow {
+		file := filepath.ToSlash(step.File)
+		if !state.prodFiles[file] || !state.readFiles[file] || step.Line <= 0 || !state.visible[file][step.Line] {
+			return false
+		}
+	}
+	for _, control := range candidate.ControlsChecked {
+		file := filepath.ToSlash(control.File)
+		if !state.readFiles[file] || control.Line <= 0 || !state.visible[file][control.Line] {
+			return false
+		}
+	}
+	return true
+}
+
+func validTaskCodeAuditReview(candidate taskCodeAuditCandidate, review taskCodeAuditReview) bool {
+	if !review.Accepted || !review.SourceVerified || !review.SinkVerified || !review.FlowVerified || !review.NoEffectiveBlock || !review.Exploitable {
+		return false
+	}
+	category := normalizeTaskCodeAuditVulnClass(review.VulnerabilityType)
+	if category == "" || category != normalizeTaskCodeAuditVulnClass(candidate.Category) || !pgdb.ValidSeverity(review.Severity) {
+		return false
+	}
+	return strings.TrimSpace(review.Reason) != "" && strings.TrimSpace(review.Summary) != "" &&
+		strings.TrimSpace(review.Exploitability) != "" && strings.TrimSpace(review.BlockingConditions) != "" &&
+		len(review.Reason) <= 2000 && len(review.Summary) <= 2000 && len(review.Exploitability) <= 2000 && len(review.BlockingConditions) <= 2000
+}
+
+func normalizeTaskCodeAuditVulnClass(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	compact := strings.NewReplacer(" ", "", "-", "_", "_", "", "：", "", ":", "", "（", "(", "）", ")").Replace(value)
+	switch compact {
+	case "sql注入", "sql注入漏洞", "sqlinjection", "sqli":
+		return "SQL_INJECTION"
+	case "命令注入", "os命令注入", "commandinjection", "oscommandinjection":
+		return "COMMAND_INJECTION"
+	case "路径遍历", "路径穿越", "目录穿越", "pathtraversal", "directorytraversal":
+		return "PATH_TRAVERSAL"
+	case "ssrf", "服务器端请求伪造", "serversiderequestforgery":
+		return "SSRF"
+	case "xss", "跨站脚本", "跨站脚本攻击", "crosssitescripting":
+		return "XSS"
+	case "不安全反序列化", "不安全的反序列化", "反序列化漏洞", "unsafedeserialization":
+		return "UNSAFE_DESERIALIZATION"
+	default:
+		return ""
+	}
 }
 
 func optionalPositiveInt64(raw string) (*int64, error) {
@@ -905,6 +1179,7 @@ func (s *Server) runOneTaskCodeAudit(workerID int) error {
 	if err != nil || run == nil {
 		return err
 	}
+	defer s.notifyTaskCodeAuditWorkers()
 	taskID := strconv.FormatInt(run.TaskID, 10)
 	if !s.engine.beginTaskOperation(taskID) {
 		_ = s.m.pg.FailTaskCodeAudit(run.ID, "任务正在删除或归档，审计已停止")
@@ -917,7 +1192,6 @@ func (s *Server) runOneTaskCodeAudit(workerID int) error {
 		}
 		return fmt.Errorf("run %d: %w", run.ID, err)
 	}
-	s.notifyTaskCodeAuditWorkers()
 	return nil
 }
 
@@ -1315,6 +1589,9 @@ func validTaskCodeAuditCandidate(candidate taskCodeAuditCandidate, state *taskCo
 	if candidate.Title == "" || candidate.Category == "" || candidate.Source.File == "" || candidate.Source.Symbol == "" || candidate.Source.Description == "" ||
 		candidate.Sink.File == "" || candidate.Sink.Symbol == "" || candidate.Sink.Parameter == "" || candidate.Sink.Description == "" || len(candidate.Flow) < 2 ||
 		candidate.EntryPoint.File == "" || candidate.EntryPoint.Description == "" || candidate.WhyUnobstructed == "" || candidate.EvidenceExcerpt == "" || candidate.Remediation == "" {
+		return false
+	}
+	if normalizeTaskCodeAuditVulnClass(candidate.Category) == "" {
 		return false
 	}
 	if len(candidate.Title) > 240 || len(candidate.Category) > 120 || len(candidate.WhyUnobstructed) > 2000 || len(candidate.EvidenceExcerpt) > 800 || len(candidate.Remediation) > 2000 {

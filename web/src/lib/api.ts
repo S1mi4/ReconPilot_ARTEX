@@ -693,6 +693,15 @@ export const api = {
     post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-audits/${runID}/resume`, {
       additional_budget_tokens: additionalBudgetTokens,
     }),
+  retryTaskCodeAudit: (id: string, runID: number, additionalBudgetTokens: number) =>
+    post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-audits/${runID}/retry`, {
+      additional_budget_tokens: additionalBudgetTokens,
+    }),
+  reviewTaskCodeAuditCandidate: (id: string, runID: number, candidateID: number) =>
+    post<{ review: { status: "published" | "rejected"; finding_id?: number } }>(
+      `/tasks/${id}/code-audits/${runID}/candidates/${candidateID}/review`,
+      {},
+    ),
   taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
   taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
   taskFileRead: (id: string, path: string) =>

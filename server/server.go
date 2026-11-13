@@ -126,16 +126,17 @@ type Server struct {
 
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
-	archiveWake       chan struct{}
-	archiveWG         sync.WaitGroup
-	auditWake         chan struct{}
-	auditWG           sync.WaitGroup
-	credentialWake    chan struct{}
-	proxyReconnect    proxyReconnectSupervisor
-	proxyPoolWake     chan struct{}
-	proxyPoolWG       sync.WaitGroup
-	proxyPoolProbeSem chan struct{}
-	proxyPoolTickMu   sync.Mutex
+	archiveWake          chan struct{}
+	archiveWG            sync.WaitGroup
+	auditWake            chan struct{}
+	auditWG              sync.WaitGroup
+	codeAuditReviewLocks sync.Map
+	credentialWake       chan struct{}
+	proxyReconnect       proxyReconnectSupervisor
+	proxyPoolWake        chan struct{}
+	proxyPoolWG          sync.WaitGroup
+	proxyPoolProbeSem    chan struct{}
+	proxyPoolTickMu      sync.Mutex
 	// proxyProbe is injectable for deterministic reconnect race tests. Production
 	// servers leave it nil and use probeEgress directly.
 	proxyProbe func(context.Context, string, string, []string, time.Duration) egressProbeResult
@@ -887,6 +888,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/code-audits", s.taskCodeAuditsListHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-audits/{runID}", s.taskCodeAuditGetHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/resume", s.taskCodeAuditResumeHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/retry", s.taskCodeAuditRetryHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/candidates/{candidateID}/review", s.taskCodeAuditCandidateReviewHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/files", s.taskFilesList)
 	mux.HandleFunc("GET /api/tasks/{id}/files/all", s.taskFilesAll)
 	mux.HandleFunc("GET /api/tasks/{id}/files/read", s.taskFilesServe)
