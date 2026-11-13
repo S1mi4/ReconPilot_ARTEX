@@ -72,9 +72,9 @@ func TestNotificationAssetNamesResolvesAndPreservesOrder(t *testing.T) {
 		}
 		return id
 	}
-	domID := insertAsset(`INSERT INTO assets(type, domain) VALUES('subdomain',$1) RETURNING id`, "a.example.com")
-	ipID := insertAsset(`INSERT INTO assets(type, ip) VALUES('ip',$1) RETURNING id`, "10.1.2.3")
-	svcID := insertAsset(`INSERT INTO assets(type, url) VALUES('service',$1) RETURNING id`, "https://a.example.com/admin")
+	domID := insertAsset(`INSERT INTO assets(project_id,type, domain) VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'subdomain',$1) RETURNING id`, "a.example.com")
+	ipID := insertAsset(`INSERT INTO assets(project_id,type, ip) VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'ip',$1) RETURNING id`, "10.1.2.3")
+	svcID := insertAsset(`INSERT INTO assets(project_id,type, url) VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'service',$1) RETURNING id`, "https://a.example.com/admin")
 	t.Cleanup(func() {
 		d.Exec(`DELETE FROM assets WHERE id IN ($1,$2,$3)`, domID, ipID, svcID)
 	})
@@ -523,7 +523,7 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	d := notifyTestDB(t)
 	ctx := context.Background()
 
-	tk, err := d.CreateTask("通知状态变更测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "通知状态变更测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,7 +811,7 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	d := notifyTestDB(t)
 	ctx := context.Background()
 
-	tk, err := d.CreateTask("复测推送测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "复测推送测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +827,7 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
 
 	// 建一条复测记录并直接推到完成态。
-	rt, _, _, err := d.CreateFindingRetest(ctx, f.FindingID, "复核")
+	rt, _, _, err := d.CreateFindingRetest(ctx, testProjectID(t, d), f.FindingID, "复核")
 	if err != nil {
 		t.Fatal(err)
 	}

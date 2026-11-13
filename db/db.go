@@ -274,29 +274,16 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedBuiltinSkillVisibility(); err != nil {
 		return fmt.Errorf("seed skill visibility: %w", err)
 	}
-	if err := d.seedDefaultInterceptRules(); err != nil {
-		return fmt.Errorf("seed intercept rules: %w", err)
-	}
-	if err := d.seedDefaultInterceptRulesV2(); err != nil {
-		return fmt.Errorf("seed intercept rules v2: %w", err)
-	}
-	if err := d.seedDefaultInterceptRulesV3(); err != nil {
-		return fmt.Errorf("seed intercept rules v3: %w", err)
-	}
-	if err := d.seedDefaultAssetInterceptRules(); err != nil {
-		return fmt.Errorf("seed asset intercept rules: %w", err)
+	if err := d.SeedProjectRules(); err != nil {
+		return fmt.Errorf("seed project rules: %w", err)
 	}
 	return nil
 }
 
-// seedDefaultAssetInterceptRules inserts the built-in asset blocklist (fuzzy
-// domain matches for government / education sites) once on first startup. Gated
-// by a settings flag so a user's later disable/delete is never resurrected on
-// restart — same policy as the intercept-rule seed.
-func (d *DB) seedDefaultAssetInterceptRules() error {
-	if v, _, _ := d.GetSetting("asset_intercept_default_rules_v1"); v == "done" {
-		return nil
-	}
+// seedAssetInterceptRules inserts the built-in asset blocklist (fuzzy domain
+// matches for government / education sites) for one project. 每个项目各灌一份；
+// 灌过一次后由 projects.rules_seeded_at 记住，用户后续的停用/删除不会被重启复活。
+func (d *DB) seedAssetInterceptRules(projectID int64) error {
 	rules := []struct {
 		kind    string
 		pattern string
@@ -309,13 +296,12 @@ func (d *DB) seedDefaultAssetInterceptRules() error {
 	}
 	for _, r := range rules {
 		if _, err := d.Exec(`
-INSERT INTO asset_intercept_rules(enabled, kind, pattern, note, builtin)
-VALUES (true, $1, $2, $3, true)
-ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
+INSERT INTO asset_intercept_rules(project_id, enabled, kind, pattern, note, builtin)
+VALUES ($1, true, $2, $3, $4, true)`, projectID, r.kind, r.pattern, r.note); err != nil {
 			return fmt.Errorf("asset rule %q: %w", r.pattern, err)
 		}
 	}
-	return d.SetSetting("asset_intercept_default_rules_v1", "done")
+	return nil
 }
 
 // builtinSkillVisibility maps a shipped skill's directory name → the built-in
@@ -349,10 +335,7 @@ ON CONFLICT (agent_id, skill_name) DO NOTHING`, key, skillName); err != nil {
 // seedDefaultInterceptRules inserts built-in safety intercept rules once on
 // first startup. The seed is gated by a settings flag so user edits (disable,
 // delete, re-order) are never overwritten on subsequent restarts.
-func (d *DB) seedDefaultInterceptRules() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v1"); v == "done" {
-		return nil
-	}
+func (d *DB) seedInterceptRulesV1(projectID int64) error {
 	type rule struct {
 		name     string
 		target   string // tool_name | tool_input
@@ -526,28 +509,24 @@ func (d *DB) seedDefaultInterceptRules() error {
 	}
 	for _, r := range rules {
 		if _, err := d.Exec(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, true, $2, $3, $4, $5, $6, $7, false, 60, 'deny')
-ON CONFLICT DO NOTHING`,
-			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
+INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, $2, true, $3, $4, $5, $6, $7, $8, false, 60, 'deny')`,
+			projectID, r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
 		); err != nil {
 			return fmt.Errorf("rule %q: %w", r.name, err)
 		}
 	}
-	return d.SetSetting("intercept_default_rules_v1", "done")
+	return nil
 }
 
-// seedDefaultInterceptRulesV2 migrates the two safety patterns that used to be
+// seedInterceptRulesV2 migrates the two safety patterns that used to be
 // hard-coded in guard.go (destructive shell + data-exfil pipe) into ordinary
-// intercept rules. Gated by its own flag so it also lands on DBs that already ran
-// v1. Unlike the old guard.go floor, these are plain [内置] rules — the user can
-// disable or delete them. The exfil rule ships DISABLED by default (its
-// curl/wget/nc pipe pattern mis-fires on legitimate CTF/pentest reverse-shell and
-// data-transfer pipes); enable it manually when exfil gating is actually wanted.
-func (d *DB) seedDefaultInterceptRulesV2() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v2"); v == "done" {
-		return nil
-	}
+// intercept rules. 每个项目各灌一份（项目层隔离后不存在「全局规则」）。Unlike the
+// old guard.go floor, these are plain [内置] rules — the user can disable or
+// delete them. The exfil rule ships DISABLED by default (its curl/wget/nc pipe
+// pattern mis-fires on legitimate CTF/pentest reverse-shell and data-transfer
+// pipes); enable it manually when exfil gating is actually wanted.
+func (d *DB) seedInterceptRulesV2(projectID int64) error {
 	rules := []struct {
 		name     string
 		pattern  string
@@ -575,24 +554,23 @@ func (d *DB) seedDefaultInterceptRulesV2() error {
 	}
 	for _, r := range rules {
 		if _, err := d.Exec(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, $2, $3, 'tool_input', 'regex', $4, $5, $6, false, 60, 'deny')
-ON CONFLICT DO NOTHING`,
-			r.name, r.enabled, r.priority, r.pattern, r.action, r.message,
+INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, $2, $3, $4, 'tool_input', 'regex', $5, $6, $7, false, 60, 'deny')`,
+			projectID, r.name, r.enabled, r.priority, r.pattern, r.action, r.message,
 		); err != nil {
 			return fmt.Errorf("rule %q: %w", r.name, err)
 		}
 	}
-	return d.SetSetting("intercept_default_rules_v2", "done")
+	return nil
 }
 
-// seedDefaultInterceptRulesV3 adds the delete-endpoint path rule. The v1 HTTP rules
-// only catch the DELETE *method* (curl -X DELETE, requests.delete(, method:'DELETE'),
+// seedInterceptRulesV3 adds the delete-endpoint path rule. 项目层隔离后每个项目
+// 各灌一份，因此不再需要独立的 settings 闸门。The v1 HTTP rules only catch the
+// DELETE *method* (curl -X DELETE, requests.delete(, method:'DELETE'),
 // and v1's path rule covers only /clear /wipe /flush /purge /truncate /drop /destroy
 // /factory-reset /reset-all — so a plain `curl 'http://t/api/user/delete?id=1'` (a
 // delete endpoint reached with GET/POST, which is how most web apps expose deletion)
-// slipped through every built-in rule. Own flag so it also lands on DBs that already
-// ran v1/v2, where editing the v1 seed would have no effect.
+// slipped through every built-in rule.
 //
 // The pattern deliberately requires a separator after the verb so /delivery,
 // /details, /delta and /delegate do not match, while /deleteAll, /delete_user and
@@ -602,20 +580,18 @@ ON CONFLICT DO NOTHING`,
 // Exported as a package const only so the seeded regex is unit-testable without a DB.
 const deleteEndpointPathPattern = `(?i)/(?:(?:delete|remove|unlink|erase|destroy)[-\w]*|del)(?:[/?#"'\s]|$)`
 
-func (d *DB) seedDefaultInterceptRulesV3() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v3"); v == "done" {
-		return nil
-	}
+func (d *DB) seedInterceptRulesV3(projectID int64) error {
 	const name = "[内置] 删除类接口路径"
 	if _, err := d.Exec(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-SELECT $1, true, 80, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'deny'
-WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, $2, true, 80, 'tool_input', 'regex', $3, 'deny', $4, false, 60, 'deny'
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE project_id = $1 AND name = $2)`,
+		projectID,
 		name,
 		deleteEndpointPathPattern,
 		"禁止调用删除类接口（/delete /remove /unlink /erase 等），不论使用哪种 HTTP 方法——多数应用的删除接口用 GET/POST 就能触发，同样会真实删除目标数据",
 	); err != nil {
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
-	return d.SetSetting("intercept_default_rules_v3", "done")
+	return nil
 }

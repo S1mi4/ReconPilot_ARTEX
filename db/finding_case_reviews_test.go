@@ -62,7 +62,7 @@ func TestFindingCaseReviewConcurrentReservation(t *testing.T) {
 
 func TestFindingCaseReviewMixedRequestRollsBack(t *testing.T) {
 	d, task, ids := caseTestDB(t)
-	other, err := d.CreateTask("other review", "goal", nil, 0, 0)
+	other, err := d.CreateTask(testProjectID(t, d), "other review", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -125,7 +125,7 @@ type Reviewer func(ctx context.Context, profileID int64, prompt string, input Re
 type Interceptor struct {
 	db           *db.DB
 	mu           sync.RWMutex
-	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
+	cached       map[int64][]compiledRule // projectID -> rules sorted by priority DESC
 	enabledTools map[string]bool // nil means not loaded yet
 	pending      *pendingManager
 	reviewer     Reviewer // nil = LLM fallback judge not wired
@@ -162,10 +162,13 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Unlock()
 }
 
-func (i *Interceptor) loadLocked() error {
-	rules, err := i.db.ListInterceptRules()
+func (i *Interceptor) loadLocked(projectID int64) error {
+	rules, err := i.db.ListInterceptRules(projectID)
 	if err != nil {
 		return err
+	}
+	if i.cached == nil {
+		i.cached = map[int64][]compiledRule{}
 	}
 	var out []compiledRule
 	for _, r := range rules {
@@ -182,7 +185,7 @@ func (i *Interceptor) loadLocked() error {
 		}
 		out = append(out, cr)
 	}
-	i.cached = out
+	i.cached[projectID] = out
 
 	// Load enabled-tools set from settings, falling back to hard-coded defaults.
 	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
@@ -207,10 +210,11 @@ func (i *Interceptor) loadLocked() error {
 	return nil
 }
 
-func (i *Interceptor) rules() ([]compiledRule, error) {
+// rules returns the compiled rules of one project. 拦截规则是项目内配置：同一个
+// 进程里不同项目的规则互不可见，所以缓存按项目分片。
+func (i *Interceptor) rules(projectID int64) ([]compiledRule, error) {
 	i.mu.RLock()
-	if i.cached != nil {
-		out := i.cached
+	if out, ok := i.cached[projectID]; ok {
 		i.mu.RUnlock()
 		return out, nil
 	}
@@ -218,19 +222,19 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.cached != nil {
-		return i.cached, nil
+	if out, ok := i.cached[projectID]; ok {
+		return out, nil
 	}
-	if err := i.loadLocked(); err != nil {
+	if err := i.loadLocked(projectID); err != nil {
 		return nil, err
 	}
-	return i.cached, nil
+	return i.cached[projectID], nil
 }
 
 // IsToolEnabled returns true if the named tool is in the intercept-enabled set
 // (i.e. it should enter the rule-matching path). Uses the same double-check lock
 // pattern as rules().
-func (i *Interceptor) IsToolEnabled(name string) bool {
+func (i *Interceptor) IsToolEnabled(projectID int64, name string) bool {
 	i.mu.RLock()
 	if i.enabledTools != nil {
 		v := i.enabledTools[name]
@@ -242,7 +246,7 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.enabledTools == nil {
-		_ = i.loadLocked()
+		_ = i.loadLocked(projectID)
 	}
 	return i.enabledTools[name]
 }
@@ -567,8 +571,8 @@ func judgeActionLabel(action string) string {
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
-func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
-	rules, err := i.rules()
+func (i *Interceptor) Match(projectID int64, toolName string, input []byte) (Decision, bool) {
+	rules, err := i.rules(projectID)
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
 	}

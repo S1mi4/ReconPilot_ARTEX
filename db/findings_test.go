@@ -19,7 +19,7 @@ func TestDeleteFinding(t *testing.T) {
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("删除漏洞测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "删除漏洞测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,12 +275,12 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	cleanupFindings := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }
 	defer cleanupFindings()
 
-	taskA, err := d.CreateTask("group A", "goal", nil, 0, 0)
+	taskA, err := d.CreateTask(testProjectID(t, d), "group A", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(taskA.ID)
-	taskB, err := d.CreateTask("group B", "goal", nil, 0, 0)
+	taskB, err := d.CreateTask(testProjectID(t, d), "group B", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,12 +415,12 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("finding follow-up", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "finding follow-up", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(task.ID)
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{
 		Domain: fmt.Sprintf("follow-up-%d.example.test", time.Now().UnixNano()),
 		TaskID: task.ID,
 	})

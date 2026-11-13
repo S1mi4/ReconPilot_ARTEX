@@ -19,10 +19,11 @@ func TestJevProfileCannotBindTaskChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteProfile(id) })
-	if _, err := d.CreateTaskWithOptions("jev task", "must reject", TaskCreateOptions{LLMProfileIDs: []int64{id}}); !errors.Is(err, ErrJevProfileJudgeOnly) {
+	if _, err := d.CreateTaskWithOptions("jev task", "must reject", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), LLMProfileIDs: []int64{id}}); !errors.Is(err, ErrJevProfileJudgeOnly) {
 		t.Fatalf("CreateTaskWithOptions Jev error=%v, want %v", err, ErrJevProfileJudgeOnly)
 	}
-	task, err := d.CreateTask("jev replace", "must reject", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "jev replace", "must reject", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +40,7 @@ func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("迁移测试", "目标X", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "迁移测试", "目标X", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,15 +114,15 @@ func TestTaskDeleteCascadeAssets(t *testing.T) {
 	}
 	defer d.Close()
 
-	first, err := d.CreateTask("级联删除测试", "目标A", nil, 0, 0)
+	first, err := d.CreateTask(testProjectID(t, d), "级联删除测试", "目标A", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.CreateTask("共享资产保留测试", "目标B", nil, 0, 0)
+	second, err := d.CreateTask(testProjectID(t, d), "共享资产保留测试", "目标B", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assets := d.Assets()
+	assets := d.Assets(testProjectID(t, d))
 	exclusiveID, err := assets.UpsertRootDomain(UpsertRootDomainReq{
 		Domain: fmt.Sprintf("delete-%d.example.test", first.ID),
 		TaskID: first.ID,
@@ -250,15 +251,16 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 		profileIDs = append(profileIDs, id)
 	}
 
-	sourceA, err := d.CreateTask("source A", "goal A", nil, 0, 0)
+	sourceA, err := d.CreateTask(testProjectID(t, d), "source A", "goal A", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceB, err := d.CreateTask("source B", "goal B", nil, 0, 0)
+	sourceB, err := d.CreateTask(testProjectID(t, d), "source B", "goal B", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	child, err := d.CreateTaskWithOptions("child", "new goal", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		SourceTaskIDs: []int64{sourceA.ID, sourceB.ID},
 		LLMProfileIDs: profileIDs,
 	})
@@ -495,12 +497,13 @@ func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 	}
 	defer d.Close()
 
-	source, err := d.CreateTask("source", "goal", nil, 0, 0)
+	source, err := d.CreateTask(testProjectID(t, d), "source", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(source.ID) })
-	if _, err := d.CreateTaskWithOptions("bad", "goal", TaskCreateOptions{SourceTaskIDs: []int64{source.ID, source.ID}}); err == nil {
+	if _, err := d.CreateTaskWithOptions("bad", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{source.ID, source.ID}}); err == nil {
 		t.Fatal("duplicate source task ids should be rejected")
 	}
 
@@ -515,7 +518,7 @@ func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = d.DeleteProfile(profileID) })
 
-	task, err := d.CreateTask("terminal", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "terminal", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,15 +552,15 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 	defer d.Close()
 
 	suffix := time.Now().UnixNano()
-	companyA, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Task Company A %d", suffix), "")
+	companyA, _, err := d.Companies(testProjectID(t, d)).UpsertCompany(fmt.Sprintf("Task Company A %d", suffix), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	companyB, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Task Company B %d", suffix), "")
+	companyB, _, err := d.Companies(testProjectID(t, d)).UpsertCompany(fmt.Sprintf("Task Company B %d", suffix), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	emptyCompany, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Task Empty Company %d", suffix), "")
+	emptyCompany, _, err := d.Companies(testProjectID(t, d)).UpsertCompany(fmt.Sprintf("Task Empty Company %d", suffix), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +568,7 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2,$3)`, companyA, companyB, emptyCompany)
 	})
 
-	existingTask, err := d.CreateTask("existing company asset owner", "goal", nil, 0, 0)
+	existingTask, err := d.CreateTask(testProjectID(t, d), "existing company asset owner", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,20 +577,21 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 	domainA := fmt.Sprintf("task-company-a-%d.example.test", suffix)
 	domainB := fmt.Sprintf("task-company-b-%d.example.test", suffix)
 	if err := d.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, company_id, company_source, task_ids)
-VALUES ('root_domain',$1,$1,$2,'explicit',ARRAY[$3]::bigint[])
+INSERT INTO assets(project_id,type, domain, root_domain, company_id, company_source, task_ids)
+VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'root_domain',$1,$1,$2,'explicit',ARRAY[$3]::bigint[])
 RETURNING id`, domainA, companyA, existingTask.ID).Scan(&companyAssetA); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, company_id, company_source)
-VALUES ('root_domain',$1,$1,$2,'explicit')
+INSERT INTO assets(project_id,type, domain, root_domain, company_id, company_source)
+VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'root_domain',$1,$1,$2,'explicit')
 RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{companyAssetA, companyAssetB}) })
+	t.Cleanup(func() { _, _ = d.Assets(testProjectID(t, d)).DeleteByIDs([]int64{companyAssetA, companyAssetB}) })
 
 	task, err := d.CreateTaskWithOptions("company-scoped task", "use company scope", TaskCreateOptions{
+		ProjectID:  testProjectID(t, d),
 		CompanyIDs: []int64{companyA, companyB},
 	})
 	if err != nil {
@@ -611,7 +615,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	if scopeCount != 2 {
 		t.Fatalf("company task scope rows=%d want 2", scopeCount)
 	}
-	assets, err := d.Assets().QueryByTask(task.ID, "root_domain", 10, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "root_domain", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,12 +655,13 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	}
 
 	emptyTask, err := d.CreateTaskWithOptions("empty company scope", "no current assets", TaskCreateOptions{
+		ProjectID:  testProjectID(t, d),
 		CompanyIDs: []int64{emptyCompany},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if assets, err := d.Assets().QueryByTask(emptyTask.ID, "", 10, 0); err != nil || len(assets) != 0 {
+	if assets, err := d.Assets(testProjectID(t, d)).QueryByTask(emptyTask.ID, "", 10, 0); err != nil || len(assets) != 0 {
 		t.Fatalf("empty company task assets=%+v err=%v", assets, err)
 	}
 	if err := d.DeleteTask(emptyTask.ID); err != nil {
@@ -664,6 +669,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	}
 
 	duplicateTask, err := d.CreateTaskWithOptions("duplicate company scope", "deduplicate", TaskCreateOptions{
+		ProjectID:  testProjectID(t, d),
 		CompanyIDs: []int64{companyA, companyA, companyB, companyA},
 	})
 	if err != nil {
@@ -677,7 +683,8 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	}
 
 	badDescription := fmt.Sprintf("invalid-company-%d", suffix)
-	if _, err := d.CreateTaskWithOptions(badDescription, "rollback", TaskCreateOptions{CompanyIDs: []int64{companyA, 1 << 62}}); !errors.Is(err, ErrTaskCompanyNotFound) {
+	if _, err := d.CreateTaskWithOptions(badDescription, "rollback", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), CompanyIDs: []int64{companyA, 1 << 62}}); !errors.Is(err, ErrTaskCompanyNotFound) {
 		t.Fatalf("missing company error=%v, want %v", err, ErrTaskCompanyNotFound)
 	}
 	var leaked int
@@ -702,7 +709,7 @@ func TestListTasksOrderByIDDesc(t *testing.T) {
 	stamp := time.Now().UnixNano()
 	var ids []int64
 	for i := range 3 {
-		tk, err := d.CreateTask(fmt.Sprintf("order-%d-%d", stamp, i), "goal", nil, 0, 0)
+		tk, err := d.CreateTask(testProjectID(t, d), fmt.Sprintf("order-%d-%d", stamp, i), "goal", nil, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

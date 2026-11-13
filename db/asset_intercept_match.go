@@ -208,7 +208,7 @@ func (h AssetInterceptHit) Describe() string {
 // ListAssetInterceptRules 是 *DB 同名方法的透传，让只持有 AssetStore 的调用方
 // （如 agent 工具）也能读取规则。
 func (s *AssetStore) ListAssetInterceptRules() ([]AssetInterceptRule, error) {
-	return s.db.ListAssetInterceptRules()
+	return s.db.ListAssetInterceptRules(s.projectID)
 }
 
 // CheckAssetsIntercept 按 id 载入资产，逐个执行「先拦截后允许」闸门判定，返回所有
@@ -218,7 +218,7 @@ func (s *AssetStore) CheckAssetsIntercept(taskID int64, ids []int64) ([]AssetInt
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	blockRules, err := s.db.ListAssetInterceptRules()
+	blockRules, err := s.db.ListAssetInterceptRules(s.projectID)
 	if err != nil {
 		return nil, err
 	}

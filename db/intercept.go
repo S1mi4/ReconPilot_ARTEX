@@ -55,8 +55,8 @@ func scanInterceptRule(row interface{ Scan(...any) error }) (InterceptRule, erro
 }
 
 // ListInterceptRules returns all rules ordered by priority DESC then id.
-func (d *DB) ListInterceptRules() ([]InterceptRule, error) {
-	rows, err := d.Query(`SELECT ` + interceptRuleCols + ` FROM intercept_rules ORDER BY priority DESC, id`)
+func (d *DB) ListInterceptRules(projectID int64) ([]InterceptRule, error) {
+	rows, err := d.Query(`SELECT `+interceptRuleCols+` FROM intercept_rules WHERE project_id = $1 ORDER BY priority DESC, id`, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -73,12 +73,15 @@ func (d *DB) ListInterceptRules() ([]InterceptRule, error) {
 }
 
 // CreateInterceptRule inserts a new rule.
-func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+func (d *DB) CreateInterceptRule(projectID int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+	if projectID <= 0 {
+		return InterceptRule{}, ErrProjectRequired
+	}
 	row := d.QueryRow(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING `+interceptRuleCols,
-		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
+		projectID, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
 	return scanInterceptRule(row)
 }
 

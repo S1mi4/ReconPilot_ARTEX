@@ -27,7 +27,7 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 	}
 	conv := func() int64 {
 		t.Helper()
-		c, err := d.CreateConversation("test", "navigation", nil)
+		c, err := d.CreateConversation(testProjectID(t, d), "test", "navigation", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +62,7 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 		}
 	})
 	t.Run("task sessions and result pairing", func(t *testing.T) {
-		task, err := d.CreateTask("navigation", "fixture", nil, 0, 600)
+		task, err := d.CreateTask(testProjectID(t, d), "navigation", "fixture", nil, 0, 600)
 		if err != nil {
 			t.Fatal(err)
 		}

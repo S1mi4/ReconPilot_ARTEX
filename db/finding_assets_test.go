@@ -25,6 +25,8 @@ func seedTreeAsset(t *testing.T, d *DB, kind string, cols map[string]any) int64 
 		names = append(names, k)
 		placeholders = append(placeholders, "$"+strconv.Itoa(len(values)))
 	}
+	names = append(names, "project_id")
+	placeholders = append(placeholders, "(SELECT id FROM projects WHERE nkey='artex-test')")
 	q := "INSERT INTO assets(" + strings.Join(names, ",") + ") VALUES (" +
 		strings.Join(placeholders, ",") + ") RETURNING id"
 	var id int64
@@ -55,7 +57,7 @@ func TestBuildFindingAssetTree(t *testing.T) {
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("资产树测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "资产树测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +163,7 @@ func TestFindingAssetScopeFilter(t *testing.T) {
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("资产筛选测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "资产筛选测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -95,17 +95,19 @@ func TestExplorationDirectSourceReadView(t *testing.T) {
 	}
 	defer d.Close()
 
-	grand, err := d.CreateTask("grand source", "grand goal", nil, 0, 0)
+	grand, err := d.CreateTask(testProjectID(t, d), "grand source", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	source, err := d.CreateTaskWithOptions("direct source", "source goal", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		SourceTaskIDs: []int64{grand.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	current, err := d.CreateTaskWithOptions("current", "current goal", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		SourceTaskIDs: []int64{source.ID},
 	})
 	if err != nil {
@@ -317,19 +319,21 @@ func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
 	}
 	defer d.Close()
 
-	grand, err := d.CreateTask("grand assets", "grand goal", nil, 0, 0)
+	grand, err := d.CreateTask(testProjectID(t, d), "grand assets", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := d.CreateTaskWithOptions("source assets", "source goal", TaskCreateOptions{SourceTaskIDs: []int64{grand.ID}})
+	source, err := d.CreateTaskWithOptions("source assets", "source goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{grand.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := d.CreateTaskWithOptions("current assets", "current goal", TaskCreateOptions{SourceTaskIDs: []int64{source.ID}})
+	current, err := d.CreateTaskWithOptions("current assets", "current goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{source.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assets := d.Assets()
+	assets := d.Assets(testProjectID(t, d))
 	sourceTestedDomain := fmt.Sprintf("context-tested-%d.invalid", source.ID)
 	sourceUntestedDomain := fmt.Sprintf("context-untested-%d.invalid", source.ID)
 	sourceAnchoredOnlyDomain := fmt.Sprintf("context-anchor-only-%d.invalid", source.ID)

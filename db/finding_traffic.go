@@ -73,6 +73,7 @@ func ValidTrafficRole(role string) bool {
 
 type TrafficEvidenceSnapshot struct {
 	ID              string    `json:"id"`
+	ProjectID       int64     `json:"project_id"`
 	SourceTrafficID string    `json:"source_traffic_id"`
 	CapturedAt      int64     `json:"captured_at"`
 	URL             string    `json:"url"`
@@ -131,6 +132,7 @@ func TrafficSnapshotID(snapshot TrafficEvidenceSnapshot) string {
 	snapshot = snapshot.Normalize()
 	snapshot.ID = ""
 	snapshot.CreatedAt = time.Time{}
+	snapshot.ProjectID = 0
 	raw, _ := json.Marshal(snapshot)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
@@ -195,20 +197,28 @@ func InsertEvidenceSnapshotTx(tx *sql.Tx, s TrafficEvidenceSnapshot) error {
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now().UTC()
 	}
+	if s.ProjectID <= 0 {
+		return ErrProjectRequired
+	}
 	_, err := tx.Exec(`INSERT INTO traffic_evidence_snapshots
-(id,source_traffic_id,captured_at,url,method,status,content_type,req_head,resp_head,req_hash,resp_hash,req_len,resp_len,created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,
-		s.ID, s.SourceTrafficID, s.CapturedAt, s.URL, s.Method, s.Status, s.ContentType, s.ReqHead, s.RespHead, s.ReqHash, s.RespHash, s.ReqLen, s.RespLen, s.CreatedAt)
+(id,project_id,source_traffic_id,captured_at,url,method,status,content_type,req_head,resp_head,req_hash,resp_hash,req_len,resp_len,created_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,
+		s.ID, s.ProjectID, s.SourceTrafficID, s.CapturedAt, s.URL, s.Method, s.Status, s.ContentType, s.ReqHead, s.RespHead, s.ReqHash, s.RespHash, s.ReqLen, s.RespLen, s.CreatedAt)
 	return err
 }
 
 func AddFindingTrafficTx(tx *sql.Tx, findingID int64, prepared []PreparedTrafficEvidence) error {
+	var projectID int64
+	if err := tx.QueryRow(`SELECT task.project_id FROM findings finding JOIN tasks task ON task.id=finding.task_id WHERE finding.id=$1`, findingID).Scan(&projectID); err != nil {
+		return fmt.Errorf("resolve finding project: %w", err)
+	}
 	var position int
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(position)+1,0) FROM finding_traffic_bindings WHERE finding_id=$1`, findingID).Scan(&position); err != nil {
 		return err
 	}
 	changed := false
 	for _, item := range prepared {
+		item.Snapshot.ProjectID = projectID
 		if err := InsertEvidenceSnapshotTx(tx, item.Snapshot); err != nil {
 			return err
 		}

@@ -51,6 +51,7 @@ GROUP BY c.id`)
 // independent of the pentest exploration graph — see schema.sql §I.
 type Conversation struct {
 	ID           int64      `json:"id"`
+	ProjectID    int64      `json:"project_id"`
 	AgentKey     string     `json:"agent_key"`
 	Title        string     `json:"title"`
 	LLMProfileID *int64     `json:"llm_profile_id,omitempty"`
@@ -66,12 +67,12 @@ type ConversationPatch struct {
 	Pinned *bool
 }
 
-const convCols = `id, agent_key, title, llm_profile_id, pinned_at, created_at, updated_at`
+const convCols = `id, project_id, agent_key, title, llm_profile_id, pinned_at, created_at, updated_at`
 
 func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 	var c Conversation
 	var pinnedAt sql.NullTime
-	err := row.Scan(&c.ID, &c.AgentKey, &c.Title, &c.LLMProfileID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.ProjectID, &c.AgentKey, &c.Title, &c.LLMProfileID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt)
 	if pinnedAt.Valid {
 		c.Pinned = true
 		c.PinnedAt = &pinnedAt.Time
@@ -81,7 +82,7 @@ func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 
 // CreateConversation opens a new chat thread for agentKey with an initial title.
 // llmProfileID may be nil to use the globally active profile.
-func (d *DB) CreateConversation(agentKey, title string, llmProfileID *int64) (*Conversation, error) {
+func (d *DB) CreateConversation(projectID int64, agentKey, title string, llmProfileID *int64) (*Conversation, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, err
@@ -92,8 +93,8 @@ func (d *DB) CreateConversation(agentKey, title string, llmProfileID *int64) (*C
 	// by this transaction before it takes a profile lock, matching DeleteProfile's
 	// child-row -> profile-row protocol.
 	c, err := scanConv(tx.QueryRow(`
-INSERT INTO conversations(agent_key, title, llm_profile_id) VALUES ($1, $2, NULL)
-RETURNING `+convCols, agentKey, title))
+INSERT INTO conversations(project_id, agent_key, title, llm_profile_id) VALUES ($1, $2, $3, NULL)
+RETURNING `+convCols, projectID, agentKey, title))
 	if err != nil {
 		return nil, err
 	}
@@ -139,9 +140,9 @@ func (d *DB) UpdateConversationProfile(id int64, llmProfileID *int64) error {
 }
 
 // ListConversations returns all threads, most-recently-updated first.
-func (d *DB) ListConversations() ([]*Conversation, error) {
-	rows, err := d.Query(`SELECT ` + convCols + ` FROM conversations
-ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, updated_at DESC, id DESC`)
+func (d *DB) ListConversations(projectID int64) ([]*Conversation, error) {
+	rows, err := d.Query(`SELECT ` + convCols + ` FROM conversations WHERE project_id = $1
+ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, updated_at DESC, id DESC`, projectID)
 	if err != nil {
 		return nil, err
 	}

@@ -45,7 +45,7 @@ func TestCredentialSwitchDependencyAndLeases(t *testing.T) {
 		t.Fatal("recording off did not cascade")
 	}
 	_ = d.SetIntelligenceSettings(t.Context(), &on, &on, nil)
-	task, err := d.CreateTask("credential queue", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "credential queue", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

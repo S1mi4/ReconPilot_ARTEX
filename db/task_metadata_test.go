@@ -14,11 +14,11 @@ func TestTaskPinOrderingAndRename(t *testing.T) {
 	defer d.Close()
 
 	suffix := time.Now().UnixNano()
-	first, err := d.CreateTask(fmt.Sprintf("task-pin-first-%d", suffix), "goal", nil, 0, 0)
+	first, err := d.CreateTask(testProjectID(t, d), fmt.Sprintf("task-pin-first-%d", suffix), "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.CreateTask(fmt.Sprintf("task-pin-second-%d", suffix), "goal", nil, 0, 0)
+	second, err := d.CreateTask(testProjectID(t, d), fmt.Sprintf("task-pin-second-%d", suffix), "goal", nil, 0, 0)
 	if err != nil {
 		_ = d.DeleteTask(first.ID)
 		t.Fatal(err)
@@ -75,11 +75,11 @@ func TestDeleteConversationsReturnsExistingIDs(t *testing.T) {
 	}
 	defer d.Close()
 
-	first, err := d.CreateConversation("mainagent", "batch-delete-first", nil)
+	first, err := d.CreateConversation(testProjectID(t, d), "mainagent", "batch-delete-first", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.CreateConversation("mainagent", "batch-delete-second", nil)
+	second, err := d.CreateConversation(testProjectID(t, d), "mainagent", "batch-delete-second", nil)
 	if err != nil {
 		_ = d.DeleteConversation(first.ID)
 		t.Fatal(err)

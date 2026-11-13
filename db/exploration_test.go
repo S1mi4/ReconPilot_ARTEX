@@ -130,7 +130,7 @@ func TestIntentPauseResumeAndCancelCleanup(t *testing.T) {
 	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
 	es := d.Exploration(expID)
 
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{
 		Domain: fmt.Sprintf("cancel-intent-%d.invalid", expID),
 	})
 	if err != nil {

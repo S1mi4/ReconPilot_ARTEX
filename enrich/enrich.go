@@ -40,7 +40,10 @@ type job struct {
 
 // Engine owns the resolver, the proxy-routed HTTP client, and the worker pool.
 type Engine struct {
-	as     *db.AssetStore
+	// 项目是最高级分层：富化产生的资产必须落回被富化资产所在的项目，所以这里
+	// 持有 DB 而不是一个固定的 AssetStore。
+	db     *db.DB
+	store  sync.Map // asset id -> project id (cheap, bounded by the asset set)
 	resolv *dnsx.DNSX
 	client *http.Client
 
@@ -60,7 +63,7 @@ const (
 // probes through (so they land in the traffic store), evaluated per request so the
 // runtime traffic-capture toggle takes effect live; "" = direct. Returns a usable
 // engine even if the resolver fails to init (DNS becomes a no-op).
-func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
+func New(database *db.DB, proxy func() string, workers int) *Engine {
 	if workers <= 0 {
 		workers = 4
 	}
@@ -75,7 +78,7 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 		resolv = nil
 	}
 	e := &Engine{
-		as:     as,
+		db:     database,
 		resolv: resolv,
 		client: buildClient(proxy),
 		jobs:   make(chan job, queueSize),
@@ -175,10 +178,29 @@ func (e *Engine) onCooldown(j job) bool {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
+// storeFor returns the asset store of the project that owns assetID. Enrichment
+// derived rows (IP / subdomain / service) always belong to the same project as
+// the asset they came from.
+func (e *Engine) storeFor(assetID int64) *db.AssetStore {
+	if v, ok := e.store.Load(assetID); ok {
+		return e.db.Assets(v.(int64))
+	}
+	var projectID int64
+	if err := e.db.QueryRow(`SELECT project_id FROM assets WHERE id = $1`, assetID).Scan(&projectID); err != nil {
+		return nil
+	}
+	e.store.Store(assetID, projectID)
+	return e.db.Assets(projectID)
+}
+
 // ---- DNS ----
 
 func (e *Engine) doDNS(id int64, host string) {
 	if e.resolv == nil {
+		return
+	}
+	as := e.storeFor(id)
+	if as == nil {
 		return
 	}
 	data, err := e.resolv.QueryMultiple(host)
@@ -188,28 +210,28 @@ func (e *Engine) doDNS(id int64, host string) {
 	ips := uniq(append(append([]string{}, data.A...), data.AAAA...))
 	// Upsert resolved IPs into the asset store.
 	for _, ip := range ips {
-		_, _ = e.as.UpsertIP(db.UpsertIPReq{
+		_, _ = as.UpsertIP(db.UpsertIPReq{
 			IP:           ip,
 			BoundDomains: []string{host},
 		})
 	}
 	// Record A records as subdomains if host looks like a subdomain.
 	for _, a := range data.A {
-		_, _ = e.as.UpsertSubdomain(db.UpsertSubdomainReq{
+		_, _ = as.UpsertSubdomain(db.UpsertSubdomainReq{
 			Domain:      host,
 			RecordType:  "A",
 			RecordValue: []string{a},
 		})
 	}
 	for _, aaaa := range data.AAAA {
-		_, _ = e.as.UpsertSubdomain(db.UpsertSubdomainReq{
+		_, _ = as.UpsertSubdomain(db.UpsertSubdomainReq{
 			Domain:      host,
 			RecordType:  "AAAA",
 			RecordValue: []string{aaaa},
 		})
 	}
 	for _, cname := range data.CNAME {
-		_, _ = e.as.UpsertSubdomain(db.UpsertSubdomainReq{
+		_, _ = as.UpsertSubdomain(db.UpsertSubdomainReq{
 			Domain:      host,
 			RecordType:  "CNAME",
 			RecordValue: []string{cname},
@@ -226,6 +248,10 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	if host == "" {
 		return
 	}
+	as := e.storeFor(id)
+	if as == nil {
+		return
+	}
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return
@@ -240,7 +266,7 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	statusCode := resp.StatusCode
 	bodyLen := int64(len(body))
 	title := extractTitle(body)
-	_, _ = e.as.UpsertHTTPService(db.UpsertHTTPServiceReq{
+	_, _ = as.UpsertHTTPService(db.UpsertHTTPServiceReq{
 		URL:           rawURL,
 		StatusCode:    &statusCode,
 		ContentLength: &bodyLen,

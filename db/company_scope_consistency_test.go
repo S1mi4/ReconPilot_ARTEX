@@ -43,7 +43,7 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	if _, err := mutation.Exec(`DELETE FROM company_scope WHERE company_id=$1 AND kind='domain' AND domain=$2`, oldCompany, domain); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := insertScopeRuleTx(mutation, newCompany, ParsedScope{
+	if _, err := insertScopeRuleTx(mutation, newCompany, testProjectID(t, d), ParsedScope{
 		Kind: "domain", Domain: domain, Raw: domain,
 	}, "test"); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestCompanyScopeCheckedReturnsSystemErrorSeparately(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	companies := d.Companies()
+	companies := d.Companies(testProjectID(t, d))
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}

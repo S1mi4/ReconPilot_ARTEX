@@ -37,11 +37,13 @@ func TestTaskOptionsPersistAndValidateLimits(t *testing.T) {
 	defer d.Close()
 
 	if _, err := d.CreateTaskWithOptions("oversized remark", "goal", TaskCreateOptions{
-		Remark: strings.Repeat("界", MaxTaskRemarkRunes+1),
+		ProjectID: testProjectID(t, d),
+		Remark:    strings.Repeat("界", MaxTaskRemarkRunes+1),
 	}); err == nil {
 		t.Fatal("2001-rune task remark accepted")
 	}
 	if _, err := d.CreateTaskWithOptions("oversized workers", "goal", TaskCreateOptions{
+		ProjectID:   testProjectID(t, d),
 		WorkerCount: MaxTaskWorkerCount + 1,
 	}); err == nil {
 		t.Fatal("51-worker task accepted")
@@ -49,7 +51,8 @@ func TestTaskOptionsPersistAndValidateLimits(t *testing.T) {
 
 	remark := strings.Repeat("界", MaxTaskRemarkRunes)
 	task, err := d.CreateTaskWithOptions("task options boundary", "goal", TaskCreateOptions{
-		Remark: remark, WorkerCount: MaxTaskWorkerCount,
+		ProjectID: testProjectID(t, d),
+		Remark:    remark, WorkerCount: MaxTaskWorkerCount,
 	})
 	if err != nil {
 		t.Fatal(err)

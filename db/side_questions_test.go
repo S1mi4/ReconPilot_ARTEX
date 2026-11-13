@@ -20,7 +20,7 @@ func sideFixture(t *testing.T) (*DB, sidequestion.Snapshot) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	c, err := d.CreateConversation("mainagent", "side persistence", nil)
+	c, err := d.CreateConversation(testProjectID(t, d), "mainagent", "side persistence", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestSideTaskArchiveVersions(t *testing.T) {
 			if err := d.EnsureLLMUsageTable(); err != nil {
 				t.Fatal(err)
 			}
-			task, err := d.CreateTask("btw archive", "restore context", nil, 0, 0)
+			task, err := d.CreateTask(testProjectID(t, d), "btw archive", "restore context", nil, 0, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

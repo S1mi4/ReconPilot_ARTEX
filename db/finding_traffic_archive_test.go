@@ -28,7 +28,7 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 	}
 	for _, version := range []int{1, 2} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
-			task, err := d.CreateTask("legacy archive evidence defaults", "fixture", nil, 0, 0)
+			task, err := d.CreateTask(testProjectID(t, d), "legacy archive evidence defaults", "fixture", nil, 0, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

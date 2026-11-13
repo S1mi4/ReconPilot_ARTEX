@@ -36,12 +36,12 @@ func TestIntelligenceProvenanceDedupAndDirectContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	first, err := d.CreateTask("intelligence source", "test", nil, 0, 0)
+	first, err := d.CreateTask(testProjectID(t, d), "intelligence source", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(first.ID)
-	second, err := d.CreateTask("intelligence unrelated", "test", nil, 0, 0)
+	second, err := d.CreateTask(testProjectID(t, d), "intelligence unrelated", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestIntelligenceSensitiveDataListIncludesContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	task, err := d.CreateTask("direct sensitive data display", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "direct sensitive data display", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestIntelligenceSourceSessionUsesGraphProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	task, err := d.CreateTask("source navigation", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "source navigation", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,12 +216,12 @@ func TestIntelligenceSourceSessionUsesGraphProvenance(t *testing.T) {
 		t.Fatalf("guessed session: %+v %v", got, err)
 	}
 	// Asset IDs resolve across categories.
-	assetID, err := d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{URL: fmt.Sprintf("https://navigation-%d.example.invalid", task.ID), TaskID: task.ID})
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertHTTPService(UpsertHTTPServiceReq{URL: fmt.Sprintf("https://navigation-%d.example.invalid", task.ID), TaskID: task.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Exec(`DELETE FROM assets WHERE id=$1`, assetID)
-	assets, err := d.Assets().QueryDSL(fmt.Sprintf("id==%d", assetID), "", 0, 1, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryDSL(fmt.Sprintf("id==%d", assetID), "", 0, 1, 0)
 	if err != nil || len(assets) != 1 || assets[0].ID != assetID {
 		t.Fatalf("asset ID lookup failed: %+v %v", assets, err)
 	}

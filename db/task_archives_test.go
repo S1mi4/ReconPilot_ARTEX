@@ -133,7 +133,8 @@ func TestTaskArchiveDatabaseRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, err := d.CreateTaskWithOptions("archive database roundtrip", "restore exact graph", TaskCreateOptions{
-		Name: "cold task", WorkerCount: 7, ShareGlobalAssets: true,
+		ProjectID: testProjectID(t, d),
+		Name:      "cold task", WorkerCount: 7, ShareGlobalAssets: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +144,7 @@ func TestTaskArchiveDatabaseRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var companyID, llmProfileID int64
-	if err := d.QueryRow(`INSERT INTO companies(name,nkey) VALUES($1,$2) RETURNING id`,
+	if err := d.QueryRow(`INSERT INTO companies(project_id,name,nkey) VALUES((SELECT id FROM projects WHERE nkey='artex-test'),$1,$2) RETURNING id`,
 		fmt.Sprintf("archive-company-%d", task.ID), fmt.Sprintf("archive-company-%d", task.ID)).Scan(&companyID); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +173,7 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	if err := d.SetPaused(task.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("archive-%d.example", task.ID), TaskID: task.ID})
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("archive-%d.example", task.ID), TaskID: task.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +372,7 @@ VALUES($1,'archive-candidate','pending_review','{"title":"archive taint candidat
 		restoredAudits[0].Candidates[0].ReviewStatus != "pending_review" {
 		t.Fatalf("code audit history did not survive archive restore: audits=%+v err=%v", restoredAudits, err)
 	}
-	restoredCodeAssets, err := d.Assets().QueryByTask(task.ID, "code_service", 10, 0)
+	restoredCodeAssets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "code_service", 10, 0)
 	if err != nil || len(restoredCodeAssets) != 1 || restoredCodeAssets[0].ID != *restoredCodeServices[0].AssetID {
 		t.Fatalf("restored code service asset identity mismatch: assets=%+v services=%+v err=%v", restoredCodeAssets, restoredCodeServices, err)
 	}
@@ -416,11 +417,12 @@ func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer d.Close()
-	source, err := d.CreateTaskWithOptions("archive blocker source", "source", TaskCreateOptions{})
+	source, err := d.CreateTaskWithOptions("archive blocker source", "source", TaskCreateOptions{ProjectID: testProjectID(t, d)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	dependent, err := d.CreateTaskWithOptions("archive blocker dependent", "dependent", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		SourceTaskIDs: []int64{source.ID},
 	})
 	if err != nil {
@@ -461,7 +463,8 @@ func TestRecoverInterruptedArchiveRequiresManualRetry(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer d.Close()
-	task, err := d.CreateTaskWithOptions("interrupted archive", "must not restart automatically", TaskCreateOptions{})
+	task, err := d.CreateTaskWithOptions("interrupted archive", "must not restart automatically", TaskCreateOptions{
+		ProjectID: testProjectID(t, d)})
 	if err != nil {
 		t.Fatal(err)
 	}

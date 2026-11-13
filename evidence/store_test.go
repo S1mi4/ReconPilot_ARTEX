@@ -29,7 +29,7 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pg.Close() })
-	task, err := pg.CreateTask("evidence integration "+t.Name(), "local fixtures", nil, 0, 0)
+	task, err := pg.CreateTask(testProjectID(t, pg), "evidence integration "+t.Name(), "local fixtures", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
