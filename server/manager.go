@@ -2090,7 +2090,10 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 
 	var fileStage *taskFileDeleteStage
 	if opts.DeleteFiles {
-		fileStage, err = stageTaskFiles(m.dir, id, registered.ExplorationID)
+		fileStage, err = stageTaskFiles(m.dir, id,
+			m.taskDataDir(registered.ProjectID, registered.ID),
+			filepath.Join(m.projectDataDir(registered.ProjectID), "transcripts"),
+			registered.ExplorationID)
 		if err != nil {
 			return result, err
 		}
@@ -2212,31 +2215,37 @@ type taskFileDeleteStage struct {
 // stageTaskFiles atomically renames the task workspace and owned transcripts to
 // a same-filesystem staging directory. The trailing dash in the transcript
 // prefix is significant: exploration 12 must not match exploration 123.
-func stageTaskFiles(dataDir, taskID string, explorationID int64) (*taskFileDeleteStage, error) {
+func stageTaskFiles(dataDir, taskID string, taskDir, transcriptDir string, explorationID int64) (*taskFileDeleteStage, error) {
 	stage := &taskFileDeleteStage{}
 	var targets []string
-	taskDir := filepath.Join(dataDir, "tasks", taskID)
 	if _, err := os.Lstat(taskDir); err == nil {
 		targets = append(targets, taskDir)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
 
-	transcriptDir := filepath.Join(dataDir, "transcripts")
-	entries, err := os.ReadDir(transcriptDir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		entries = nil
+	// 该项目自己的转录目录，加上升级前共享目录里的同名文件：同一任务的转录
+	// 不该因为升级而残留。
+	transcriptDirs := []string{transcriptDir}
+	if legacy := filepath.Join(dataDir, "transcripts"); filepath.Clean(legacy) != filepath.Clean(transcriptDir) {
+		transcriptDirs = append(transcriptDirs, legacy)
 	}
 	prefix := fmt.Sprintf("exp%d-", explorationID)
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !strings.HasSuffix(name, ".jsonl")) {
+	for _, dir := range transcriptDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, err
+			}
 			continue
 		}
-		targets = append(targets, filepath.Join(transcriptDir, name))
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !strings.HasSuffix(name, ".jsonl")) {
+				continue
+			}
+			targets = append(targets, filepath.Join(dir, name))
+		}
 	}
 	if len(targets) == 0 {
 		stage.done = true
@@ -2247,6 +2256,7 @@ func stageTaskFiles(dataDir, taskID string, explorationID int64) (*taskFileDelet
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, err
 	}
+	var err error
 	stage.stageDir, err = os.MkdirTemp(parent, "task-"+taskID+"-")
 	if err != nil {
 		return nil, err
@@ -2308,7 +2318,10 @@ func (s *taskFileDeleteStage) rollback() error {
 
 // deleteTaskFiles retains the standalone helper contract used by focused tests.
 func deleteTaskFiles(dataDir, taskID string, explorationID int64) (bool, error) {
-	stage, err := stageTaskFiles(dataDir, taskID, explorationID)
+	stage, err := stageTaskFiles(dataDir, taskID,
+		filepath.Join(dataDir, "tasks", taskID),
+		filepath.Join(dataDir, "transcripts"),
+		explorationID)
 	if err != nil {
 		return false, err
 	}

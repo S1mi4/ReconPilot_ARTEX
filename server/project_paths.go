@@ -1,10 +1,17 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
+
+	"github.com/Autumn-27/artex/evidence"
 )
 
 // 项目在磁盘上也是最高级分层：每个项目一个目录，项目内的一切文件都落在
@@ -109,4 +116,66 @@ func (m *Manager) taskProjectID(taskID int64) int64 {
 		return 0
 	}
 	return projectID
+}
+
+// runEvidenceGC sweeps every project's evidence store plus the pre-project shared
+// root. The reference set is global (it is read from the database), so sweeping one
+// root at a time is safe: a blob is only dropped when nothing references it.
+func (s *Server) runEvidenceGC(ctx context.Context) {
+	timer := time.NewTicker(time.Hour)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-timer.C:
+			s.collectEvidenceAll(ctx, now)
+		}
+	}
+}
+
+func (s *Server) collectEvidenceAll(ctx context.Context, now time.Time) {
+	stores := []*evidence.Store{s.evidenceStore()}
+	if s.m != nil && s.m.pg != nil {
+		if projects, err := s.m.pg.Projects().List(false); err == nil {
+			for _, p := range projects {
+				stores = append(stores, s.evidenceStoreFor(p.ID))
+			}
+		}
+	}
+	for _, store := range stores {
+		if err := store.Collect(ctx, now); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[evidence] collect %s: %v", store.Dir, err)
+		}
+	}
+}
+
+// transcriptDir is the project's LLM transcript root.
+func (s *Server) transcriptDir(projectID int64) string {
+	return filepath.Join(s.m.projectDataDir(projectID), "transcripts")
+}
+
+// adoptLegacyTranscripts moves an exploration's transcript files from the shared
+// pre-project root into its project, so reads only ever look in one place.
+func (m *Manager) adoptLegacyTranscripts(projectID, explorationID int64) {
+	if projectID <= 0 || explorationID <= 0 {
+		return
+	}
+	legacy := filepath.Join(m.dir, "transcripts")
+	entries, err := os.ReadDir(legacy)
+	if err != nil {
+		return
+	}
+	prefix := "exp" + strconv.FormatInt(explorationID, 10) + "-"
+	target := filepath.Join(m.projectDataDir(projectID), "transcripts")
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return
+		}
+		_ = os.Rename(filepath.Join(legacy, name), filepath.Join(target, name))
+	}
 }

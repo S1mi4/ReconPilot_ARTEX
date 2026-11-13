@@ -20,7 +20,19 @@ import (
 )
 
 func (s *Server) evidenceStore() *evidence.Store {
-	return evidence.New(s.m.pg, s.m.traffic, filepath.Join(s.m.dir, "evidence"))
+	return s.evidenceStoreFor(0)
+}
+
+// evidenceStoreFor opens the evidence store of one project. projectID 0 is the
+// pre-project shared root, kept for GC and for installs that have not migrated yet;
+// it is also the read-time fallback for blobs recorded before the split.
+func (s *Server) evidenceStoreFor(projectID int64) *evidence.Store {
+	legacy := filepath.Join(s.m.dir, "evidence")
+	dir := legacy
+	if projectID > 0 {
+		dir = filepath.Join(s.m.projectDataDir(projectID), "evidence")
+	}
+	return evidence.NewWithLegacy(s.m.pg, s.m.traffic, dir, legacy)
 }
 
 // Add only new optional properties; preserve edited descriptions, existing
@@ -182,7 +194,7 @@ func (s *Server) bindFindingTraffic(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请选择流量")
 		return
 	}
-	out, err := s.evidenceStore().Bind(r.Context(), id, body.Refs)
+	out, err := s.evidenceStoreFor(s.projectOfFinding(id)).Bind(r.Context(), id, body.Refs)
 	if err != nil {
 		evidenceError(w, err)
 		return
@@ -299,7 +311,7 @@ func (s *Server) getFindingTrafficDetail(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "invalid binding id")
 		return
 	}
-	store := s.evidenceStore()
+	store := s.evidenceStoreFor(s.projectOfFinding(id))
 	var result any
 	err = store.WithBinding(r.Context(), id, bid, func(b db.FindingTrafficBinding) error {
 		req, err := readEvidencePreview(store, b.Snapshot, "request", 0, 8192)
@@ -331,7 +343,7 @@ func (s *Server) getFindingTrafficBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	side := r.URL.Query().Get("side")
-	store := s.evidenceStore()
+	store := s.evidenceStoreFor(s.projectOfFinding(id))
 	// Resolve the binding under the evidence lock, then read the blob without it:
 	// both paths below are O(body size) and would otherwise stall every evidence
 	// write for as long as the client takes to receive the data.
@@ -400,7 +412,7 @@ func (s *Server) toolGetFindingTraffic() actool.CoreTool {
 			if a.Side == "" {
 				a.Side = "response"
 			}
-			store := s.evidenceStore()
+			store := s.evidenceStoreFor(s.projectOfFinding(id))
 			var result any
 			err := store.WithBinding(ctx, id, bid, func(b db.FindingTrafficBinding) error {
 				preview, err := readEvidencePreview(store, b.Snapshot, a.Side, a.Offset, a.Length)

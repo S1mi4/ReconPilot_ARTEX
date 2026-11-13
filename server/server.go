@@ -98,7 +98,8 @@ type Server struct {
 	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
 	// so edits take effect.
 	profMu         sync.Mutex
-	profChatAgents map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	profChatAgents map[chatAgentKey]*agent.ChatAgent // per-(project,profile) ChatAgent cache (chat page)
+	projChatAgents map[chatAgentKey]*agent.ChatAgent // per-project agents on the global config
 
 	// provByProfile caches ONE provider per LLM profile id so every agent bound or
 	// pinned to the same profile shares a single provider instance — hence one rate
@@ -175,7 +176,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
-		profChatAgents: map[int64]*agent.ChatAgent{},
+		profChatAgents: map[chatAgentKey]*agent.ChatAgent{},
+		projChatAgents: map[chatAgentKey]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), auditWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
 	m.SetTaskControlMutex(&s.concMu)
@@ -272,7 +274,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
+		go s.runEvidenceGC(s.ctx)
 		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		// Calendar scheduler starts after persisted tasks are restored.
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
@@ -551,14 +553,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.cfgMu.Lock()
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
-	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	s.chatAgent.SetProxyProvider(s.m.ProxyAddr)
-	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
-	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
-	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
-	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	s.chatAgent = s.configureChatAgent(agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win), cfg) // chat page runner
 	s.llmProv = prov
 	s.llmCfg = cfg
 	s.llmOn = true
@@ -625,9 +620,9 @@ func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 
 // picked a valid profile still got rejected with "LLM 未配置" when no global
 // config was active.
 func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
-	ca := s.chatAgentRef()
+	ca := s.chatAgentForProject(c.ProjectID)
 	if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
-		if pa := s.chatAgentForProfile(*eff); pa != nil {
+		if pa := s.chatAgentForProfile(c.ProjectID, *eff); pa != nil {
 			ca = pa
 		}
 	}
@@ -743,9 +738,31 @@ func (s *Server) requestLimiterForProfileLocked(id int64) *agent.RequestLimiter 
 
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
-func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
+// chatAgentKey scopes the chat-agent cache: each project gets its own instance so
+// the conversation transcripts land in that project's directory.
+type chatAgentKey struct {
+	project int64
+	profile int64
+}
+
+// configureChatAgent installs the shared options every chat agent needs.
+func (s *Server) configureChatAgent(ca *agent.ChatAgent, cfg agent.Config) *agent.ChatAgent {
+	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetProxyProvider(s.m.ProxyAddr)
+	ca.SetWebSearch(s.m.WebSearchOpts())
+	ca.SetGuard(s.chatGuard())
+	ca.SetNonStreaming(nonStreamingResolver(cfg))
+	ca.SetMaxTokens(maxTokensResolver(cfg))
+	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	return ca
+}
+
+// chatAgentForProfile returns the ChatAgent for one project + LLM profile. Both the
+// transcripts directory and the instance are per project.
+func (s *Server) chatAgentForProfile(projectID, id int64) *agent.ChatAgent {
+	key := chatAgentKey{project: projectID, profile: id}
 	s.profMu.Lock()
-	cached := s.profChatAgents[id]
+	cached := s.profChatAgents[key]
 	s.profMu.Unlock()
 	if cached != nil {
 		return cached
@@ -754,20 +771,14 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	if !ok {
 		return nil
 	}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	ca.SetProxyProvider(s.m.ProxyAddr)
-	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
-	ca.SetNonStreaming(nonStreamingResolver(cfg))
-	ca.SetMaxTokens(maxTokensResolver(cfg))
-	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	tx := transcript.NewStore(s.transcriptDir(projectID))
+	ca := s.configureChatAgent(
+		agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow()), cfg)
 	s.profMu.Lock()
-	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
+	if ex := s.profChatAgents[key]; ex != nil { // lost the race → keep the winner
 		ca = ex
 	} else {
-		s.profChatAgents[id] = ca
+		s.profChatAgents[key] = ca
 	}
 	s.profMu.Unlock()
 	return ca
@@ -778,13 +789,42 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 // (and re-resolves each agent's bound model) on their next round.
 func (s *Server) invalidateProfileAgents() {
 	s.profMu.Lock()
-	s.profChatAgents = map[int64]*agent.ChatAgent{}
+	s.profChatAgents = map[chatAgentKey]*agent.ChatAgent{}
+	s.projChatAgents = map[chatAgentKey]*agent.ChatAgent{}
 	s.profMu.Unlock()
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
 	s.invalidateTaskAgents()
+}
+
+// chatAgentForProject returns the default-config ChatAgent of one project, cached
+// per project so its conversation transcripts live in the project directory.
+func (s *Server) chatAgentForProject(projectID int64) *agent.ChatAgent {
+	s.cfgMu.Lock()
+	global, prov, cfg := s.chatAgent, s.llmProv, s.llmCfg
+	s.cfgMu.Unlock()
+	if projectID <= 0 || global == nil || prov == nil {
+		return global
+	}
+	key := chatAgentKey{project: projectID}
+	s.profMu.Lock()
+	cached := s.projChatAgents[key]
+	s.profMu.Unlock()
+	if cached != nil {
+		return cached
+	}
+	tx := transcript.NewStore(s.transcriptDir(projectID))
+	ca := s.configureChatAgent(agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, cfg.CompactionWindow()), cfg)
+	s.profMu.Lock()
+	if ex := s.projChatAgents[key]; ex != nil {
+		ca = ex
+	} else {
+		s.projChatAgents[key] = ca
+	}
+	s.profMu.Unlock()
+	return ca
 }
 
 func (s *Server) chatAgentRef() *agent.ChatAgent {
@@ -2527,7 +2567,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(stage)
-	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
+	if err = s.evidenceStoreFor(projectID).StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
 		evidenceError(w, err)
 		return
 	}

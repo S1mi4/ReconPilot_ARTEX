@@ -142,7 +142,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return pgdb.ErrTaskArchiveNotFound
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "stage_files", 10)
-	fileStage, err := stageTaskArchiveFiles(s.m.dir, job.ID, taskID, s.m.taskDataDir(task.ProjectID, task.ID), task.ExplorationID)
+	fileStage, err := stageTaskArchiveFiles(s.m.dir, job.ID, taskID, s.m.taskDataDir(task.ProjectID, task.ID), s.transcriptDir(task.ProjectID), task.ExplorationID)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if err != nil {
 		return err
 	}
-	if err = s.evidenceStore().CopySnapshots(s.ctx, evidenceSnapshots, filepath.Join(fileStage.payload, "evidence")); err != nil {
+	if err = s.evidenceStoreFor(task.ProjectID).CopySnapshots(s.ctx, evidenceSnapshots, filepath.Join(fileStage.payload, "evidence")); err != nil {
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compress", 50)
@@ -284,7 +284,7 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 	if err != nil {
 		return err
 	}
-	return s.evidenceStore().WithInstalledSnapshots(s.ctx, evidenceSnapshots, filepath.Join(extracted, "evidence"), func() error {
+	return s.evidenceStoreFor(s.m.taskProjectID(job.TaskID)).WithInstalledSnapshots(s.ctx, evidenceSnapshots, filepath.Join(extracted, "evidence"), func() error {
 		return s.restoreTaskArchivePayload(job, &snapshot, extracted)
 	})
 }

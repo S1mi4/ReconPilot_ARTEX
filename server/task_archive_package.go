@@ -89,7 +89,7 @@ func taskArchivePath(dataDir string, archiveID int64, taskID string) string {
 	return filepath.Join(taskArchiveRoot(dataDir), fmt.Sprintf("task-%s-%d.tar.zst", taskID, archiveID))
 }
 
-func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID, taskDir string, explorationID int64) (*taskArchiveFileStage, error) {
+func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID, taskDir, transcriptDir string, explorationID int64) (*taskArchiveFileStage, error) {
 	root := filepath.Join(taskArchiveRoot(dataDir), ".staging", strconv.FormatInt(archiveID, 10))
 	stage := &taskArchiveFileStage{root: root, payload: filepath.Join(root, "payload")}
 	journalPath := filepath.Join(root, "journal.json")
@@ -122,7 +122,6 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID, taskDir stri
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	transcriptDir := filepath.Join(dataDir, "transcripts")
 	entries, err := os.ReadDir(transcriptDir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err

@@ -237,7 +237,7 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 	}
 	// Corrupt body must fail before an attachment response is sent.
 	snap := list.Bindings[0].Snapshot
-	path := filepath.Join(s.m.dir, "evidence", "blobs", snap.RespHash[:2], snap.RespHash+".bin")
+	path := filepath.Join(s.evidenceStoreFor(s.projectOfFinding(f.FindingID)).Dir, "blobs", snap.RespHash[:2], snap.RespHash+".bin")
 	if err = os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -331,3 +331,28 @@ func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
 		t.Fatal("accepted tampered snapshot")
 	}
 }
+
+// 升级前证据在共享目录里：项目内的 store 读不到时回退到 LegacyDir，而不是报丢失。
+func TestLegacyDirFallbackReads(t *testing.T) {
+	store, in, dir := evidenceFixture(t)
+	legacy := filepath.Join(dir, "legacy")
+	old := New(store.DB, store.Traffic, legacy)
+	seedExchange(t, old, "original", []byte("legacy body"), false)
+	in.Summary = "legacy"
+	rec, err := old.Record(t.Context(), in, []db.TrafficRef{{TrafficID: "original", Role: "proof"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Traffic.Bindings) == 0 {
+		t.Fatal("no binding recorded")
+	}
+	moved := NewWithLegacy(store.DB, store.Traffic, filepath.Join(dir, "projects", "1", "evidence"), legacy)
+	f, length, err := moved.OpenBody(rec.Traffic.Bindings[0].Snapshot, "response")
+	if err != nil {
+		t.Fatalf("legacy fallback failed: %v", err)
+	}
+	defer f.Close()
+	if length != int64(len("legacy body")) {
+		t.Fatalf("length = %d", length)
+	}
+}

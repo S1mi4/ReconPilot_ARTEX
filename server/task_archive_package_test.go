@@ -32,7 +32,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 		}
 	}
 
-	stage, err := stageTaskArchiveFiles(dataDir, 1, taskID, filepath.Join(dataDir, "tasks", taskID), explorationID)
+	stage, err := stageTaskArchiveFiles(dataDir, 1, taskID, filepath.Join(dataDir, "tasks", taskID), filepath.Join(dataDir, "transcripts"), explorationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	stage, err := stageTaskArchiveFiles(dataDir, 9, "42", filepath.Join(dataDir, "tasks", "42"), 73)
+	stage, err := stageTaskArchiveFiles(dataDir, 9, "42", filepath.Join(dataDir, "tasks", "42"), filepath.Join(dataDir, "transcripts"), 73)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,3 +41,29 @@ func TestTaskDataDirAdoptsLegacyLayout(t *testing.T) {
 		t.Fatalf("project-less base = %s, want %s", got, base)
 	}
 }
+
+// 证据与转录也按项目分区：各自落在 <data>/projects/<项目>/ 下，读的时候还能回退
+// 到升级前的共享目录，但写入永远只进项目目录。
+func TestEvidenceAndTranscriptsAreProjectScoped(t *testing.T) {
+	base := t.TempDir()
+	m := &Manager{dir: base, tasks: map[string]*Task{}}
+	s := &Server{m: m}
+
+	a := s.evidenceStoreFor(1)
+	b := s.evidenceStoreFor(2)
+	if a.Dir == b.Dir {
+		t.Fatalf("two projects share an evidence dir: %s", a.Dir)
+	}
+	if want := filepath.Join(base, "projects", "1", "evidence"); a.Dir != want {
+		t.Fatalf("evidence dir = %s, want %s", a.Dir, want)
+	}
+	if a.LegacyDir != filepath.Join(base, "evidence") {
+		t.Fatalf("legacy evidence root = %s", a.LegacyDir)
+	}
+	if got := s.transcriptDir(1); got != filepath.Join(base, "projects", "1", "transcripts") {
+		t.Fatalf("transcript dir = %s", got)
+	}
+	if s.transcriptDir(1) == s.transcriptDir(2) {
+		t.Fatal("two projects share a transcript dir")
+	}
+}
