@@ -42,7 +42,7 @@ func TestJevModelListAndConnectionEndpoints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			payload, _ := json.Marshal(map[string]any{"provider": "jev", "base_url": upstream.URL + "/v1/systemone", "api_key": "test-key"})
 			w := httptest.NewRecorder()
-			tc.handler(w, httptest.NewRequest(http.MethodPost, "/api/llm/"+tc.name, strings.NewReader(string(payload))))
+			tc.handler(w, newReqWithProject(http.MethodPost, "/api/llm/"+tc.name, strings.NewReader(string(payload))))
 			var got struct {
 				OK     bool     `json:"ok"`
 				Models []string `json:"models"`

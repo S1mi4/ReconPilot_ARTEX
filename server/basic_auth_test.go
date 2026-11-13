@@ -46,7 +46,7 @@ func basicAuthTestServer(t *testing.T) (*Server, *basicAuthMemoryStore) {
 
 func saveBasicAuthForTest(s *Server, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	s.saveBasicAuthSettings(w, httptest.NewRequest("PUT", "/api/settings/basic-auth", strings.NewReader(body)))
+	s.saveBasicAuthSettings(w, newReqWithProject("PUT", "/api/settings/basic-auth", strings.NewReader(body)))
 	return w
 }
 
@@ -114,7 +114,7 @@ func TestBasicAuthBlockedSaveDoesNotBlockRequests(t *testing.T) {
 				}
 				h := s.requireBasicAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 				for _, path := range []string{"/", "/_next/static/app.js", "/api/tasks", "/api/health"} {
-					r := httptest.NewRequest(http.MethodGet, path, nil)
+					r := newReqWithProject(http.MethodGet, path, nil)
 					if enabled {
 						r.AddCookie(initial.Result().Cookies()[0])
 					}
@@ -126,7 +126,7 @@ func TestBasicAuthBlockedSaveDoesNotBlockRequests(t *testing.T) {
 					}
 				}
 				w := httptest.NewRecorder()
-				r := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+				r := newReqWithProject(http.MethodGet, "/api/health", nil)
 				if enabled {
 					r.AddCookie(initial.Result().Cookies()[0])
 				}
@@ -182,7 +182,7 @@ func TestBasicAuthBlockedSaveRespectsRequestCancellation(t *testing.T) {
 	t.Cleanup(func() { close(blocked.release) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := httptest.NewRequest(http.MethodPut, "/api/settings/basic-auth", strings.NewReader(`{"username":"new-entry"}`)).WithContext(ctx)
+	r := newReqWithProject(http.MethodPut, "/api/settings/basic-auth", strings.NewReader(`{"username":"new-entry"}`)).WithContext(ctx)
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		w := httptest.NewRecorder()
@@ -225,7 +225,7 @@ func TestBasicAuthGate(t *testing.T) {
 	s, _ := basicAuthTestServer(t)
 	h := s.requireBasicAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest("GET", "/login", nil))
+	h.ServeHTTP(w, newReqWithProject("GET", "/login", nil))
 	if w.Code != 204 {
 		t.Fatal("must default to disabled")
 	}
@@ -264,7 +264,7 @@ func TestBasicAuthGate(t *testing.T) {
 		{name: "admin JWT is not gate cookie", path: "/login", cookie: &http.Cookie{Name: basicAuthCookie, Value: adminJWT}, want: 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest("GET", tc.path, nil)
+			r := newReqWithProject("GET", tc.path, nil)
 			if tc.user != "" {
 				r.SetBasicAuth(tc.user, tc.pass)
 			}
@@ -291,7 +291,7 @@ func TestBasicAuthGate(t *testing.T) {
 		})
 	}
 	// Passing the outer gate must not grant access to the inner admin API.
-	r := httptest.NewRequest("GET", "/api/settings/basic-auth", nil)
+	r := newReqWithProject("GET", "/api/settings/basic-auth", nil)
 	r.AddCookie(cookie)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -332,14 +332,14 @@ func TestBasicAuthSettingsPersistenceAndRevocation(t *testing.T) {
 	if w.Code != 200 || s.basicAuth.snapshot().PasswordHash != before.PasswordHash {
 		t.Fatal("blank password must preserve hash")
 	}
-	r := httptest.NewRequest("GET", "/", nil)
+	r := newReqWithProject("GET", "/", nil)
 	r.AddCookie(oldCookie)
 	if s.validBasicAuthCookie(r, s.basicAuth.snapshot()) {
 		t.Fatal("old cookie survived disable/re-enable")
 	}
 	cookie := w.Result().Cookies()[0]
 	w = saveBasicAuthForTest(s, `{"username":"new-entry","password":"new-pass-123"}`)
-	r = httptest.NewRequest("GET", "/", nil)
+	r = newReqWithProject("GET", "/", nil)
 	r.AddCookie(cookie)
 	if w.Code != 200 || s.validBasicAuthCookie(r, s.basicAuth.snapshot()) {
 		t.Fatal("credential change did not revoke cookie")
@@ -385,13 +385,13 @@ func TestBasicAuthExpiredCookieAndSecureFlag(t *testing.T) {
 		token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 			Subject: cfg.Revision, Audience: jwt.ClaimStrings{"artex-basic-auth"}, ExpiresAt: expires,
 		}).SignedString(s.basicAuthSigningKey())
-		r := httptest.NewRequest("GET", "/", nil)
+		r := newReqWithProject("GET", "/", nil)
 		r.AddCookie(&http.Cookie{Name: basicAuthCookie, Value: token})
 		if s.validBasicAuthCookie(r, cfg) {
 			t.Fatal("expired or unbounded cookie accepted")
 		}
 	}
-	r := httptest.NewRequest("GET", "https://example.test/login", nil)
+	r := newReqWithProject("GET", "https://example.test/login", nil)
 	w = httptest.NewRecorder()
 	if err := s.setBasicAuthCookie(w, r, cfg); err != nil {
 		t.Fatal(err)
@@ -417,7 +417,7 @@ func TestBasicAuthCORS(t *testing.T) {
 	}{
 		{"http://127.0.0.1:3000", true}, {"https://evil.test", false}, {"http://127.0.0.1.evil.test:3000", false},
 	} {
-		r := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
+		r := newReqWithProject("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
 		r.Header.Set("Origin", tc.origin)
 		w := httptest.NewRecorder()
 		cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
@@ -465,13 +465,13 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := `{"enabled":true,"username":"entry","password":"entry-password"}`
-	r := httptest.NewRequest("PUT", "/api/settings/basic-auth", strings.NewReader(body))
+	r := newReqWithProject("PUT", "/api/settings/basic-auth", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 401 || s.basicAuth.snapshot().Enabled {
 		t.Fatal("unauthenticated settings write succeeded")
 	}
-	r = httptest.NewRequest("PUT", "/api/settings/basic-auth", strings.NewReader(body))
+	r = newReqWithProject("PUT", "/api/settings/basic-auth", strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer "+adminJWT)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -484,13 +484,13 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	loginBody := `{"username":"ARTEX","password":"admin-password"}`
-	r = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginBody))
+	r = newReqWithProject("POST", "/api/auth/login", strings.NewReader(loginBody))
 	w = httptest.NewRecorder()
 	restarted.Handler().ServeHTTP(w, r)
 	if w.Code != 401 || w.Header().Get("X-Artex-Auth") != "basic" || w.Header().Get("WWW-Authenticate") != "" {
 		t.Fatal("login must fail with a recoverable gate error after restart")
 	}
-	r = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginBody))
+	r = newReqWithProject("POST", "/api/auth/login", strings.NewReader(loginBody))
 	r.SetBasicAuth("entry", "entry-password")
 	w = httptest.NewRecorder()
 	restarted.Handler().ServeHTTP(w, r)
@@ -501,7 +501,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Fatalf("Basic Auth + existing login failed: %d %s", w.Code, w.Body.String())
 	}
 	cookie := w.Result().Cookies()[0]
-	r = httptest.NewRequest("PUT", "/api/settings/basic-auth", strings.NewReader(`{"enabled":false}`))
+	r = newReqWithProject("PUT", "/api/settings/basic-auth", strings.NewReader(`{"enabled":false}`))
 	r.AddCookie(cookie)
 	r.Header.Set("Authorization", "Bearer "+login.Token)
 	w = httptest.NewRecorder()
@@ -534,7 +534,7 @@ func TestBasicAuthExpiredSessionRecovery(t *testing.T) {
 	h := s.Handler()
 	for _, path := range []string{"/api/version", "/api/auth/status", "/api/logs/stream", "/api/workspace/upload", "/api/workspace/download"} {
 		t.Run(strings.TrimPrefix(path, "/"), func(t *testing.T) {
-			r := httptest.NewRequest("GET", path, nil)
+			r := newReqWithProject("GET", path, nil)
 			r.Header.Set("Authorization", "Bearer "+adminJWT)
 			r.AddCookie(&http.Cookie{Name: basicAuthCookie, Value: expired})
 			w := httptest.NewRecorder()
@@ -549,14 +549,14 @@ func TestBasicAuthExpiredSessionRecovery(t *testing.T) {
 	}
 	// Reloading the current document can use Basic authorization, while the
 	// admin JWT stays in its cookie for subsequent API requests.
-	r := httptest.NewRequest("GET", "/function/tasks/", nil)
+	r := newReqWithProject("GET", "/function/tasks/", nil)
 	r.AddCookie(&http.Cookie{Name: "artex_token", Value: adminJWT})
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != 401 || w.Header().Get("WWW-Authenticate") == "" {
 		t.Fatal("document navigation must still prompt for Basic authentication")
 	}
-	r = httptest.NewRequest("GET", "/api/basic-auth/check", nil)
+	r = newReqWithProject("GET", "/api/basic-auth/check", nil)
 	r.SetBasicAuth("entry", "entry-password")
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -564,7 +564,7 @@ func TestBasicAuthExpiredSessionRecovery(t *testing.T) {
 		t.Fatalf("reauthentication failed: %d %s", w.Code, w.Body.String())
 	}
 	renewed := w.Result().Cookies()[0]
-	r = httptest.NewRequest("GET", "/api/version", nil)
+	r = newReqWithProject("GET", "/api/version", nil)
 	r.AddCookie(renewed)
 	r.Header.Set("Authorization", "Bearer "+adminJWT)
 	w = httptest.NewRecorder()

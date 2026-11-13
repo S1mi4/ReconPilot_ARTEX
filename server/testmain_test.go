@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
@@ -26,5 +27,13 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	defer conn.Exec(`SELECT pg_advisory_unlock(7337741002)`) //nolint:errcheck
+	// Every project-scoped request needs the active project header. Pin it once for
+	// the whole suite so request helpers can inject it without threading a *testing.T.
+	if pg, openErr := db.Open(dsn); openErr == nil {
+		if project, ensureErr := pg.Projects().Ensure("artex-test", "自动化测试专用项目"); ensureErr == nil {
+			testProjectHeader.Store(strconv.FormatInt(project.ID, 10))
+		}
+		pg.Close()
+	}
 	os.Exit(m.Run())
 }

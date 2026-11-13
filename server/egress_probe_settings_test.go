@@ -46,7 +46,7 @@ func TestEgressProbeSettingsPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := func(method, body string, authenticated bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, "/api/settings", strings.NewReader(body))
+		req := newReqWithProject(method, "/api/settings", strings.NewReader(body))
 		if authenticated {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -131,7 +131,7 @@ func TestEgressProbeSavedAndTemporaryURLs(t *testing.T) {
 				return egressProbeResult{OK: true, ExitIP: "203.0.113.7", Probes: []egressAttempt{}}
 			}
 			w := httptest.NewRecorder()
-			s.testEgressProxy(w, httptest.NewRequest(http.MethodPost, "/api/settings/proxy/test", strings.NewReader(tc.body)))
+			s.testEgressProxy(w, newReqWithProject(http.MethodPost, "/api/settings/proxy/test", strings.NewReader(tc.body)))
 			wantCalls := 1
 			if strings.Contains(tc.body, "global_proxy") {
 				wantCalls = 2
@@ -149,7 +149,7 @@ func TestEgressProbeSavedAndTemporaryURLs(t *testing.T) {
 		return egressProbeResult{}
 	}
 	w := httptest.NewRecorder()
-	s.testEgressProxy(w, httptest.NewRequest(http.MethodPost, "/api/settings/proxy/test", strings.NewReader(`{"probe_url":"http://127.0.0.1"}`)))
+	s.testEgressProxy(w, newReqWithProject(http.MethodPost, "/api/settings/proxy/test", strings.NewReader(`{"probe_url":"http://127.0.0.1"}`)))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid probe status=%d", w.Code)
 	}

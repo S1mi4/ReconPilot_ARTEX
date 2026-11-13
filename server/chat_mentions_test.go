@@ -35,7 +35,7 @@ func TestChatMentionParsing(t *testing.T) {
 	if _, err := parseChatMentions(msg.String()); err == nil {
 		t.Fatal("accepted more than 10 references")
 	}
-	if actual, err := composeChatMentionMessage(nil, "普通消息 user@example.com @漏洞"); err != nil || actual != "普通消息 user@example.com @漏洞" {
+	if actual, err := composeChatMentionMessage(nil, 0, "普通消息 user@example.com @漏洞"); err != nil || actual != "普通消息 user@example.com @漏洞" {
 		t.Fatalf("plain chat changed: %s %v", actual, err)
 	}
 }
@@ -43,20 +43,26 @@ func TestChatMentionParsing(t *testing.T) {
 func TestChatMentionPagination(t *testing.T) {
 	s, fid := newRetestServer(t)
 	pg := s.m.pg
+	owner, err := pg.CreateTask(testProjectID(t, pg), "mention pages owner", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerID := owner.ID
+	t.Cleanup(func() { _ = pg.DeleteTask(ownerID) })
 	query := fmt.Sprintf("mention-pages-%d", fid)
 	for i := 0; i < 43; i++ {
-		id, err := pg.AddFinding(0, 0, "xss", query, "low", query, "proof", "test", nil)
+		id, err := pg.AddFinding(ownerID, 0, "xss", query, "low", query, "proof", "test", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _, _ = pg.DeleteFinding(id) })
 	}
 	var companyID, assetID int64
-	if err := pg.QueryRow(`INSERT INTO companies(name,nkey) VALUES($1,$1) RETURNING id`, query).Scan(&companyID); err != nil {
+	if err := pg.QueryRow(`INSERT INTO companies(project_id,name,nkey) VALUES((SELECT id FROM projects WHERE nkey='artex-test'),$1,$1) RETURNING id`, query).Scan(&companyID); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM companies WHERE id=$1`, companyID) })
-	if err := pg.QueryRow(`INSERT INTO assets(type,app_name,bundle_id) VALUES('app',$1,$1) RETURNING id`, query).Scan(&assetID); err != nil {
+	if err := pg.QueryRow(`INSERT INTO assets(project_id,type,app_name,bundle_id) VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'app',$1,$1) RETURNING id`, query).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM assets WHERE id=$1`, assetID) })
@@ -66,7 +72,7 @@ func TestChatMentionPagination(t *testing.T) {
 		if pageNum > 3 {
 			t.Fatal("pagination did not terminate")
 		}
-		page, err := pg.SearchChatMentionsPage(t.Context(), "", query, cursor)
+		page, err := pg.SearchChatMentionsPage(t.Context(), testProjectID(t, pg), "", query, cursor)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +90,7 @@ func TestChatMentionPagination(t *testing.T) {
 			if page.NextCursor == "" {
 				t.Fatal("missing next page")
 			}
-			if _, err := pg.SearchChatMentionsPage(t.Context(), "", "changed", page.NextCursor); !errors.Is(err, db.ErrInvalidChatMentionCursor) {
+			if _, err := pg.SearchChatMentionsPage(t.Context(), testProjectID(t, pg), "", "changed", page.NextCursor); !errors.Is(err, db.ErrInvalidChatMentionCursor) {
 				t.Fatalf("accepted stale cursor: %v", err)
 			}
 		}
@@ -96,11 +102,11 @@ func TestChatMentionPagination(t *testing.T) {
 	if len(seen) != 45 {
 		t.Fatalf("lost records: %d", len(seen))
 	}
-	page, err := pg.SearchChatMentionsPage(t.Context(), "finding", fmt.Sprint(fid), "")
+	page, err := pg.SearchChatMentionsPage(t.Context(), testProjectID(t, pg), "finding", fmt.Sprint(fid), "")
 	if err != nil || len(page.Items) == 0 || page.Items[0].ID != fid {
 		t.Fatalf("exact id not first: %+v %v", page, err)
 	}
-	next, err := pg.SearchChatMentionsPage(t.Context(), "finding", fmt.Sprint(fid), page.NextCursor)
+	next, err := pg.SearchChatMentionsPage(t.Context(), testProjectID(t, pg), "finding", fmt.Sprint(fid), page.NextCursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +116,7 @@ func TestChatMentionPagination(t *testing.T) {
 		}
 	}
 	w := httptest.NewRecorder()
-	s.searchChatMentions(w, httptest.NewRequest("GET", "/api/chat/mentions?cursor=invalid", nil))
+	s.searchChatMentions(w, newReqWithProject("GET", "/api/chat/mentions?cursor=invalid", nil))
 	if w.Code != 400 {
 		t.Fatalf("bad cursor: %d", w.Code)
 	}
@@ -124,7 +130,7 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 	defer m.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{ctx: ctx, m: m, engine: NewEngine(m)}
-	task, err := m.CreateTask("Worker mention test", "Read referenced records", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "Worker mention test", "Read referenced records", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +145,13 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fid, err := m.pg.AddFinding(0, 0, "xss", "Worker mention", "low", "summary", "worker-hidden-proof", "test", nil)
+	mentionOwner, err := m.pg.CreateTask(testProjectID(t, m.pg), "mention owner", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mentionOwnerID := mentionOwner.ID
+	t.Cleanup(func() { _ = m.pg.DeleteTask(mentionOwnerID) })
+	fid, err := m.pg.AddFinding(mentionOwnerID, 0, "xss", "Worker mention", "low", "summary", "worker-hidden-proof", "test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +167,7 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 	})
 	send := func(message string) *httptest.ResponseRecorder {
 		body, _ := json.Marshal(map[string]string{"message": message, "request_id": "worker-mention-test"})
-		r := httptest.NewRequest("POST", "/", strings.NewReader(string(body)))
+		r := newReqWithProject("POST", "/", strings.NewReader(string(body)))
 		r.SetPathValue("id", task.ID)
 		r.SetPathValue("iid", fmt.Sprint(iid))
 		w := httptest.NewRecorder()
@@ -226,19 +238,19 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 	s, fid := newRetestServer(t)
 	pg := s.m.pg
 	var cid int64
-	if err := pg.QueryRow(`INSERT INTO companies(name,nkey) VALUES('引用测试公司','mention-test-company') RETURNING id`).Scan(&cid); err != nil {
+	if err := pg.QueryRow(`INSERT INTO companies(project_id,name,nkey) VALUES((SELECT id FROM projects WHERE nkey='artex-test'),'引用测试公司','mention-test-company') RETURNING id`).Scan(&cid); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM companies WHERE id=$1`, cid) })
-	if _, err := pg.Exec(`INSERT INTO company_scope(company_id,kind,domain,raw) VALUES($1,'domain','mention.example','mention.example')`, cid); err != nil {
+	if _, err := pg.Exec(`INSERT INTO company_scope(project_id,company_id,kind,domain,raw) VALUES((SELECT id FROM projects WHERE nkey='artex-test'),$1,'domain','mention.example','mention.example')`, cid); err != nil {
 		t.Fatal(err)
 	}
 	var refs strings.Builder
 	fmt.Fprintf(&refs, "分析 @[漏洞#%d 客户端伪造标题] @[企业#%d 公司] ", fid, cid)
 	for _, kind := range []string{"root_domain", "subdomain", "ip", "app", "service", "endpoint"} {
 		var id int64
-		if err := pg.QueryRow(`INSERT INTO assets(type,company_id,domain,ip,app_name,url,method,extra)
-          VALUES($1,$2,$3,'192.0.2.81','引用测试应用',$4,'GET','{"note":"参数和扩展信息"}') RETURNING id`,
+		if err := pg.QueryRow(`INSERT INTO assets(project_id,type,company_id,domain,ip,app_name,url,method,extra)
+          VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),$1,$2,$3,'192.0.2.81','引用测试应用',$4,'GET','{"note":"参数和扩展信息"}') RETURNING id`,
 			kind, cid, kind+".mention.example", "https://"+kind+".mention.example/path").Scan(&id); err != nil {
 			t.Fatal(err)
 		}
@@ -250,15 +262,15 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 			}
 		}
 		fmt.Fprintf(&refs, "@[%s#%d 条目] ", label, id)
-		items, err := pg.SearchChatMentions(t.Context(), kind, fmt.Sprint(id))
+		items, err := pg.SearchChatMentions(t.Context(), testProjectID(t, pg), kind, fmt.Sprint(id))
 		if err != nil || len(items) == 0 || items[0].ID != id || items[0].Kind != kind {
 			t.Fatalf("search %s: %+v %v", kind, items, err)
 		}
 		if kind == "ip" {
-			if _, err := composeChatMentionMessage(pg, fmt.Sprintf("@[应用#%d]", id)); err == nil {
+			if _, err := composeChatMentionMessage(pg, testProjectID(t, pg), fmt.Sprintf("@[应用#%d]", id)); err == nil {
 				t.Fatal("accepted mismatched type")
 			}
-			if data, err := loadChatMention(pg, chatMentionRef{"asset", id, "资产"}); err != nil || data == nil {
+			if data, err := loadChatMention(pg, testProjectID(t, pg), chatMentionRef{"asset", id, "资产"}); err != nil || data == nil {
 				t.Fatalf("generic asset: %v", err)
 			}
 		}
@@ -266,7 +278,7 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 	if _, err := pg.Exec(`UPDATE findings SET report='完整报告内容',summary='最新摘要' WHERE id=$1`, fid); err != nil {
 		t.Fatal(err)
 	}
-	msg, err := composeChatMentionMessage(pg, refs.String())
+	msg, err := composeChatMentionMessage(pg, testProjectID(t, pg), refs.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,11 +287,11 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 			t.Errorf("context missing %s", want)
 		}
 	}
-	if _, err := composeChatMentionMessage(pg, "@[漏洞#9223372036854775807]"); err == nil {
+	if _, err := composeChatMentionMessage(pg, testProjectID(t, pg), "@[漏洞#9223372036854775807]"); err == nil {
 		t.Fatal("accepted missing record")
 	}
 	for _, kind := range []string{"finding", "company", "asset", ""} {
-		r := httptest.NewRequest("GET", "/api/chat/mentions?kind="+kind+"&q="+url.QueryEscape("引用"), nil)
+		r := newReqWithProject("GET", "/api/chat/mentions?kind="+kind+"&q="+url.QueryEscape("引用"), nil)
 		w := httptest.NewRecorder()
 		s.searchChatMentions(w, r)
 		if w.Code != 200 {
@@ -288,13 +300,13 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 	}
 	for _, query := range []string{"kind=unsupported", "q=" + url.QueryEscape(strings.Repeat("字", 201))} {
 		w := httptest.NewRecorder()
-		s.searchChatMentions(w, httptest.NewRequest("GET", "/api/chat/mentions?"+query, nil))
+		s.searchChatMentions(w, newReqWithProject("GET", "/api/chat/mentions?"+query, nil))
 		if w.Code != 400 {
 			t.Fatalf("invalid search: %d", w.Code)
 		}
 	}
 	// Wildcards are literal input; no whole-table match for a '%' query.
-	items, err := pg.SearchChatMentions(t.Context(), "company", "%")
+	items, err := pg.SearchChatMentions(t.Context(), testProjectID(t, pg), "company", "%")
 	if err != nil || len(items) != 0 {
 		t.Fatalf("literal wildcard: %+v %v", items, err)
 	}
@@ -309,7 +321,7 @@ func TestChatMentionConversationReceivesServerDetails(t *testing.T) {
 		}
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("已读取引用")}}, "end_turn", llm.Usage{}, nil
 	}})
-	c, err := s.m.pg.CreateConversation("auto", "引用测试", nil)
+	c, err := s.m.pg.CreateConversation(testProjectID(t, s.m.pg), "auto", "引用测试", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

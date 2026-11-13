@@ -18,7 +18,7 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	s := &Server{m: m}
 	s.seed(task, "https://"+host)
 	taskID := mustTaskID(t, task.ID)
-	assets, err := m.Assets().QueryByTask(taskID, "", 20, 0)
+	assets, err := m.Assets(testProjectID(t, m)).QueryByTask(taskID, "", 20, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *test
 	}
 	t.Cleanup(func() { _ = m.Close() })
 
-	task, err := m.CreateTask("delete rollback", "delete rollback", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "delete rollback", "delete rollback", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *test
 	t.Cleanup(cleanupDB)
 
 	host := fmt.Sprintf("delete-rollback-%d.example.test", taskID)
-	if _, err := m.Assets().UpsertHTTPService(pgdb.UpsertHTTPServiceReq{URL: "https://" + host, TaskID: taskID}); err != nil {
+	if _, err := m.Assets(testProjectID(t, m)).UpsertHTTPService(pgdb.UpsertHTTPServiceReq{URL: "https://" + host, TaskID: taskID}); err != nil {
 		t.Fatal(err)
 	}
 	createDeleteFixture(t, dataDir, filepath.Join("tasks", task.ID), true)

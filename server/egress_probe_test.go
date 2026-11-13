@@ -447,17 +447,17 @@ func TestValidateProbeURL(t *testing.T) {
 func TestProbeCheckRedirect(t *testing.T) {
 	t.Setenv(repeaterAllowLocalEnv, "")
 
-	via := []*http.Request{httptest.NewRequest(http.MethodGet, "https://api.ipify.org", nil)}
-	if err := probeCheckRedirect(httptest.NewRequest(http.MethodGet, "https://api.ipify.org/ip", nil), via); err != nil {
+	via := []*http.Request{newReqWithProject(http.MethodGet, "https://api.ipify.org", nil)}
+	if err := probeCheckRedirect(newReqWithProject(http.MethodGet, "https://api.ipify.org/ip", nil), via); err != nil {
 		t.Fatalf("同主机重定向应放行，实际 %v", err)
 	}
-	if err := probeCheckRedirect(httptest.NewRequest(http.MethodGet, "https://ifconfig.me/ip", nil), via); err == nil {
+	if err := probeCheckRedirect(newReqWithProject(http.MethodGet, "https://ifconfig.me/ip", nil), via); err == nil {
 		t.Fatal("跨公网主机的重定向必须拒绝")
 	}
-	if err := probeCheckRedirect(httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/settings", nil), via); err == nil {
+	if err := probeCheckRedirect(newReqWithProject(http.MethodGet, "http://127.0.0.1:8787/api/settings", nil), via); err == nil {
 		t.Fatal("重定向到本机必须拒绝")
 	}
-	if err := probeCheckRedirect(httptest.NewRequest(http.MethodGet, "https://api.ipify.org", nil),
+	if err := probeCheckRedirect(newReqWithProject(http.MethodGet, "https://api.ipify.org", nil),
 		[]*http.Request{via[0], via[0], via[0]}); err == nil {
 		t.Fatal("超过 3 跳必须拒绝")
 	}

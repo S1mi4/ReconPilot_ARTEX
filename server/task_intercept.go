@@ -66,7 +66,11 @@ func (s *Server) taskInterceptListRules(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 400, "bad task id")
 		return
 	}
-	rules, err := pg.Assets().ListTaskInterceptRules(taskID)
+	if s.projectOfTask(taskID) == 0 {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	rules, err := pg.Assets(s.projectOfTask(taskID)).ListTaskInterceptRules(taskID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -87,6 +91,10 @@ func (s *Server) taskInterceptCreateRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "bad task id")
 		return
 	}
+	if s.projectOfTask(taskID) == 0 {
+		writeErr(w, 404, "task not found")
+		return
+	}
 	var req taskInterceptRuleReq
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -96,7 +104,7 @@ func (s *Server) taskInterceptCreateRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.Assets().CreateTaskInterceptRule(taskID, req.Action, req.Kind, req.Pattern, req.Note, req.Enabled)
+	rule, err := pg.Assets(s.projectOfTask(taskID)).CreateTaskInterceptRule(taskID, req.Action, req.Kind, req.Pattern, req.Note, req.Enabled)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -114,6 +122,10 @@ func (s *Server) taskInterceptUpdateRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "bad task id")
 		return
 	}
+	if s.projectOfTask(taskID) == 0 {
+		writeErr(w, 404, "task not found")
+		return
+	}
 	ruleID, ok := pathInt(r, "rid")
 	if !ok || ruleID <= 0 {
 		writeErr(w, 400, "bad rule id")
@@ -128,7 +140,7 @@ func (s *Server) taskInterceptUpdateRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.Assets().UpdateTaskInterceptRule(taskID, ruleID, req.Action, req.Kind, req.Pattern, req.Note, req.Enabled)
+	rule, err := pg.Assets(s.projectOfTask(taskID)).UpdateTaskInterceptRule(taskID, ruleID, req.Action, req.Kind, req.Pattern, req.Note, req.Enabled)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -146,12 +158,16 @@ func (s *Server) taskInterceptDeleteRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "bad task id")
 		return
 	}
+	if s.projectOfTask(taskID) == 0 {
+		writeErr(w, 404, "task not found")
+		return
+	}
 	ruleID, ok := pathInt(r, "rid")
 	if !ok || ruleID <= 0 {
 		writeErr(w, 400, "bad rule id")
 		return
 	}
-	deleted, err := pg.Assets().DeleteTaskInterceptRule(taskID, ruleID)
+	deleted, err := pg.Assets(s.projectOfTask(taskID)).DeleteTaskInterceptRule(taskID, ruleID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -169,6 +185,10 @@ func (s *Server) taskInterceptToggleRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "bad task id")
 		return
 	}
+	if s.projectOfTask(taskID) == 0 {
+		writeErr(w, 404, "task not found")
+		return
+	}
 	ruleID, ok := pathInt(r, "rid")
 	if !ok || ruleID <= 0 {
 		writeErr(w, 400, "bad rule id")
@@ -181,7 +201,7 @@ func (s *Server) taskInterceptToggleRule(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.Assets().ToggleTaskInterceptRule(taskID, ruleID, req.Enabled); err != nil {
+	if err := pg.Assets(s.projectOfTask(taskID)).ToggleTaskInterceptRule(taskID, ruleID, req.Enabled); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

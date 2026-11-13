@@ -20,13 +20,13 @@ func TestRemarksRoundTripPreservesExecutionState(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("remark test description", "original goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "remark test description", "original goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
 	defer func() { _ = m.pg.DeleteTask(taskID) }()
-	scheduleInput := db.TaskScheduleInput{Name: "remark schedule", Enabled: false, ScheduleType: "once", RunDate: "2099-01-01", StartTime: "09:00", TaskIDs: []int64{taskID}}
+	scheduleInput := db.TaskScheduleInput{ProjectID: testProjectID(t, m.pg), Name: "remark schedule", Enabled: false, ScheduleType: "once", RunDate: "2099-01-01", StartTime: "09:00", TaskIDs: []int64{taskID}}
 	schedule, err := m.pg.CreateTaskSchedule(scheduleInput)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestRemarksRoundTripPreservesExecutionState(t *testing.T) {
 	}
 	handler := s.Handler()
 	request := func(path, body string, authenticated bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPatch, path, strings.NewReader(body))
+		req := newReqWithProject(http.MethodPatch, path, strings.NewReader(body))
 		if authenticated {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}

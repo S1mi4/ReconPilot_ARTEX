@@ -12,17 +12,17 @@ import (
 func TestTaskAssetSharingLiveToolPolicy(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
-	task, err := d.CreateTask("tool sharing", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "tool sharing", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(task.ID)
-	assets := d.Assets()
-	company, _, err := d.Companies().UpsertCompany(fmt.Sprintf("sharing-tool-%d", task.ID), "")
+	assets := d.Assets(testProjectID(t, d))
+	company, _, err := d.Companies(testProjectID(t, d)).UpsertCompany(fmt.Sprintf("sharing-tool-%d", task.ID), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Companies().DeleteCompany(company)
+	defer d.Companies(testProjectID(t, d)).DeleteCompany(company)
 	foreign, err := assets.UpsertRootDomain(db.UpsertRootDomainReq{Domain: fmt.Sprintf("sharing-tool-%d.invalid", task.ID)})
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +33,7 @@ func TestTaskAssetSharingLiveToolPolicy(t *testing.T) {
 	}
 	tools := NewToolSet(d.Exploration(task.ExplorationID), "planner")
 	tools.SetTaskID(task.ID)
-	tools.SetAssetStore(assets, d.Companies())
+	tools.SetAssetStore(assets, d.Companies(testProjectID(t, d)))
 	idJSON, _ := json.Marshal(foreign)
 	intent := intentItem{Summary: "reference foreign target", AssetIDs: []json.RawMessage{idJSON, idJSON}}
 	if _, err := tools.addOneIntent(intent); err == nil {
@@ -52,7 +52,7 @@ func TestTaskAssetSharingLiveToolPolicy(t *testing.T) {
 		if visible != enabled {
 			t.Fatalf("live list_assets enabled=%v result=%v", enabled, got)
 		}
-		companies, err := d.Companies().ListCompaniesForTask(task.ID)
+		companies, err := d.Companies(testProjectID(t, d)).ListCompaniesForTask(task.ID)
 		if err != nil {
 			t.Fatal(err)
 		}

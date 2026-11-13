@@ -42,13 +42,13 @@ func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.
 
 	stamp := time.Now().UnixNano()
 	name := fmt.Sprintf("HTTP Strict Company %d", stamp)
-	companyID, _, _, _, _, err := m.pg.Companies().CreateCompanyWithScope(name, "", []db.ScopeInput{
+	companyID, _, _, _, _, err := m.pg.Companies(testProjectID(t, m.pg)).CreateCompanyWithScope(name, "", []db.ScopeInput{
 		{Kind: "domain", Value: fmt.Sprintf("existing-%d.example", stamp)},
 	}, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = m.pg.Companies().DeleteCompany(companyID) }()
+	defer func() { _ = m.pg.Companies(testProjectID(t, m.pg)).DeleteCompany(companyID) }()
 
 	s := &Server{m: m}
 	body, err := json.Marshal(map[string]any{
@@ -58,13 +58,13 @@ func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/companies", bytes.NewReader(body))
+	req := newReqWithProject(http.MethodPost, "/api/companies", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	s.createCompany(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("duplicate create status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	scope, err := m.pg.Companies().GetScope(companyID)
+	scope, err := m.pg.Companies(testProjectID(t, m.pg)).GetScope(companyID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,13 +80,14 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 	}
 	defer m.Close()
 
-	companyID, _, err := m.pg.Companies().UpsertCompany(
+	companyID, _, err := m.pg.Companies(testProjectID(t, m.pg)).UpsertCompany(
 		fmt.Sprintf("Delete Company DTO %d", time.Now().UnixNano()), "",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	task, err := m.CreateTaskWithOptions("company deletion dto", "goal", db.TaskCreateOptions{
+		ProjectID:  testProjectID(t, m),
 		CompanyIDs: []int64{companyID},
 	})
 	if err != nil {
@@ -95,7 +96,7 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
 
 	s := &Server{m: m}
-	req := httptest.NewRequest(http.MethodDelete, "/api/companies/1", bytes.NewBufferString(`{}`))
+	req := newReqWithProject(http.MethodDelete, "/api/companies/1", bytes.NewBufferString(`{}`))
 	req.SetPathValue("id", i64s(companyID))
 	rec := httptest.NewRecorder()
 	s.deleteCompany(rec, req)
@@ -124,7 +125,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 
 	t.Run("missing company is 404", func(t *testing.T) {
 		body := bytes.NewBufferString(`{"scope":[]}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/companies/999999999/scope", body)
+		req := newReqWithProject(http.MethodPost, "/api/companies/999999999/scope", body)
 		req.SetPathValue("id", "999999999")
 		rec := httptest.NewRecorder()
 		s.addCompanyScope(rec, req)
@@ -143,7 +144,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req := httptest.NewRequest(http.MethodPost, "/api/companies", bytes.NewReader(body))
+		req := newReqWithProject(http.MethodPost, "/api/companies", bytes.NewReader(body))
 		rec := httptest.NewRecorder()
 		s.createCompany(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -160,7 +161,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req := httptest.NewRequest(http.MethodPost, "/api/companies", bytes.NewReader(body))
+		req := newReqWithProject(http.MethodPost, "/api/companies", bytes.NewReader(body))
 		rec := httptest.NewRecorder()
 		s.createCompany(rec, req)
 		var created struct {
@@ -168,7 +169,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 			Added int   `json:"scope_added"`
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &created)
-		defer func() { _ = m.pg.Companies().DeleteCompany(created.ID) }()
+		defer func() { _ = m.pg.Companies(testProjectID(t, m.pg)).DeleteCompany(created.ID) }()
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
@@ -179,7 +180,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 
 	t.Run("oversized request body is 413", func(t *testing.T) {
 		body := `{"name":"` + strings.Repeat("x", maxCompanyMutationBodyBytes+1) + `"}`
-		req := httptest.NewRequest(http.MethodPost, "/api/companies", strings.NewReader(body))
+		req := newReqWithProject(http.MethodPost, "/api/companies", strings.NewReader(body))
 		rec := httptest.NewRecorder()
 		s.createCompany(rec, req)
 		if rec.Code != http.StatusRequestEntityTooLarge {
@@ -196,7 +197,7 @@ func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
 	defer m.Close()
 	s := &Server{m: m}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/assets?dsl=(", nil)
+	req := newReqWithProject(http.MethodGet, "/api/assets?dsl=(", nil)
 	rec := httptest.NewRecorder()
 	s.listAssets(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -206,7 +207,7 @@ func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}
-	req = httptest.NewRequest(http.MethodGet, "/api/assets?type=root_domain", nil)
+	req = newReqWithProject(http.MethodGet, "/api/assets?type=root_domain", nil)
 	rec = httptest.NewRecorder()
 	s.listAssets(rec, req)
 	if rec.Code != http.StatusInternalServerError {
@@ -222,29 +223,29 @@ func TestDeleteCompanyRejectsBadJSONAndReportsMissing(t *testing.T) {
 	defer m.Close()
 	s := &Server{m: m}
 
-	companyID, _, err := m.pg.Companies().UpsertCompany(
+	companyID, _, err := m.pg.Companies(testProjectID(t, m.pg)).UpsertCompany(
 		fmt.Sprintf("Delete JSON Company %d", time.Now().UnixNano()), "",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = m.pg.Companies().DeleteCompany(companyID) }()
+	defer func() { _ = m.pg.Companies(testProjectID(t, m.pg)).DeleteCompany(companyID) }()
 
 	for _, body := range []string{`{"delete_assets":`, `{}` + `{}`} {
-		req := httptest.NewRequest(http.MethodDelete, "/api/companies/1", strings.NewReader(body))
+		req := newReqWithProject(http.MethodDelete, "/api/companies/1", strings.NewReader(body))
 		req.SetPathValue("id", i64s(companyID))
 		rec := httptest.NewRecorder()
 		s.deleteCompany(rec, req)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("body=%q status=%d response=%s", body, rec.Code, rec.Body.String())
 		}
-		company, err := m.pg.Companies().GetCompany(companyID)
+		company, err := m.pg.Companies(testProjectID(t, m.pg)).GetCompany(companyID)
 		if err != nil || company == nil {
 			t.Fatalf("bad JSON deleted company: company=%v err=%v", company, err)
 		}
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/api/companies/999999999", nil)
+	req := newReqWithProject(http.MethodDelete, "/api/companies/999999999", nil)
 	req.SetPathValue("id", "999999999")
 	rec := httptest.NewRecorder()
 	s.deleteCompany(rec, req)
@@ -264,7 +265,7 @@ func TestCompanyScopeSystemFailureIsHTTP500(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/companies/1/scope", bytes.NewBufferString(`{"scope":[]}`))
+	req := newReqWithProject(http.MethodPost, "/api/companies/1/scope", bytes.NewBufferString(`{"scope":[]}`))
 	req.SetPathValue("id", "1")
 	rec := httptest.NewRecorder()
 	s.addCompanyScope(rec, req)

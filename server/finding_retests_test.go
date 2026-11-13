@@ -51,7 +51,12 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 	if err := s.seedFindingRetester(); err != nil {
 		t.Fatal(err)
 	}
-	fid, err := pg.AddFinding(0, 0, "retest-server", "复测测试", "high", "summary", "original proof", "worker", nil)
+	// Findings are project-scoped through their task, so the fixture owns one.
+	owner, err := pg.CreateTask(testProjectID(t, pg), "retest owner", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := pg.AddFinding(owner.ID, 0, "retest-server", "复测测试", "high", "summary", "original proof", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,6 +72,7 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 		agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt
 		_, _ = pg.Exec(`DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM finding_retests WHERE finding_id=$1)`, fid)
 		_, _ = pg.DeleteFinding(fid)
+		_ = pg.DeleteTask(owner.ID)
 		pg.Close()
 	})
 	return s, fid
@@ -78,7 +84,7 @@ func setRetestProvider(s *Server, p retestProvider) {
 }
 
 func retestRequest(handler http.HandlerFunc, method string, id int64, body string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(method, "/", strings.NewReader(body))
+	r := newReqWithProject(method, "/", strings.NewReader(body))
 	r.SetPathValue("id", strconv.FormatInt(id, 10))
 	w := httptest.NewRecorder()
 	handler(w, r)
@@ -135,7 +141,7 @@ func TestRetestActiveStatusLifecycle(t *testing.T) {
 	}
 	check("", 0)
 	for _, terminal := range []string{"completed", "failed", "stopped"} {
-		r, c, _, err := s.m.pg.CreateFindingRetest(t.Context(), fid, "private notes")
+		r, c, _, err := s.m.pg.CreateFindingRetest(t.Context(), testProjectID(t, s.m.pg), fid, "private notes")
 		if err != nil {
 			t.Fatal(err)
 		}

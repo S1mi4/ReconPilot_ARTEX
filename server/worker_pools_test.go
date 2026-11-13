@@ -127,7 +127,7 @@ func TestWorkerPoolSettingsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := httptest.NewRecorder()
-	s.getSettings(res, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	s.getSettings(res, newReqWithProject(http.MethodGet, "/api/settings", nil))
 	var unset map[string]any
 	if err := json.Unmarshal(res.Body.Bytes(), &unset); err != nil {
 		t.Fatal(err)
@@ -135,7 +135,7 @@ func TestWorkerPoolSettingsRoundTrip(t *testing.T) {
 	if pools, ok := unset["worker_pools"].([]any); !ok || pools == nil || len(pools) != 0 {
 		t.Fatalf("GET unset worker_pools=%#v, want empty array", unset["worker_pools"])
 	}
-	put := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":2,"worker_pools":[{"profile_id":"`+strconv.FormatInt(pID, 10)+`","workers":2}]}`))
+	put := newReqWithProject(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":2,"worker_pools":[{"profile_id":"`+strconv.FormatInt(pID, 10)+`","workers":2}]}`))
 	putResult := httptest.NewRecorder()
 	s.putSettings(putResult, put)
 	if putResult.Code != http.StatusOK {
@@ -144,13 +144,13 @@ func TestWorkerPoolSettingsRoundTrip(t *testing.T) {
 	if m.Workers() != 2 || len(m.WorkerPools()) != 1 {
 		t.Fatalf("PUT worker pools did not sync settings: workers=%d pools=%+v", m.Workers(), m.WorkerPools())
 	}
-	workersOnly := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":9}`))
+	workersOnly := newReqWithProject(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":9}`))
 	workersOnlyResult := httptest.NewRecorder()
 	s.putSettings(workersOnlyResult, workersOnly)
 	if workersOnlyResult.Code != http.StatusOK || m.Workers() != 2 {
 		t.Fatalf("workers-only PUT changed pool total: status=%d workers=%d", workersOnlyResult.Code, m.Workers())
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newReqWithProject(http.MethodGet, "/api/settings", nil)
 	res = httptest.NewRecorder()
 	s.getSettings(res, req)
 	if res.Code != http.StatusOK {
@@ -164,14 +164,14 @@ func TestWorkerPoolSettingsRoundTrip(t *testing.T) {
 	if !ok || len(pools) != 1 || pools[0].(map[string]any)["profile_id"] != strconv.FormatInt(pID, 10) {
 		t.Fatalf("GET worker_pools=%#v, want string profile id", payload["worker_pools"])
 	}
-	clear := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":4,"worker_pools":[]}`))
+	clear := newReqWithProject(http.MethodPut, "/api/settings", strings.NewReader(`{"workers":4,"worker_pools":[]}`))
 	clearResult := httptest.NewRecorder()
 	s.putSettings(clearResult, clear)
 	if clearResult.Code != http.StatusOK || m.Workers() != 4 || len(m.WorkerPools()) != 0 {
 		t.Fatalf("PUT legacy clear status=%d body=%s workers=%d pools=%+v", clearResult.Code, clearResult.Body.String(), m.Workers(), m.WorkerPools())
 	}
 	res = httptest.NewRecorder()
-	s.getSettings(res, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	s.getSettings(res, newReqWithProject(http.MethodGet, "/api/settings", nil))
 	var cleared map[string]any
 	if err := json.Unmarshal(res.Body.Bytes(), &cleared); err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestPinnedRuntimeMissingProfileDoesNotFallback(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("pinned runtime test", "test", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "pinned runtime test", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestPinnedRuntimeQuotaDoesNotAdvanceTaskFailover(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("pinned quota", "test", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "pinned quota", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestPinnedWorkerLoopDoesNotConsultTaskRouterAndReportsFailureOnce(t *testin
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("pinned worker loop", "test", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "pinned worker loop", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestPinnedWorkerAvailabilityRecoveryUsesSystemSession(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("pinned availability", "test", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "pinned availability", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestDetachedIntentPinnedOwnerUsesPinnedResolver(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("detached pinned owner", "test", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "detached pinned owner", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

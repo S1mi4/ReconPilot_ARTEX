@@ -655,6 +655,7 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 		t.Fatal(err)
 	}
 	task, err := m.CreateTaskWithOptions("quota fallback", "resume intent", db.TaskCreateOptions{
+		ProjectID:     testProjectID(t, m),
 		LLMProfileIDs: []int64{profileID},
 	})
 	if err != nil {

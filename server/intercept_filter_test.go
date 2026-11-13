@@ -76,7 +76,7 @@ func TestInterceptFilterHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	do := func(path string, auth bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req := newReqWithProject(http.MethodGet, path, nil)
 		if auth {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}

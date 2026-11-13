@@ -143,7 +143,7 @@ func uploadZip(t *testing.T, skillDir string, filename string, data []byte) (*ht
 	}
 	mw.Close()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/skills/upload", &body)
+	req := newReqWithProject(http.MethodPost, "/api/skills/upload", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rr := httptest.NewRecorder()
 	(&Server{skillDir: skillDir}).fsUploadSkill(rr, req)

@@ -31,7 +31,7 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, err := m.CreateTask("traffic evidence API", "local evidence", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "traffic evidence API", "local evidence", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	}
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
-		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r := newReqWithProject(method, path, strings.NewReader(body))
 		r.Header.Set("Authorization", "Bearer "+token)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -261,7 +261,7 @@ func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	tid := *finding.TaskID
-	sharedTask, err := s.m.CreateTask("shared evidence", "fixture", nil, 0, 0)
+	sharedTask, err := s.m.CreateTask(testProjectID(t, s.m), "shared evidence", "fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,8 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child, err := s.m.CreateTaskWithOptions("inherited evidence API", "fixture", db.TaskCreateOptions{SourceTaskIDs: []int64{*finding.TaskID}})
+	child, err := s.m.CreateTaskWithOptions("inherited evidence API", "fixture", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, s.m), SourceTaskIDs: []int64{*finding.TaskID}})
 	if err != nil {
 		t.Fatal(err)
 	}

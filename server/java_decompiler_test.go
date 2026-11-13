@@ -579,8 +579,8 @@ func installBinaryAuditCodeService(t *testing.T, s *Server, taskID int64, classe
 	}
 	assetExtra, _ := json.Marshal(map[string]any{"task_id": taskID, "codebase_id": codebaseID, "relative_path": "."})
 	var assetID int64
-	if err := s.m.pg.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'binary-service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
+	if err := s.m.pg.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'binary-service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	var serviceID int64
@@ -618,8 +618,8 @@ func installBinaryAuditClassCodeService(t *testing.T, s *Server, taskID int64, c
 	}
 	assetExtra, _ := json.Marshal(map[string]any{"task_id": taskID, "codebase_id": codebaseID, "relative_path": "."})
 	var assetID int64
-	if err := s.m.pg.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'direct-class-service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
+	if err := s.m.pg.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'direct-class-service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	var serviceID int64

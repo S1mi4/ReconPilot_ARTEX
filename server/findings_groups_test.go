@@ -23,7 +23,7 @@ func TestFindingGroupsNoResultStopReason(t *testing.T) {
 	}
 	t.Cleanup(func() { m.Close() })
 	marker := fmt.Sprintf("__no_result_groups_%d__", time.Now().UnixNano())
-	task, err := m.CreateTask("stopped finding group", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "stopped finding group", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestFindingGroupsNoResultStopReason(t *testing.T) {
 				s.engine = engine
 			}
 			rec := httptest.NewRecorder()
-			s.findingGroups(rec, httptest.NewRequest(http.MethodGet, "/api/exploration/findings/groups?vulnclass="+marker, nil))
+			s.findingGroups(rec, newReqWithProject(http.MethodGet, "/api/exploration/findings/groups?vulnclass="+marker, nil))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
@@ -126,12 +126,12 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 		}
 	}()
 
-	taskA, err := m.CreateTask("finding group A", "goal", nil, 0, 0)
+	taskA, err := m.CreateTask(testProjectID(t, m), "finding group A", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	createdTaskIDs = append(createdTaskIDs, mustTaskID(t, taskA.ID))
-	taskB, err := m.CreateTask("finding group B", "goal", nil, 0, 0)
+	taskB, err := m.CreateTask(testProjectID(t, m), "finding group B", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 	}
 
 	s := &Server{m: m}
-	request := httptest.NewRequest(http.MethodGet,
+	request := newReqWithProject(http.MethodGet,
 		"/api/exploration/findings/groups?vulnclass="+marker+"&sort=severity&page=1&limit=1", nil)
 	recorder := httptest.NewRecorder()
 	s.findingGroups(recorder, request)
@@ -177,7 +177,7 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 		t.Fatalf("unexpected first group: %+v", page.Items[0])
 	}
 
-	request = httptest.NewRequest(http.MethodGet,
+	request = newReqWithProject(http.MethodGet,
 		"/api/exploration/findings/groups?vulnclass="+marker+"&q=finding+2&page=1&limit=10", nil)
 	recorder = httptest.NewRecorder()
 	s.findingGroups(recorder, request)
@@ -199,7 +199,7 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 		t.Fatalf("unexpected searched group page: %+v", page)
 	}
 
-	request = httptest.NewRequest(http.MethodGet,
+	request = newReqWithProject(http.MethodGet,
 		"/api/exploration/findings/groups?vulnclass="+marker+"&page=-4&limit=0", nil)
 	recorder = httptest.NewRecorder()
 	s.findingGroups(recorder, request)
@@ -228,7 +228,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	}
 	defer m.Close()
 
-	task, err := m.CreateTask("deepen finding", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "deepen finding", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	live, unsubscribe := s.engine.Broadcaster().Subscribe(task.ID)
 	defer unsubscribe()
 	body := bytes.NewBufferString(`{"description":"验证完整利用链并保留可复现证据"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", body)
+	req := newReqWithProject(http.MethodPost, "/api/exploration/findings/1/deepen", body)
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()
 	s.deepenFinding(rec, req)
@@ -319,7 +319,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	if err := m.pg.DeleteTask(taskID); err != nil {
 		t.Fatal(err)
 	}
-	req = httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", bytes.NewBufferString(`{"description":"retry"}`))
+	req = newReqWithProject(http.MethodPost, "/api/exploration/findings/1/deepen", bytes.NewBufferString(`{"description":"retry"}`))
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec = httptest.NewRecorder()
 	s.deepenFinding(rec, req)
@@ -332,7 +332,7 @@ func TestDeepenFindingValidatesDescription(t *testing.T) {
 	s := &Server{}
 	tooLong, _ := json.Marshal(map[string]string{"description": strings.Repeat("x", maxFindingFollowUpRunes+1)})
 	for _, body := range []string{`{}`, `{"description":"   "}`, string(tooLong)} {
-		req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", bytes.NewBufferString(body))
+		req := newReqWithProject(http.MethodPost, "/api/exploration/findings/1/deepen", bytes.NewBufferString(body))
 		req.SetPathValue("id", "1")
 		rec := httptest.NewRecorder()
 		s.deepenFinding(rec, req)
@@ -341,7 +341,7 @@ func TestDeepenFindingValidatesDescription(t *testing.T) {
 		}
 	}
 	oversized := `{"description":"` + strings.Repeat("x", (32<<10)+1) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", strings.NewReader(oversized))
+	req := newReqWithProject(http.MethodPost, "/api/exploration/findings/1/deepen", strings.NewReader(oversized))
 	req.SetPathValue("id", "1")
 	rec := httptest.NewRecorder()
 	s.deepenFinding(rec, req)
@@ -356,7 +356,7 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("deepen rollback", "leave no orphan intent", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "deepen rollback", "leave no orphan intent", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx}
-	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen",
+	req := newReqWithProject(http.MethodPost, "/api/exploration/findings/1/deepen",
 		bytes.NewBufferString(`{"description":"this intent must be rolled back"}`))
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()

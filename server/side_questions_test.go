@@ -178,7 +178,7 @@ func newSideHTTPFixture(t *testing.T) *sideHTTPFixture {
 func (f *sideHTTPFixture) call(t *testing.T, method, path string, body any, want int) *httptest.ResponseRecorder {
 	t.Helper()
 	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
+	req := newReqWithProject(method, path, bytes.NewReader(raw))
 	req.Header.Set("Authorization", "Bearer "+f.token)
 	w := httptest.NewRecorder()
 	f.handler.ServeHTTP(w, req)
@@ -189,7 +189,7 @@ func (f *sideHTTPFixture) call(t *testing.T, method, path string, body any, want
 }
 func (f *sideHTTPFixture) conversation(t *testing.T) (sidequestion.Parent, string) {
 	t.Helper()
-	c, err := f.m.pg.CreateConversation("mainagent", "side HTTP", nil)
+	c, err := f.m.pg.CreateConversation(testProjectID(t, f.m.pg), "mainagent", "side HTTP", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func (f *sideHTTPFixture) checkpoint(t *testing.T, p sidequestion.Parent) sidequ
 
 func TestSideTaskContextFallbackForPausedTask(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("审查暂停任务的上下文", "确认边界访问控制", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "审查暂停任务的上下文", "确认边界访问控制", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestSideTaskContextFallbackForPausedTask(t *testing.T) {
 
 func TestSideTaskContextFallbackRequiresUsableContext(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("", "", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "", "", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestSideTaskContextFallbackRequiresUsableContext(t *testing.T) {
 
 func TestSideTaskSyntheticSnapshotRebuildsCurrentEvidence(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("rebuild task context", "keep adding evidence", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "rebuild task context", "keep adding evidence", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestSideTaskSyntheticSnapshotUsesCurrentTaskModel(t *testing.T) {
 		}
 		f.s.provByProfile[id] = &provEntry{prov: f.provider, cfg: cfg}
 	}
-	task, err := f.m.CreateTask("model switch task", "retain task context", &aID, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "model switch task", "retain task context", &aID, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestSideTaskSyntheticSnapshotUsesCurrentTaskModel(t *testing.T) {
 
 func TestSideTaskSyntheticSnapshotIsOverriddenByCheckpoint(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("synthetic checkpoint", "keep real context", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "synthetic checkpoint", "keep real context", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestSideTaskSyntheticSnapshotIsOverriddenByCheckpoint(t *testing.T) {
 
 func TestSideTaskContextModelUnavailableIsDistinct(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("model unavailable", "still has material", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "model unavailable", "still has material", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +572,7 @@ func TestSideHTTPGlobalLimitTaskWorkerAndDeletion(t *testing.T) {
 		waitSide(t, f.m.pg, e.ID, "cancelled")
 	}
 	close(f.provider.release)
-	task, err := f.m.CreateTask("side route task", "context", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "side route task", "context", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +656,7 @@ func TestSideCheckpointPersistsBeforeAdmissionAndRestart(t *testing.T) {
 	}
 	// All routes pass the same authentication middleware.
 	w := httptest.NewRecorder()
-	f.handler.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+	f.handler.ServeHTTP(w, newReqWithProject("GET", path, nil))
 	if w.Code != 401 {
 		t.Fatalf("unauthenticated side route: %d", w.Code)
 	}
@@ -695,7 +695,7 @@ func TestSideRejectsDeletedOrChangedCachedProfile(t *testing.T) {
 
 func TestSideTaskDrainPersistsBeforeArchive(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("side archive drain", "context", nil, 0, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "side archive drain", "context", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +740,7 @@ func TestSideTaskDrainPersistsBeforeArchive(t *testing.T) {
 
 func TestSideRestoredWorkerRuntimePublishesNewCheckpoint(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	task, err := f.m.CreateTask("restore side publisher", "context", nil, 3600, 0)
+	task, err := f.m.CreateTask(testProjectID(t, f.m), "restore side publisher", "context", nil, 3600, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -164,8 +164,8 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	delete(m, "task_id")
 	inner, _ := json.Marshal(m)
 	tsx := agent.NewToolSet(t.Store, "orchestrator")
-	if s.m.Assets() != nil {
-		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
+	if as := s.m.assetsForTask(t); as != nil {
+		tsx.SetAssetStore(as, as.Companies())
 	}
 	tsx.SetNotify(t.Notify)         // 通用唤醒（无专用回调的写操作走它；读工具为 no-op）
 	tsx.SetNotifyHint(t.NotifyHint) // add_hint → 记一条「人新增了 N 条战略提示：…」触发并唤醒 planner
@@ -335,7 +335,23 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 					return actool.Errorf(err.Error()), nil
 				}
 			}
+			// 子任务必须落在父任务所属项目里：项目是最高级分层，spawn 不能跨项目。
+			projectID := int64(0)
+			if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
+				if pt, ok := s.m.Task(strconv.FormatInt(ri.TaskID, 10)); ok {
+					projectID = pt.ProjectID
+				}
+			}
+			if projectID == 0 && a.ParentRef != "" {
+				if pt, ok := s.m.Task(a.ParentRef); ok {
+					projectID = pt.ProjectID
+				}
+			}
+			if projectID == 0 {
+				return actool.Errorf("无法确定所属项目：spawn_task 只能从某个任务内部调用"), nil
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
+				ProjectID:       projectID,
 				Name:            name,
 				SourceTaskIDs:   sourceIDs,
 				LLMProfileIDs:   llmIDs,

@@ -49,7 +49,7 @@ func TestInsertAssetsSubdomainSideEffects(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE domain IN ('ia-sub.sideeffect-test.com','sideeffect-test.com') OR ip='7.8.9.10'`)
 
 	out := callInsertAssets(t, ts, map[string]any{
@@ -118,7 +118,7 @@ func TestInsertAssetsMultiIPSubdomain(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE domain IN ('multi.multiip-test.io','multiip-test.io') OR ip IN ('1.1.1.1','2.2.2.2')`)
 
 	out := callInsertAssets(t, ts, map[string]any{
@@ -166,7 +166,7 @@ func TestInsertAssetsHTTPServiceTechnologies(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE url='https://tech-test.example.com' OR domain IN ('tech-test.example.com','example.com') OR ip='3.4.5.6'`)
 
 	out := callInsertAssets(t, ts, map[string]any{
@@ -195,7 +195,7 @@ func TestInsertAssetsHTTPServiceTechnologies(t *testing.T) {
 	}
 
 	// QueryByType should return technologies correctly (verifies array_to_json scan)
-	assets, err := d.Assets().QueryByType("service", 50, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByType("service", 50, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestInsertAssetsOtherService(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE
 		(type='service' AND ip='10.20.30.40') OR
 		(type='ip' AND ip='10.20.30.40') OR
@@ -310,7 +310,7 @@ func TestInsertAssetsMixedBatch(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE
 		domain IN ('batch-sub.batch-test.org','batch-test.org') OR
 		ip='55.66.77.88' OR
@@ -368,7 +368,7 @@ func TestInsertAssetsDedup(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE domain='dedup-ia.deduptest.net' OR domain='deduptest.net'`)
 
 	payload := map[string]any{
@@ -406,7 +406,7 @@ func TestInsertAssetsRejectsHostnameIPPerItem(t *testing.T) {
 	defer d.Close()
 
 	ts := NewToolSet(nil, "")
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	defer d.Exec(`DELETE FROM assets WHERE ip IN ('198.51.100.23','cdn.badip-test.com') OR domain='badip-test.com'`)
 
 	out := callInsertAssets(t, ts, map[string]any{

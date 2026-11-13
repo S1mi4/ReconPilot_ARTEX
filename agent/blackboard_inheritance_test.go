@@ -29,7 +29,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
 
-	companies := d.Companies()
+	companies := d.Companies(testProjectID(t, d))
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("overview-scope-%d", time.Now().UnixNano()), "")
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if added != len(inputs) || skipped != 0 || invalid != 0 || len(scopeErrors) != 0 {
 		t.Fatalf("add company scope: added=%d skipped=%d invalid=%d errors=%v", added, skipped, invalid, scopeErrors)
 	}
-	assets := d.Assets()
+	assets := d.Assets(testProjectID(t, d))
 	assetID, err := assets.UpsertRootDomain(db.UpsertRootDomainReq{Domain: domain})
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +60,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	t.Cleanup(func() { _, _ = assets.DeleteByIDs([]int64{assetID}) })
 
 	task, err := d.CreateTaskWithOptions("company context", "read configured scope", db.TaskCreateOptions{
+		ProjectID:  testProjectID(t, d),
 		CompanyIDs: []int64{companyID},
 	})
 	if err != nil {
@@ -137,6 +138,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 
 	coverageDisabled := false
 	disabledTask, err := d.CreateTaskWithOptions("company context without coverage", "still expose company assets", db.TaskCreateOptions{
+		ProjectID:  testProjectID(t, d),
 		CompanyIDs: []int64{companyID}, CoverageEnabled: &coverageDisabled,
 	})
 	if err != nil {
@@ -187,15 +189,17 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
 
-	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
+	grand, err := d.CreateTask(testProjectID(t, d), "grand", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := d.CreateTaskWithOptions("source", "source goal", db.TaskCreateOptions{SourceTaskIDs: []int64{grand.ID}})
+	source, err := d.CreateTaskWithOptions("source", "source goal", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{grand.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := d.CreateTaskWithOptions("current", "current goal", db.TaskCreateOptions{SourceTaskIDs: []int64{source.ID}})
+	current, err := d.CreateTaskWithOptions("current", "current goal", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{source.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +248,7 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assets := d.Assets()
+	assets := d.Assets(testProjectID(t, d))
 	host := fmt.Sprintf("overview-host-%d.invalid", source.ID)
 	assetID, err := assets.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, TaskID: source.ID})
 	if err != nil {
@@ -371,7 +375,7 @@ func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
 
-	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "trace-cap", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +399,7 @@ func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	}
 
 	tools := NewToolSet(store, "worker")
-	tools.SetAssetStore(d.Assets(), d.Companies())
+	tools.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 
 	// Request 7 ids: a duplicate of the first, an invalid 0, then all 6 real ids.
 	// After dedup/cleanup that is 6 valid ids — one over the cap.

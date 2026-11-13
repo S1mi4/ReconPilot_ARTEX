@@ -32,7 +32,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 		if body != nil {
 			data, _ = json.Marshal(body)
 		}
-		req := httptest.NewRequest(method, path, bytes.NewReader(data))
+		req := newReqWithProject(method, path, bytes.NewReader(data))
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -91,7 +91,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	}
 	defer m.Close()
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
-	conversation, err := m.pg.CreateConversation("mainagent", "pin through http", nil)
+	conversation, err := m.pg.CreateConversation(testProjectID(t, m.pg), "mainagent", "pin through http", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	}
 
 	body, _ := json.Marshal(map[string]any{"title": "  pinned title  ", "pinned": true})
-	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
+	req := newReqWithProject(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -122,7 +122,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	}
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("会", maxConversationTitleRunes+1)})
-	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
+	req = newReqWithProject(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -131,7 +131,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	}
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("x", maxConversationRequestBytes+1)})
-	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
+	req = newReqWithProject(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -142,7 +142,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	body, _ = json.Marshal(map[string]any{
 		"agent_key": "mainagent", "title": strings.Repeat("会", maxConversationTitleRunes+1),
 	})
-	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
+	req = newReqWithProject(http.MethodPost, "/api/conversations", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -153,7 +153,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	body, _ = json.Marshal(map[string]any{
 		"agent_key": "mainagent", "title": strings.Repeat("x", maxConversationRequestBytes+1),
 	})
-	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
+	req = newReqWithProject(http.MethodPost, "/api/conversations", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)

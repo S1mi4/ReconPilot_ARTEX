@@ -35,9 +35,9 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 		var r *http.Request
 		if body != nil {
 			b, _ := json.Marshal(body)
-			r = httptest.NewRequest(method, path, bytes.NewReader(b))
+			r = newReqWithProject(method, path, bytes.NewReader(b))
 		} else {
-			r = httptest.NewRequest(method, path, nil)
+			r = newReqWithProject(method, path, nil)
 		}
 		r.Header.Set("Authorization", "Bearer "+tok)
 		rec := httptest.NewRecorder()

@@ -811,7 +811,16 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		writeErr(w, 429, "旁路请求已达并发上限，请稍后重试")
 		return
 	}
-	agentQuestion, ok := s.prepareChatMentionMessage(w, in.Question)
+	// 旁路问题没有请求头可读，项目从它所属的任务/会话继承。
+	mentionProject := s.projectOfTask(p.TaskID)
+	if mentionProject == 0 {
+		mentionProject = s.projectOfConversation(p.ConversationID)
+	}
+	if mentionProject == 0 {
+		writeErr(w, http.StatusConflict, "无法确定所属项目")
+		return
+	}
+	agentQuestion, ok := s.prepareChatMentionMessage(w, mentionProject, in.Question)
 	if !ok {
 		return
 	}

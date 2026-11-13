@@ -29,7 +29,7 @@ func TestTaskCategoryBatchRoute(t *testing.T) {
 	}
 
 	post := func(body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/tasks/category/batch", strings.NewReader(body))
+		req := newReqWithProject(http.MethodPost, "/api/tasks/category/batch", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()

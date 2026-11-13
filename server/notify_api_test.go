@@ -54,7 +54,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 
 	// 自建一个 task：共享装置 trafficEvidenceServer 造的 task 拿不到 exploration id，
 	// 而记录漏洞必须提供它。
-	task, err := s.m.CreateTask("通知推送测试", "推送行为验证", nil, 0, 0)
+	task, err := s.m.CreateTask(testProjectID(t, s.m), "通知推送测试", "推送行为验证", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

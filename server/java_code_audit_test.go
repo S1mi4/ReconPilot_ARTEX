@@ -234,8 +234,8 @@ func TestTaskCodeAuditReviewPublishesToTaskAndGlobalFindings(t *testing.T) {
 	}
 	assetExtra, _ := json.Marshal(map[string]any{"task_id": taskID, "codebase_id": codebaseID, "relative_path": "service"})
 	var assetID, serviceID int64
-	if err := s.m.pg.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
+	if err := s.m.pg.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.m.pg.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,

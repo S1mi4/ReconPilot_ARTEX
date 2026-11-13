@@ -99,7 +99,10 @@ func (s *Server) processCredentialJob(parent context.Context, item *db.Intellige
 	result := *item.Credentials
 	conversationID := result.ConversationID
 	if conversationID == 0 {
-		if c, err := s.m.pg.CreateConversation(db.CredentialAgentKey, "凭据整理 · "+firstLine(item.Title, 42), nil); err == nil {
+		projectID := s.projectOfTask(item.TaskID)
+		if projectID == 0 {
+			log.Printf("[credentials] 跳过凭据整理会话：无法确定所属项目（task#%d）", item.TaskID)
+		} else if c, err := s.m.pg.CreateConversation(projectID, db.CredentialAgentKey, "凭据整理 · "+firstLine(item.Title, 42), nil); err == nil {
 			conversationID = c.ID
 			result.ConversationID = c.ID
 			_, _ = s.m.pg.AppendConvActivity(c.ID, db.Activity{Worker: db.CredentialAgentKey, Kind: "user", Summary: "收到凭据上报，开始整理", Detail: item.Content})
@@ -230,7 +233,7 @@ func (s *Server) credentialHosts(item *db.Intelligence) map[string]bool {
 			hosts[host] = hosts[host] || children
 		}
 	}
-	if assets, err := s.m.Assets().GetByIDs(item.AssetIDs); err == nil {
+	if assets, err := s.m.Assets(s.projectOfTask(item.TaskID)).GetByIDs(item.AssetIDs); err == nil {
 		for _, a := range assets {
 			switch a.Type {
 			case "root_domain":

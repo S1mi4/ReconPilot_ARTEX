@@ -14,6 +14,8 @@ import (
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
+
+	"strconv"
 )
 
 // wireAgentAugment connects the PG agent_visibility table into the agent runtime:
@@ -222,7 +224,10 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
-func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+// makeDomainReg builds the domain-tool registry for the project the current run
+// belongs to. It is a factory (not a value) because 项目是最高级分层：同一个
+// 进程里不同运行属于不同项目，工具绑定的资产库必须跟着运行走。
+func wireTools(pg *db.DB, makeDomainReg func(context.Context) map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	agent.IntelligenceEnabled = func() bool { return pg.GetBool(db.SettingTaskIntelligence, false) }
 	agent.IntelligenceRecord = func(ctx context.Context, taskID, nodeID int64, worker string, input db.IntelligenceInput) (int64, error) {
@@ -302,6 +307,10 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		// and therefore never includes ToolSet-backed domain tools. Per-task instances
 		// in the base always win: inList is built from the original incoming list so a
 		// worker's own upsert_asset is never shadowed by the server-level registry copy.
+		var domainReg map[string]actool.CoreTool
+		if makeDomainReg != nil {
+			domainReg = makeDomainReg(ctx)
+		}
 		if len(domainReg) > 0 {
 			inList := make(map[string]bool, len(tools))
 			for _, t := range tools {
@@ -374,6 +383,23 @@ func contains(ss []string, v string) bool {
 // (they only need the AssetStore); the exploration-graph tools refuse with a
 // clear message via ToolSet.needExploration. Binding one of them to a task-less
 // agent in the tools table is therefore a useless tool, not a crash.
+// domainToolRegistry resolves the project of the current run and builds its
+// domain tools. Unresolvable project ⇒ no injected domain tools (explicit
+// degradation instead of silently writing into the wrong project).
+func (s *Server) domainToolRegistry(ctx context.Context) map[string]actool.CoreTool {
+	ri := agent.RunInfoFrom(ctx)
+	projectID := s.projectOfTask(ri.TaskID)
+	if projectID == 0 && ri.SessionID != "" {
+		if convID, err := strconv.ParseInt(ri.SessionID, 10, 64); err == nil {
+			projectID = s.projectOfConversation(convID)
+		}
+	}
+	if projectID == 0 {
+		return nil
+	}
+	return buildDomainReg(s.m.pg.Assets(projectID))
+}
+
 func buildDomainReg(as *db.AssetStore) map[string]actool.CoreTool {
 	if as == nil {
 		return nil

@@ -29,7 +29,9 @@ import (
 // sharing the process-wide asset store. ID is the PG task id as a string; ExpID
 // is the exploration the task owns.
 type Task struct {
-	ID                  string `json:"id"`
+	ID string `json:"id"`
+	// ProjectID 是任务所属项目。项目在创建时固定，之后不随任何操作改变。
+	ProjectID           int64  `json:"project_id"`
 	ExpID               int64  `json:"exploration_id"`
 	Remark              string `json:"remark"`
 	Name                string `json:"name"` // 可选任务名称;空=未命名
@@ -273,7 +275,6 @@ type DeleteTaskResult struct {
 type Manager struct {
 	dir         string
 	pg          *pgdb.DB
-	assets      *pgdb.AssetStore
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
@@ -605,7 +606,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
-	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	m := &Manager{dir: dir, pg: pg, tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	if fp, ferr := newDynamicForwardProxy(func() string { return m.GlobalProxy() }); ferr == nil {
 		m.forwardProxy = fp
 		// An empty runtime route means direct egress, even when the persisted
@@ -680,7 +681,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
-	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	m.enrich = enrich.New(m.pg, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
@@ -1029,7 +1030,17 @@ func (m *Manager) HostTools() []actool.CoreTool {
 	return m.traffic.Tools()
 }
 
-func (m *Manager) Assets() *pgdb.AssetStore  { return m.assets }
+// Assets returns the asset store of one project. 项目是最高级分层：没有项目就
+// 没有资产库，因此这里不再提供「全局资产库」的入口。
+func (m *Manager) Assets(projectID int64) *pgdb.AssetStore { return m.pg.Assets(projectID) }
+
+// assetsForTask returns the asset store bound to a task's project.
+func (m *Manager) assetsForTask(t *Task) *pgdb.AssetStore {
+	if t == nil {
+		return nil
+	}
+	return m.pg.Assets(t.ProjectID)
+}
 func (m *Manager) PG() *pgdb.DB              { return m.pg }
 func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 
@@ -1155,7 +1166,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
 	return &Task{
-		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
+		ID: strconv.FormatInt(pt.ID, 10), ProjectID: pt.ProjectID, ExpID: pt.ExplorationID,
 		Name:       pt.Name,
 		Remark:     pt.Remark,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
@@ -1175,7 +1186,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		ActiveRunSeconds: pt.ActiveRunSeconds, RunSegmentStartedAt: unixOrZero(pt.RunSegmentStartedAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: guard.NewWithInterceptor(ic).WithProject(pt.ProjectID), notify: make(chan struct{}, 1),
 	}
 }
 
@@ -1209,12 +1220,13 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 
 // CreateTask creates a task + its exploration and makes it active.
 // timeoutSeconds is the task-level wall-clock budget (0 = 不限时).
-func (m *Manager) CreateTask(description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {
+func (m *Manager) CreateTask(projectID int64, description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {
 	var ids []int64
 	if llmProfileID != nil {
 		ids = []int64{*llmProfileID}
 	}
 	return m.CreateTaskWithOptions(description, goal, pgdb.TaskCreateOptions{
+		ProjectID:     projectID,
 		LLMProfileIDs: ids, TimeoutSeconds: timeoutSeconds, PlanHeartbeatSeconds: planHeartbeatSeconds,
 	})
 }
@@ -1352,10 +1364,10 @@ func (m *Manager) SetTasksCategory(taskIDs []string, categoryID *int64) (map[str
 // one manager-level critical section. This closes the gap where a task could
 // commit its company scope immediately before registration and miss the
 // post-delete in-memory sweep.
-func (m *Manager) DeleteCompanyWithAssets(id int64, deleteAssets bool) (int64, error) {
+func (m *Manager) DeleteCompanyWithAssets(projectID, id int64, deleteAssets bool) (int64, error) {
 	m.companyMu.Lock()
 	defer m.companyMu.Unlock()
-	assetsDeleted, err := m.pg.Companies().DeleteCompanyWithAssets(id, deleteAssets)
+	assetsDeleted, err := m.pg.Companies(projectID).DeleteCompanyWithAssets(id, deleteAssets)
 	if err != nil {
 		return 0, err
 	}

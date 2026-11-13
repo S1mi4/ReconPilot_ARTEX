@@ -119,7 +119,7 @@ func (s *Server) sendWorkerMessage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "仅已暂停的 Worker 可以发送消息，请先暂停")
 		return
 	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, message)
+	agentMessage, ok := s.prepareChatMentionMessage(w, t.ProjectID, message)
 	if !ok {
 		return
 	}

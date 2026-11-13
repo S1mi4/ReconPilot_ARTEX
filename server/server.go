@@ -265,8 +265,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
-		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
+		// 域工具（资产/企业写工具）按运行所属项目注入，见 domainToolRegistry。
+		wireTools(m.pg, s.domainToolRegistry) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
@@ -810,6 +810,18 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/version", s.version)
+
+	// 项目（最高级分层）：本身是全局资源，不需要项目上下文。项目内内容一律要求
+	// 请求携带 X-Project-ID，由各 handler 通过 s.requireProject 解析。
+	mux.HandleFunc("GET /api/projects", s.listProjects)
+	mux.HandleFunc("POST /api/projects", s.createProject)
+	mux.HandleFunc("GET /api/projects/{id}", s.getProject)
+	mux.HandleFunc("PATCH /api/projects/{id}", s.updateProject)
+	mux.HandleFunc("POST /api/projects/{id}/archive", s.archiveProject)
+	mux.HandleFunc("POST /api/projects/{id}/restore", s.restoreProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.deleteProject)
+	mux.HandleFunc("GET /api/projects/{id}/stats", s.projectStats)
+
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/system/metrics", s.systemMetrics)
 	mux.HandleFunc("GET /api/logs", s.getLogs)
@@ -1186,6 +1198,10 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	out := map[string]any{}
 	out["engine_mode"] = "idle"              // spec enum; overridden below when a task is active
 	out["llm_configured"] = s.engine.Ready() // is an LLM provider installed at all
@@ -1194,7 +1210,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		out["traffic"] = c
 		out["traffic_enabled"] = true
 	}
-	if counts, err := s.m.Assets().CountsByType(); err == nil {
+	if counts, err := s.m.Assets(projectID).CountsByType(); err == nil {
 		total := 0
 		for _, n := range counts {
 			total += n
@@ -1749,6 +1765,10 @@ type createTaskReq struct {
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	var req createTaskReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
@@ -1803,7 +1823,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var schedule *db.TaskScheduleInput
 	if req.Schedule != nil {
-		input := s.scheduleInput(*req.Schedule, nil)
+		input := s.scheduleInput(projectID, *req.Schedule, nil)
 		input.TaskIDs = nil
 		if err := db.ValidateTaskScheduleInput(input); err != nil {
 			writeErr(w, 400, err.Error())
@@ -1825,8 +1845,9 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
-		Schedule: schedule,
-		Name:     strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
+		ProjectID: projectID,
+		Schedule:  schedule,
+		Name:      strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
@@ -2009,7 +2030,7 @@ func (s *Server) seed(t *Task, text string) {
 		u += ":" + strconv.Itoa(port)
 	}
 	var rootID int64
-	if as := s.m.Assets(); as != nil {
+	if as := s.m.Assets(t.ProjectID); as != nil {
 		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 		if net.ParseIP(host) != nil {
 			rootID, _ = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
@@ -2072,7 +2093,7 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2100,7 +2121,7 @@ func (s *Server) taskCoverageGraph(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2156,7 +2177,7 @@ func (s *Server) taskScopeList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2176,7 +2197,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2205,7 +2226,7 @@ func (s *Server) taskScopeDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2362,7 +2383,9 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 	if len(uniq) == 0 {
 		return assets
 	}
-	list, err := s.m.pg.Assets().GetByIDs(uniq)
+	// GetByIDs is a primary-key lookup: the ids came from findings the caller
+	// already scoped to one project, so no extra filter is needed here.
+	list, err := s.m.pg.Assets(0).GetByIDs(uniq)
 	if err != nil {
 		log.Printf("[findings] resolve assets: %v", err)
 	}
@@ -3465,11 +3488,12 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	if rawTaskID := strings.TrimSpace(q.Get("task_id")); rawTaskID != "" {
 		taskScoped = true
 		taskID, err := strconv.ParseInt(rawTaskID, 10, 64)
-		if err != nil || taskID <= 0 || s.m.ResolveTask(rawTaskID) == nil {
+		task := s.m.ResolveTask(rawTaskID)
+		if err != nil || taskID <= 0 || task == nil {
 			writeErr(w, http.StatusNotFound, "task not found")
 			return
 		}
-		taskHosts, err = s.m.Assets().HostsByTaskWithSources(taskID)
+		taskHosts, err = s.m.Assets(task.ProjectID).HostsByTaskWithSources(taskID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -3524,11 +3548,12 @@ func (s *Server) getTrafficHosts(w http.ResponseWriter, r *http.Request) {
 	var hosts []string
 	if rawTaskID := strings.TrimSpace(r.URL.Query().Get("task_id")); rawTaskID != "" {
 		taskID, err := strconv.ParseInt(rawTaskID, 10, 64)
-		if err != nil || taskID <= 0 || s.m.ResolveTask(rawTaskID) == nil {
+		task := s.m.ResolveTask(rawTaskID)
+		if err != nil || taskID <= 0 || task == nil {
 			writeErr(w, http.StatusNotFound, "task not found")
 			return
 		}
-		hosts, err = s.m.Assets().HostsByTaskWithSources(taskID)
+		hosts, err = s.m.Assets(task.ProjectID).HostsByTaskWithSources(taskID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -4323,7 +4348,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
+	agentMessage, ok := s.prepareChatMentionMessage(w, t.ProjectID, req.Message)
 	if !ok {
 		return
 	}
@@ -4395,7 +4420,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(t.ProjectID), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
@@ -4473,7 +4498,7 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 		_, _ = t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
 		return "已记录提示，规划者下次会读到：" + text
 	default:
-		assetCounts, _ := s.m.Assets().CountsByType()
+		assetCounts, _ := s.m.Assets(t.ProjectID).CountsByType()
 		assets := 0
 		for _, c := range assetCounts {
 			assets += c
@@ -4493,7 +4518,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
+		ns, _ := s.m.Assets(t.ProjectID).QueryByType(ty, 100000, 0)
 		if len(ns) > 0 {
 			counts[ty] = len(ns)
 		}
