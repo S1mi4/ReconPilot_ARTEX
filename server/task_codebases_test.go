@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -239,6 +241,106 @@ func makeCodebaseTar(t *testing.T, name string, typeflag byte, data []byte) []by
 		t.Fatal(err)
 	}
 	return output.Bytes()
+}
+
+func makeCodebaseTarGzip(t *testing.T, files []codebaseTestFile) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	gz := gzip.NewWriter(&output)
+	writer := tar.NewWriter(gz)
+	if err := writer.WriteHeader(&tar.Header{Name: "./", Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		header := &tar.Header{Name: "./" + file.path, Mode: 0o644, Size: int64(len(file.data)), Typeflag: tar.TypeReg}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(file.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func TestTaskCodebaseSourceArchivesAreExtractedForDiscovery(t *testing.T) {
+	s, mux, base := taskCodebaseFixture(t)
+	files := []codebaseTestFile{
+		{path: "A Service/pom.xml", data: []byte("<project><artifactId>a-service</artifactId></project>")},
+		{path: "A Service/src/main/App.java", data: []byte("class AService {}")},
+		{path: "B Service/build.gradle", data: []byte("plugins { id 'java' }")},
+		{path: "B Service/src/main/App.java", data: []byte("class BService {}")},
+	}
+	zipData := makeCodebaseZip(t, map[string]struct {
+		data []byte
+		mode os.FileMode
+	}{
+		files[0].path: {data: files[0].data, mode: 0o644},
+		files[1].path: {data: files[1].data, mode: 0o644},
+		files[2].path: {data: files[2].data, mode: 0o644},
+		files[3].path: {data: files[3].data, mode: 0o644},
+	})
+	archives := []struct {
+		name string
+		data []byte
+	}{
+		{name: "source.zip", data: zipData},
+		{name: "source.tar.gz", data: makeCodebaseTarGzip(t, files)},
+	}
+	for _, archive := range archives {
+		response := taskCodebasePost(t, mux, "313", "source_archive", []codebaseTestFile{{path: archive.name, data: archive.data}})
+		if response.Code != http.StatusCreated {
+			t.Fatalf("%s upload status %d: %s", archive.name, response.Code, response.Body.String())
+		}
+		version := readTaskCodebaseVersion(t, response.Body)
+		if version.Kind != "directory" || version.Format != "directory" || version.Name != "source" ||
+			version.FileCount != len(files) || version.TotalSize <= 0 {
+			t.Fatalf("%s did not become an extracted source snapshot: %+v", archive.name, version)
+		}
+		contentRoot := filepath.Join(base, "tasks", "313", "codebases", version.ID, "contents", version.Name)
+		for _, file := range files {
+			stored := filepath.Join(contentRoot, filepath.FromSlash(file.path))
+			data, err := os.ReadFile(stored)
+			if err != nil || !bytes.Equal(data, file.data) {
+				t.Fatalf("%s extracted %s as %q, err=%v", archive.name, file.path, data, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(base, "tasks", "313", "codebases", version.ID, "contents", archive.name)); !os.IsNotExist(err) {
+			t.Fatalf("original %s was left as the codebase input instead of extracting it: err=%v", archive.name, err)
+		}
+		metadata, err := s.scanCodebaseServiceMetadata(context.Background(), 313, version)
+		if err != nil {
+			t.Fatalf("scan extracted %s: %v", archive.name, err)
+		}
+		services := map[string]bool{}
+		for _, item := range metadata {
+			services[item.Path] = true
+		}
+		if !services["A Service"] || !services["B Service"] {
+			t.Fatalf("discovery did not see services extracted from %s: %+v", archive.name, metadata)
+		}
+	}
+	unsafe := makeCodebaseZip(t, map[string]struct {
+		data []byte
+		mode os.FileMode
+	}{"../escape.java": {data: []byte("unsafe"), mode: 0o644}})
+	response := taskCodebasePost(t, mux, "313", "source_archive", []codebaseTestFile{{path: "unsafe.zip", data: unsafe}})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("source archive traversal accepted: %d %s", response.Code, response.Body.String())
+	}
+	versions, err := os.ReadDir(filepath.Join(base, "tasks", "313", "codebases"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != len(archives) {
+		t.Fatalf("rejected source archive left a partial snapshot: got %d versions", len(versions))
+	}
 }
 
 func TestTaskCodebaseTarInspectionRejectsTraversalAndLinks(t *testing.T) {

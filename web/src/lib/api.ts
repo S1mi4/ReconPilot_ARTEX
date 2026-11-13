@@ -100,6 +100,7 @@ import type {
   TaskCodeAuditConfig,
   TaskCodeAuditRun,
   TaskCodebaseDiscoveryRun,
+  TaskCodebaseUploadKind,
   TaskCodebaseVersion,
   TaskCodeService,
   TaskConstraint,
@@ -616,7 +617,7 @@ export const api = {
     const response = await get<{ versions: TaskCodebaseVersion[] | null }>(`/tasks/${id}/codebases`);
     return arr(response.versions);
   },
-  uploadTaskCodebase: async (id: string, kind: TaskCodebaseVersion["kind"], files: File[], codebaseID?: string) => {
+  uploadTaskCodebase: async (id: string, kind: TaskCodebaseUploadKind, files: File[], codebaseID?: string) => {
     if (MOCK) {
       const { mockAddTaskCodebase } = await import("@/lib/mock/task-codebases");
       return mockAddTaskCodebase(id, kind, files, codebaseID);

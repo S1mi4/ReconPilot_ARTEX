@@ -24,7 +24,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
-import type { Task, TaskCodebaseVersion, TaskFileEntry, TaskFileListing, WorkspaceFile } from "@/lib/types";
+import type {
+  Task,
+  TaskCodebaseUploadKind,
+  TaskCodebaseVersion,
+  TaskFileEntry,
+  TaskFileListing,
+  WorkspaceFile,
+} from "@/lib/types";
 
 function fileSize(n: number) {
   if (n < 1024) return `${n} B`;
@@ -50,7 +57,7 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
   const [codebaseUploading, setCodebaseUploading] = React.useState(false);
   const [codebaseError, setCodebaseError] = React.useState("");
   const [codebaseTargetID, setCodebaseTargetID] = React.useState("");
-  const directoryInput = React.useRef<HTMLInputElement>(null);
+  const sourceArchiveInput = React.useRef<HTMLInputElement>(null);
   const artifactInput = React.useRef<HTMLInputElement>(null);
   const generation = React.useRef(0);
   const previewGeneration = React.useRef(0);
@@ -106,11 +113,7 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
     if (active) void refreshCodebases();
   }, [active, refreshCodebases]);
 
-  React.useEffect(() => {
-    directoryInput.current?.setAttribute("webkitdirectory", "");
-  }, []);
-
-  const uploadCodebase = async (kind: TaskCodebaseVersion["kind"], selection: FileList | null) => {
+  const uploadCodebase = async (kind: TaskCodebaseUploadKind, selection: FileList | null) => {
     const files = Array.from(selection ?? []);
     if (!files.length) return;
     setCodebaseUploading(true);
@@ -236,24 +239,24 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
         <p className="text-muted-foreground text-xs">{ui("taskCodebases.safety")}</p>
         <div className="flex flex-wrap gap-2">
           <input
-            ref={directoryInput}
+            ref={sourceArchiveInput}
             type="file"
-            multiple
+            accept=".zip,.tar,.tar.gz,.tgz"
             className="hidden"
-            aria-label={ui("taskCodebases.directory")}
+            aria-label={ui("taskCodebases.sourceArchive")}
             onChange={(event) => {
-              void uploadCodebase("directory", event.currentTarget.files);
+              void uploadCodebase("source_archive", event.currentTarget.files);
               event.currentTarget.value = "";
             }}
           />
-          <Button variant="outline" disabled={codebaseUploading} onClick={() => directoryInput.current?.click()}>
+          <Button variant="outline" disabled={codebaseUploading} onClick={() => sourceArchiveInput.current?.click()}>
             <UploadIcon />
-            {ui("taskCodebases.directory")}
+            {ui("taskCodebases.sourceArchive")}
           </Button>
           <input
             ref={artifactInput}
             type="file"
-            accept=".zip,.tar,.jar,.war,.class"
+            accept=".jar,.war,.class"
             className="hidden"
             aria-label={ui("taskCodebases.artifact")}
             onChange={(event) => {

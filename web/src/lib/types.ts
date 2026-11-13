@@ -2105,6 +2105,8 @@ export interface TaskCodebaseVersion {
   created_at: string;
 }
 
+export type TaskCodebaseUploadKind = "directory" | "source_archive" | "artifact";
+
 export interface TaskCodeService {
   id: number;
   task_id: number;

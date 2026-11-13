@@ -1,14 +1,15 @@
 export const taskMessages = {
   "taskCodebases.title": ["代码库版本", "Codebase versions"],
   "taskCodebases.description": [
-    "将服务源码目录或部署包作为独立版本保存到当前任务。",
-    "Save service source directories or deployment packages as separate versions in this task.",
+    "上传源码压缩包或服务部署包；源码压缩包会由后端解压后保存为独立版本。",
+    "Upload a source archive or service deployment package. Source archives are extracted by the backend and saved as separate versions.",
   ],
   "taskCodebases.safety": [
-    "单次最多 512 MiB。ZIP、TAR、JAR 和 WAR 只检查归档结构，不会解包或执行。",
-    "Up to 512 MiB per upload. ZIP, TAR, JAR and WAR files are inspected without extraction or execution.",
+    "单次上传最多 512 MiB；源码 ZIP/TAR 解压后最多 8 GiB、20,000 个文件。JAR/WAR 不解包或执行，CLASS 单独保存。",
+    "Uploads are limited to 512 MiB. Source ZIP/TAR archives extract to at most 8 GiB and 20,000 files. JAR/WAR files are inspected but not extracted or executed; CLASS files are stored individually.",
   ],
-  "taskCodebases.directory": ["上传源码目录", "Upload source directory"],
+  "taskCodebases.directory": ["源码目录", "Source directory"],
+  "taskCodebases.sourceArchive": ["上传源码压缩包", "Upload source archive"],
   "taskCodebases.artifact": ["上传部署包或 CLASS", "Upload package or CLASS"],
   "taskCodebases.identity": ["代码库身份", "Codebase identity"],
   "taskCodebases.newIdentity": ["自动匹配名称或新建代码库", "Match by name or create a codebase"],
@@ -19,12 +20,12 @@ export const taskMessages = {
   "taskCodebases.uploaded": ["代码库版本已保存", "Codebase version saved"],
   "taskCodebases.fileCount": ["{{count}} 个文件", "{{count}} files"],
   "taskCodebases.version": ["版本 {{id}}", "Version {{id}}"],
-  "taskCodebases.directoryKind": ["源码目录", "Source directory"],
+  "taskCodebases.directoryKind": ["源码压缩包（已解压）", "Source archive (extracted)"],
   "taskCodebases.artifactKind": ["部署包（{{format}}）", "Deployment package ({{format}})"],
   "taskCodebases.emptyUpload": ["请选择文件后再上传。", "Select files before uploading."],
   "taskCodebases.unsupported": [
-    "仅支持 ZIP、TAR、JAR、WAR 和 CLASS。",
-    "Only ZIP, TAR, JAR, WAR and CLASS files are supported.",
+    "源码仅支持 ZIP、TAR、TAR.GZ 和 TGZ；部署包仅支持 JAR、WAR 和 CLASS。",
+    "Sources support ZIP, TAR, TAR.GZ and TGZ; deployment packages support JAR, WAR and CLASS.",
   ],
   "taskCodebases.tooLarge": ["上传超过 512 MiB 限制。", "Upload exceeds the 512 MiB limit."],
   "taskCodebases.invalid": [

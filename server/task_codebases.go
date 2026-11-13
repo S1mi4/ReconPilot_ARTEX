@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -234,8 +235,8 @@ func validateTaskCodebaseUpload(form *multipart.Form) (taskCodebaseUpload, error
 	codebaseIDs := form.Value["codebase_id"]
 	files := form.File["file"]
 	paths := form.Value["relative_path"]
-	if len(kinds) != 1 || (kinds[0] != "directory" && kinds[0] != "artifact") {
-		return upload, fmt.Errorf("%w: kind must be directory or artifact", errInvalidTaskCodebase)
+	if len(kinds) != 1 || (kinds[0] != "directory" && kinds[0] != "source_archive" && kinds[0] != "artifact") {
+		return upload, fmt.Errorf("%w: kind must be directory, source_archive or artifact", errInvalidTaskCodebase)
 	}
 	if len(codebaseIDs) > 1 || (len(codebaseIDs) == 1 && codebaseIDs[0] != "" && !validCodebaseVersionID(codebaseIDs[0])) {
 		return upload, fmt.Errorf("%w: codebase_id must be a 32-character hexadecimal identifier", errInvalidTaskCodebase)
@@ -246,8 +247,8 @@ func validateTaskCodebaseUpload(form *multipart.Form) (taskCodebaseUpload, error
 	if len(files) == 0 || len(files) > maxTaskCodebaseFiles || len(paths) != len(files) {
 		return upload, fmt.Errorf("%w: upload must include 1 to %d files and matching paths", errInvalidTaskCodebase, maxTaskCodebaseFiles)
 	}
-	if kinds[0] == "artifact" && len(files) != 1 {
-		return upload, fmt.Errorf("%w: upload one archive or package at a time", errInvalidTaskCodebase)
+	if (kinds[0] == "source_archive" || kinds[0] == "artifact") && len(files) != 1 {
+		return upload, fmt.Errorf("%w: upload one source archive or deployment package at a time", errInvalidTaskCodebase)
 	}
 	out := make([]taskCodebaseUploadFile, 0, len(files))
 	seen := make(map[string]struct{}, len(files))
@@ -258,8 +259,8 @@ func validateTaskCodebaseUpload(form *multipart.Form) (taskCodebaseUpload, error
 		if err != nil {
 			return upload, fmt.Errorf("%w: invalid relative path", errInvalidTaskCodebase)
 		}
-		if kinds[0] == "artifact" && path.Base(rel) != rel {
-			return upload, fmt.Errorf("%w: artifact path must be a filename", errInvalidTaskCodebase)
+		if (kinds[0] == "source_archive" || kinds[0] == "artifact") && path.Base(rel) != rel {
+			return upload, fmt.Errorf("%w: archive path must be a filename", errInvalidTaskCodebase)
 		}
 		key := strings.ToLower(rel)
 		if _, exists := seen[key]; exists {
@@ -293,6 +294,16 @@ func validateTaskCodebaseUpload(form *multipart.Form) (taskCodebaseUpload, error
 			return taskCodebaseUpload{}, fmt.Errorf("%w: unsupported artifact format", errInvalidTaskCodebase)
 		}
 		upload.name = out[0].path
+		upload.format = format
+	} else if kinds[0] == "source_archive" {
+		format, ok := taskCodebaseSourceArchiveFormat(out[0].path)
+		if !ok {
+			return taskCodebaseUpload{}, fmt.Errorf("%w: source archive must be ZIP, TAR, TAR.GZ or TGZ", errInvalidTaskCodebase)
+		}
+		upload.name = taskCodebaseSourceArchiveName(out[0].path)
+		if upload.name == "" || upload.name == "." {
+			return taskCodebaseUpload{}, fmt.Errorf("%w: source archive name is invalid", errInvalidTaskCodebase)
+		}
 		upload.format = format
 	} else {
 		upload.name = rootName
@@ -331,6 +342,31 @@ func taskCodebaseArtifactFormat(name string) (string, bool) {
 	}
 }
 
+func taskCodebaseSourceArchiveFormat(name string) (string, bool) {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
+		return "tar.gz", true
+	case strings.HasSuffix(lower, ".zip"):
+		return "zip", true
+	case strings.HasSuffix(lower, ".tar"):
+		return "tar", true
+	default:
+		return "", false
+	}
+}
+
+func taskCodebaseSourceArchiveName(name string) string {
+	base := path.Base(name)
+	lower := strings.ToLower(base)
+	for _, suffix := range []string{".tar.gz", ".tgz", ".zip", ".tar"} {
+		if strings.HasSuffix(lower, suffix) {
+			return base[:len(base)-len(suffix)]
+		}
+	}
+	return base
+}
+
 func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUpload) (taskCodebaseVersion, error) {
 	var version taskCodebaseVersion
 	versionID, err := newTaskCodebaseVersionID()
@@ -354,9 +390,14 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 	}()
 
 	totalSize := int64(0)
+	sourceArchivePath := ""
 	for _, item := range upload.files {
 		rel := filepath.FromSlash(item.path)
 		dest := filepath.Join(stagePath, "contents", rel)
+		if upload.kind == "source_archive" {
+			dest = filepath.Join(stagePath, ".source-archive")
+			sourceArchivePath = dest
+		}
 		if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 			return version, err
 		}
@@ -386,7 +427,27 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 		}
 		totalSize += written
 	}
-	if upload.kind == "artifact" {
+	fileCount := len(upload.files)
+	storedKind := upload.kind
+	storedFormat := upload.format
+	storedName := upload.name
+	if upload.kind == "source_archive" {
+		extractedFiles, expandedSize, err := extractTaskCodebaseSourceArchive(sourceArchivePath, upload.format,
+			filepath.Join(stagePath, "contents", filepath.FromSlash(upload.name)))
+		if err != nil {
+			return version, fmt.Errorf("%w: unable to extract source archive: %v", errInvalidTaskCodebase, err)
+		}
+		if extractedFiles == 0 {
+			return version, fmt.Errorf("%w: source archive contains no files", errInvalidTaskCodebase)
+		}
+		if err := os.Remove(sourceArchivePath); err != nil {
+			return version, err
+		}
+		fileCount = extractedFiles
+		totalSize = expandedSize
+		storedKind = "directory"
+		storedFormat = "directory"
+	} else if upload.kind == "artifact" {
 		artifactPath := filepath.Join(stagePath, "contents", filepath.FromSlash(upload.files[0].path))
 		if err := inspectTaskCodebaseArtifact(artifactPath, upload.format); err != nil {
 			return version, fmt.Errorf("%w: %v", errInvalidTaskCodebase, err)
@@ -395,15 +456,15 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 	version = taskCodebaseVersion{
 		ID:         versionID,
 		CodebaseID: upload.codebaseID,
-		Name:       upload.name,
-		Kind:       upload.kind,
-		Format:     upload.format,
-		FileCount:  len(upload.files),
+		Name:       storedName,
+		Kind:       storedKind,
+		Format:     storedFormat,
+		FileCount:  fileCount,
 		TotalSize:  totalSize,
 		CreatedAt:  time.Now().UTC(),
 	}
 	if version.CodebaseID == "" {
-		version.CodebaseID = taskCodebaseIdentityID(taskID, upload.kind, upload.name)
+		version.CodebaseID = taskCodebaseIdentityID(taskID, version.Kind, version.Name)
 	}
 	manifest, err := json.MarshalIndent(version, "", "  ")
 	if err != nil {
@@ -477,6 +538,179 @@ func inspectTaskCodebaseArtifact(filename, format string) error {
 	}
 }
 
+func extractTaskCodebaseSourceArchive(filename, format, destination string) (int, int64, error) {
+	switch format {
+	case "zip":
+		if err := inspectTaskCodebaseZip(filename); err != nil {
+			return 0, 0, err
+		}
+		return extractTaskCodebaseZip(filename, destination)
+	case "tar":
+		if err := inspectTaskCodebaseTar(filename); err != nil {
+			return 0, 0, err
+		}
+		return extractTaskCodebaseTar(filename, destination, false)
+	case "tar.gz":
+		if err := inspectTaskCodebaseTarGzip(filename); err != nil {
+			return 0, 0, err
+		}
+		return extractTaskCodebaseTar(filename, destination, true)
+	default:
+		return 0, 0, errors.New("unsupported source archive format")
+	}
+}
+
+func extractTaskCodebaseZip(filename, destination string) (int, int64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	archive, err := zip.NewReader(f, info.Size())
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := ensureTaskCodebaseDirectories(destination, true); err != nil {
+		return 0, 0, err
+	}
+	fileCount := 0
+	var expandedSize int64
+	for _, entry := range archive.File {
+		isDir := entry.FileInfo().IsDir() || strings.HasSuffix(entry.Name, "/")
+		rel, err := safeTaskCodebaseArchivePath(entry.Name, isDir)
+		if err != nil {
+			return 0, 0, err
+		}
+		target := filepath.Join(destination, filepath.FromSlash(rel))
+		if isDir {
+			if err := os.MkdirAll(target, 0o750); err != nil {
+				return 0, 0, err
+			}
+			continue
+		}
+		if fileCount >= maxTaskCodebaseFiles {
+			return 0, 0, errors.New("archive contains too many files")
+		}
+		if entry.UncompressedSize64 > uint64(maxTaskCodebaseExpandedSize-expandedSize) {
+			return 0, 0, errors.New("archive expands beyond the extraction limit")
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+			return 0, 0, err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			return 0, 0, err
+		}
+		input, err := entry.Open()
+		if err != nil {
+			_ = out.Close()
+			return 0, 0, err
+		}
+		expectedSize := int64(entry.UncompressedSize64)
+		written, copyErr := io.Copy(out, &io.LimitedReader{R: input, N: expectedSize + 1})
+		closeInputErr := input.Close()
+		closeOutErr := out.Close()
+		if copyErr != nil {
+			return 0, 0, copyErr
+		}
+		if closeInputErr != nil {
+			return 0, 0, closeInputErr
+		}
+		if closeOutErr != nil {
+			return 0, 0, closeOutErr
+		}
+		if written != expectedSize {
+			return 0, 0, errors.New("archive entry size does not match its header")
+		}
+		fileCount++
+		expandedSize += written
+	}
+	return fileCount, expandedSize, nil
+}
+
+func extractTaskCodebaseTar(filename, destination string, compressed bool) (int, int64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	var source io.Reader = f
+	var gz *gzip.Reader
+	if compressed {
+		gz, err = gzip.NewReader(f)
+		if err != nil {
+			return 0, 0, err
+		}
+		defer gz.Close()
+		source = gz
+	}
+	if err := ensureTaskCodebaseDirectories(destination, true); err != nil {
+		return 0, 0, err
+	}
+	reader := tar.NewReader(source)
+	fileCount := 0
+	var expandedSize int64
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			if gz != nil {
+				if err := drainTaskCodebaseArchiveTail(gz, maxTaskCodebaseExpandedSize-expandedSize); err != nil {
+					return 0, 0, err
+				}
+			}
+			return fileCount, expandedSize, nil
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		isDir := header.Typeflag == tar.TypeDir
+		if !isDir && header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			return 0, 0, errors.New("archive contains a link or special file")
+		}
+		rel, err := safeTaskCodebaseArchivePath(header.Name, isDir)
+		if err != nil {
+			return 0, 0, err
+		}
+		target := filepath.Join(destination, filepath.FromSlash(rel))
+		if isDir {
+			if err := os.MkdirAll(target, 0o750); err != nil {
+				return 0, 0, err
+			}
+			continue
+		}
+		if fileCount >= maxTaskCodebaseFiles {
+			return 0, 0, errors.New("archive contains too many files")
+		}
+		if header.Size < 0 || header.Size > maxTaskCodebaseExpandedSize-expandedSize {
+			return 0, 0, errors.New("archive expands beyond the extraction limit")
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+			return 0, 0, err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			return 0, 0, err
+		}
+		written, copyErr := io.CopyN(out, reader, header.Size)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return 0, 0, copyErr
+		}
+		if closeErr != nil {
+			return 0, 0, closeErr
+		}
+		if written != header.Size {
+			return 0, 0, errors.New("archive entry size does not match its header")
+		}
+		fileCount++
+		expandedSize += written
+	}
+}
+
 func inspectTaskCodebaseZip(filename string) error {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -528,12 +762,32 @@ func inspectTaskCodebaseTar(filename string) error {
 		return err
 	}
 	defer f.Close()
-	tr := tar.NewReader(f)
+	return inspectTaskCodebaseTarReader(tar.NewReader(f), nil)
+}
+
+func inspectTaskCodebaseTarGzip(filename string) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	return inspectTaskCodebaseTarReader(tar.NewReader(gz), gz)
+}
+
+func inspectTaskCodebaseTarReader(tr *tar.Reader, tail io.Reader) error {
 	seen := make(map[string]bool)
 	var expanded int64
 	for count := 0; ; count++ {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
+			if tail != nil {
+				return drainTaskCodebaseArchiveTail(tail, maxTaskCodebaseExpandedSize-expanded)
+			}
 			return nil
 		}
 		if err != nil {
@@ -570,9 +824,33 @@ func inspectTaskCodebaseTar(filename string) error {
 	}
 }
 
+func drainTaskCodebaseArchiveTail(reader io.Reader, remaining int64) error {
+	if remaining < 0 {
+		return errors.New("archive expands beyond the inspection limit")
+	}
+	written, err := io.Copy(io.Discard, io.LimitReader(reader, remaining+1))
+	if err != nil {
+		return err
+	}
+	if written > remaining {
+		return errors.New("archive expands beyond the inspection limit")
+	}
+	return nil
+}
+
 func safeTaskCodebaseArchivePath(raw string, isDir bool) (string, error) {
 	if isDir {
 		raw = strings.TrimSuffix(raw, "/")
+		for strings.HasPrefix(raw, "./") {
+			raw = strings.TrimPrefix(raw, "./")
+		}
+		if raw == "." || raw == "" {
+			return "", nil
+		}
+	} else {
+		for strings.HasPrefix(raw, "./") {
+			raw = strings.TrimPrefix(raw, "./")
+		}
 	}
 	return safeTaskCodebasePath(raw)
 }
