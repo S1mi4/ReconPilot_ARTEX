@@ -4,13 +4,16 @@ import * as React from "react";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  Code2Icon,
   GlobeIcon,
   KeyRoundIcon,
   LayoutTemplateIcon,
   LinkIcon,
   type LucideIcon,
   NetworkIcon,
+  PlayIcon,
   PlusIcon,
+  RotateCcwIcon,
   SmartphoneIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -41,7 +44,15 @@ import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import { parseCompanyScopeText } from "@/lib/company-scope";
 import { taskAssetSourceLabel } from "@/lib/task-assets";
-import type { Asset, NewAssetType } from "@/lib/types";
+import type {
+  Asset,
+  LLMProfile,
+  NewAssetType,
+  TaskCodeAuditConfig,
+  TaskCodeAuditRun,
+  TaskCodebaseDiscoveryRun,
+  TaskCodeService,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZES = [25, 50, 100, 200];
@@ -63,10 +74,23 @@ const TABS = (ui: UITranslate): { key: NewAssetType; label: string; icon: Lucide
   { key: "app", label: ui("screen.63c73c4730f447"), icon: SmartphoneIcon },
   { key: "service", label: ui("screen.ec309ab207ef7f"), icon: LayoutTemplateIcon },
   { key: "endpoint", label: ui("screen.c80d519245a7e8"), icon: LinkIcon },
+  { key: "code_service", label: "代码服务", icon: Code2Icon },
 ];
 
 function firstText(values: Array<string | undefined>, fallback: string): string {
   return values.find((value) => value?.trim()) ?? fallback;
+}
+
+function codeServicePresenceLabel(present: unknown): string {
+  if (present === false) return "新版本中缺失";
+  if (present === true) return "存在";
+  return "未知";
+}
+
+function codeAuditStatusVariant(status: TaskCodeAuditRun["status"]): "destructive" | "secondary" | "outline" {
+  if (status === "failed") return "destructive";
+  if (status === "completed") return "secondary";
+  return "outline";
 }
 
 function assetLabel(asset: Asset): string {
@@ -85,6 +109,8 @@ function assetLabel(asset: Asset): string {
     }
     case "endpoint":
       return firstText([[asset.method, asset.url].filter(Boolean).join(" ")], `#${asset.id}`);
+    case "code_service":
+      return firstText([asset.service_name, String(asset.extra?.relative_path ?? "")], `#${asset.id}`);
   }
 }
 
@@ -353,6 +379,19 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const [rows, setRows] = React.useState<Asset[]>([]);
   const [total, setTotal] = React.useState(0);
   const [counts, setCounts] = React.useState<Record<string, number>>({});
+  const [codeServices, setCodeServices] = React.useState<TaskCodeService[]>([]);
+  const [discoveryRuns, setDiscoveryRuns] = React.useState<TaskCodebaseDiscoveryRun[]>([]);
+  const [auditRuns, setAuditRuns] = React.useState<TaskCodeAuditRun[]>([]);
+  const [auditTarget, setAuditTarget] = React.useState<TaskCodeService | null>(null);
+  const [auditConfig, setAuditConfig] = React.useState<TaskCodeAuditConfig | null>(null);
+  const [auditProfiles, setAuditProfiles] = React.useState<LLMProfile[]>([]);
+  const [auditScope, setAuditScope] = React.useState("");
+  const [auditProfileID, setAuditProfileID] = React.useState("default");
+  const [auditBudget, setAuditBudget] = React.useState("120000");
+  const [auditSourceAcknowledged, setAuditSourceAcknowledged] = React.useState(false);
+  const [auditConfigLoading, setAuditConfigLoading] = React.useState(false);
+  const [auditStarting, setAuditStarting] = React.useState(false);
+  const [resumingAuditID, setResumingAuditID] = React.useState<number | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState<NewAssetType>("root_domain");
   const [page, setPage] = React.useState(0);
@@ -364,6 +403,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const [addOpen, setAddOpen] = React.useState(false);
   const [removeTarget, setRemoveTarget] = React.useState<Asset | null>(null);
   const [removing, setRemoving] = React.useState(false);
+  const [decidingServiceID, setDecidingServiceID] = React.useState<number | null>(null);
   const assetsRequestRef = React.useRef(0);
   const dslMode = query.trim() !== "";
 
@@ -395,16 +435,21 @@ export function AssetsTab({ taskId }: { taskId: string }) {
       try {
         // The search always stays within this task's assets: taskAssets and
         // searchTaskAssets both pin task_id server-side.
-        const [current, nextCounts] = await Promise.all([
+        const [current, nextCounts, discoveries, audits] = await Promise.all([
           dsl
             ? api.searchTaskAssets(taskId, dsl, tab, size, page * size)
             : api.taskAssets(taskId, tab, size, page * size),
           api.assetCounts(taskId),
+          api.taskCodeServices(taskId),
+          api.taskCodeAudits(taskId),
         ]);
         if (!active || assetsRequestRef.current !== request) return;
         setRows(current.assets);
         setTotal(current.total);
         setCounts(nextCounts ?? {});
+        setCodeServices(discoveries.services);
+        setDiscoveryRuns(discoveries.runs);
+        setAuditRuns(audits);
         setDslError("");
       } catch (reason) {
         if (!active || assetsRequestRef.current !== request) return;
@@ -442,6 +487,87 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     setLoaded(false);
     setRefreshKey((current) => current + 1);
   }, []);
+  const auditTargetID = auditTarget?.id;
+
+  React.useEffect(() => {
+    if (auditTargetID === undefined) return;
+    let active = true;
+    setAuditConfig(null);
+    setAuditConfigLoading(true);
+    const profileID = auditProfileID === "default" ? undefined : Number(auditProfileID);
+    const timer = setTimeout(() => {
+      void api
+        .taskCodeAuditConfig(taskId, auditTargetID, auditScope.trim() || ".", profileID)
+        .then((config) => {
+          if (active) setAuditConfig(config);
+        })
+        .catch((reason) => {
+          if (active) toast.error(`无法读取审计配置：${String((reason as Error)?.message ?? reason)}`);
+        })
+        .finally(() => {
+          if (active) setAuditConfigLoading(false);
+        });
+    }, 250);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [auditProfileID, auditScope, auditTargetID, taskId]);
+
+  React.useEffect(() => {
+    if (auditTargetID === undefined) return;
+    let active = true;
+    void api
+      .llmProfiles()
+      .then((profiles) => {
+        if (active) setAuditProfiles(profiles.filter((profile) => profile.format !== "jev"));
+      })
+      .catch((reason) => {
+        if (active) toast.error(`无法读取 LLM 配置：${String((reason as Error)?.message ?? reason)}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [auditTargetID]);
+
+  const startCodeAudit = async () => {
+    if (!auditTarget || !auditSourceAcknowledged) return;
+    const budgetTokens = Number(auditBudget);
+    if (!Number.isInteger(budgetTokens) || budgetTokens < 1000 || budgetTokens > 500000) {
+      toast.error("Token 预算必须在 1,000 到 500,000 之间");
+      return;
+    }
+    setAuditStarting(true);
+    try {
+      await api.startTaskCodeAudit(taskId, auditTarget.id, {
+        scope_path: auditScope.trim() || ".",
+        ...(auditProfileID === "default" ? {} : { profile_id: Number(auditProfileID) }),
+        budget_tokens: budgetTokens,
+        source_acknowledged: true,
+      });
+      toast.success(`已将 ${auditTarget.name} 的白盒审计加入队列`);
+      setAuditTarget(null);
+      setAuditSourceAcknowledged(false);
+      refresh();
+    } catch (reason) {
+      toast.error(`无法启动白盒审计：${String((reason as Error)?.message ?? reason)}`);
+    } finally {
+      setAuditStarting(false);
+    }
+  };
+
+  const resumeCodeAudit = async (run: TaskCodeAuditRun) => {
+    setResumingAuditID(run.id);
+    try {
+      await api.resumeTaskCodeAudit(taskId, run.id, 50000);
+      toast.success("已追加 50,000 Token，审计将从最近检查点继续");
+      refresh();
+    } catch (reason) {
+      toast.error(`无法恢复审计：${String((reason as Error)?.message ?? reason)}`);
+    } finally {
+      setResumingAuditID(null);
+    }
+  };
 
   const remove = async () => {
     if (!removeTarget) return;
@@ -455,6 +581,19 @@ export function AssetsTab({ taskId }: { taskId: string }) {
       toast.error(ui("screen.9e0adb4df22f5d", { v0: String((reason as Error)?.message ?? reason) }));
     } finally {
       setRemoving(false);
+    }
+  };
+
+  const decideCodeService = async (service: TaskCodeService, decision: "confirm" | "reject") => {
+    setDecidingServiceID(service.id);
+    try {
+      await api.decideTaskCodeService(taskId, service.id, decision);
+      toast.success(decision === "confirm" ? "代码服务已加入任务资产" : "已拒绝该代码服务候选");
+      refresh();
+    } catch (reason) {
+      toast.error(`无法保存代码服务确认结果：${String((reason as Error)?.message ?? reason)}`);
+    } finally {
+      setDecidingServiceID(null);
     }
   };
 
@@ -472,6 +611,17 @@ export function AssetsTab({ taskId }: { taskId: string }) {
 
   const commonCardProps = { loaded, onPage: setPage, onSize: setSize, page, size, total };
   const totalAll = TABS(ui).reduce((sum, item) => sum + (counts[item.key] ?? 0), 0);
+  const pendingCodeServices = codeServices.filter((service) => service.decision === "pending");
+  const activeDiscoveryRuns = discoveryRuns.filter((run) => run.status === "queued" || run.status === "running");
+  const discoveryErrors = discoveryRuns.filter((run) => run.error);
+  const codeServiceHistory = new Map(
+    codeServices.flatMap((service) =>
+      service.asset_id === undefined ? [] : [[service.asset_id, service.versions] as const],
+    ),
+  );
+  const codeServiceByAssetID = new Map(
+    codeServices.flatMap((service) => (service.asset_id === undefined ? [] : [[service.asset_id, service] as const])),
+  );
 
   const searchBox = (
     <AssetDslSearch
@@ -482,6 +632,35 @@ export function AssetsTab({ taskId }: { taskId: string }) {
       count={dslMode ? total : undefined}
     />
   );
+
+  let auditConfigContent: React.ReactNode = (
+    <p className="text-muted-foreground text-xs">正在检查所选服务和 LLM 配置。</p>
+  );
+  if (auditConfigLoading) {
+    auditConfigContent = <Spinner />;
+  } else if (auditConfig) {
+    auditConfigContent = (
+      <>
+        <p>
+          <span className="font-medium">模型：</span>
+          {auditConfig.llm.model || "不可用"}（{auditConfig.llm.profile_name || "未配置"}）
+        </p>
+        <p className="break-all font-mono text-xs">
+          <span className="font-medium font-sans">端点：</span>
+          {auditConfig.llm.endpoint || "未解析"}
+        </p>
+        <p className="text-muted-foreground text-xs">
+          范围内 {auditConfig.production_source_files} 个生产 Java/JSP 文件、{auditConfig.test_java_files}{" "}
+          个测试上下文文件、
+          {auditConfig.config_files} 个构建/框架配置文件。
+        </p>
+        {!auditConfig.source_available ? <p className="text-amber-700 text-xs">{auditConfig.source_notice}</p> : null}
+        {!auditConfig.llm.available ? (
+          <p className="text-destructive text-xs">{auditConfig.llm.reason || "LLM 配置不可用"}</p>
+        ) : null}
+      </>
+    );
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -498,6 +677,65 @@ export function AssetsTab({ taskId }: { taskId: string }) {
           {ui("screen.c4f675a491e4b9")}
         </Button>
       </div>
+
+      {pendingCodeServices.length > 0 || activeDiscoveryRuns.length > 0 || discoveryErrors.length > 0 ? (
+        <Card className="py-0">
+          <CardContent className="flex flex-col gap-3 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="font-medium text-sm">代码服务发现</h3>
+                <p className="text-muted-foreground text-xs">
+                  发现 Agent 仅分析目录名和构建元数据；白盒漏洞审计仍需手动选择启动。
+                </p>
+              </div>
+              {activeDiscoveryRuns.length > 0 ? (
+                <Badge variant="outline">正在扫描 {activeDiscoveryRuns.length} 个版本</Badge>
+              ) : null}
+            </div>
+            {discoveryErrors.map((run) => (
+              <p key={`${run.task_id}-${run.version_id}`} className="text-muted-foreground text-xs">
+                版本 {run.version_id.slice(0, 8)}：{run.error}
+              </p>
+            ))}
+            {pendingCodeServices.length > 0 ? (
+              <div className="divide-y rounded-md border">
+                {pendingCodeServices.map((service) => (
+                  <div key={service.id} className="flex flex-wrap items-center justify-between gap-3 p-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-sm">{service.name}</span>
+                        <Badge variant="secondary">待确认</Badge>
+                      </div>
+                      <p className="break-all font-mono text-muted-foreground text-xs">{service.relative_path}</p>
+                      <p className="mt-1 text-muted-foreground text-xs">
+                        {service.reason || "元数据不足，无法自动判断是否为独立服务。"}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        disabled={decidingServiceID !== null}
+                        onClick={() => void decideCodeService(service, "confirm")}
+                      >
+                        {decidingServiceID === service.id ? <Spinner data-icon="inline-start" /> : null}
+                        确认为服务
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={decidingServiceID !== null}
+                        onClick={() => void decideCodeService(service, "reject")}
+                      >
+                        忽略
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Tabs
         value={tab}
@@ -753,9 +991,250 @@ export function AssetsTab({ taskId }: { taskId: string }) {
             ))}
           </AssetCard>
         </TabsContent>
+
+        <TabsContent value="code_service" className="mt-0 flex min-h-0 flex-1 flex-col">
+          <AssetCard
+            cols={["服务", "代码库路径", "版本历史", "最新版本状态", "代码库", "来源", "操作"]}
+            {...commonCardProps}
+          >
+            {rows.map((asset) => {
+              const relativePath = String(asset.extra?.relative_path ?? "—");
+              const codebaseID = String(asset.extra?.codebase_id ?? "");
+              const versionID = String(asset.extra?.latest_version_id ?? "");
+              const present = asset.extra?.present;
+              const history = codeServiceHistory.get(asset.id) ?? [];
+              const service = codeServiceByAssetID.get(asset.id);
+              return (
+                <TableRow key={asset.id}>
+                  <TableCell className="font-medium">{asset.service_name || relativePath}</TableCell>
+                  <TableCell className="max-w-sm break-all font-mono text-xs">{relativePath}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      {history.slice(0, 3).map((item) => (
+                        <Badge key={item.version_id} variant={item.present ? "secondary" : "outline"}>
+                          {item.version_id.slice(0, 6)} {item.present ? "有" : "缺失"}
+                        </Badge>
+                      ))}
+                      {history.length > 3 ? (
+                        <span className="text-muted-foreground text-xs">+{history.length - 3}</span>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={present === false ? "outline" : "secondary"}>
+                      {codeServicePresenceLabel(present)}
+                    </Badge>
+                    {versionID ? (
+                      <p className="mt-1 font-mono text-[10px] text-muted-foreground">{versionID.slice(0, 8)}</p>
+                    ) : null}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{codebaseID.slice(0, 8) || "—"}</TableCell>
+                  <TableCell>
+                    <SourceCell asset={asset} />
+                  </TableCell>
+                  <TableCell className="w-36 whitespace-nowrap">
+                    <div className="flex items-center gap-1">
+                      {service?.decision === "confirmed" && service.latest_present ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setAuditTarget(service);
+                            setAuditScope("");
+                            setAuditProfileID("default");
+                            setAuditBudget("120000");
+                            setAuditSourceAcknowledged(false);
+                          }}
+                        >
+                          <PlayIcon data-icon="inline-start" />
+                          审计
+                        </Button>
+                      ) : null}
+                      {removeButton(asset)}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </AssetCard>
+          <section className="mt-4 flex flex-col gap-3">
+            <div>
+              <h3 className="font-medium text-sm">Java 白盒审计</h3>
+              <p className="text-muted-foreground text-xs">
+                审计由用户手动启动。模型初审和独立复核通过的候选保存在这里，等待人工复核，不会自动写入 Findings。
+              </p>
+            </div>
+            {auditRuns.length === 0 ? (
+              <Card className="p-4 text-muted-foreground text-sm">暂无审计记录。</Card>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {auditRuns.map((run) => (
+                  <Card key={run.id} className="gap-3 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-sm">{run.service_name}</span>
+                      <Badge variant={codeAuditStatusVariant(run.status)}>
+                        {
+                          (
+                            {
+                              queued: "排队中",
+                              running: "审计中",
+                              incomplete: "未完成",
+                              completed: "已完成",
+                              failed: "失败",
+                            } as const
+                          )[run.status]
+                        }
+                      </Badge>
+                      <span className="text-muted-foreground text-xs">范围：{run.scope_path || "."}</span>
+                      <span className="text-muted-foreground text-xs">模型：{run.model}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground text-xs">
+                      <span>
+                        源码覆盖 {run.files_analyzed}/{run.files_total}
+                      </span>
+                      <span>
+                        分块 {run.chunks_completed}/{run.chunks_total}
+                      </span>
+                      <span>
+                        Token {run.used_tokens}/{run.budget_tokens}
+                      </span>
+                      <span>候选 {run.candidate_count} 条</span>
+                    </div>
+                    {run.endpoint ? (
+                      <p className="break-all font-mono text-[11px] text-muted-foreground">{run.endpoint}</p>
+                    ) : null}
+                    {run.summary ? <p className="whitespace-pre-wrap text-sm">{run.summary}</p> : null}
+                    {run.error ? <p className="text-amber-700 text-xs">{run.error}</p> : null}
+                    {run.status === "incomplete" ? (
+                      <div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={resumingAuditID === run.id}
+                          onClick={() => void resumeCodeAudit(run)}
+                        >
+                          {resumingAuditID === run.id ? (
+                            <Spinner data-icon="inline-start" />
+                          ) : (
+                            <RotateCcwIcon data-icon="inline-start" />
+                          )}
+                          追加 50,000 Token 续跑
+                        </Button>
+                      </div>
+                    ) : null}
+                    {(run.candidates ?? []).map((item) => {
+                      const candidate = item.candidate;
+                      const source = candidate.source as Record<string, unknown> | undefined;
+                      const sink = candidate.sink as Record<string, unknown> | undefined;
+                      return (
+                        <div key={item.id} className="rounded-md border bg-muted/20 p-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-medium text-sm">{String(candidate.title ?? "污点候选")}</span>
+                            <Badge variant="outline">待人工复核</Badge>
+                            <Badge variant="outline">{String(candidate.severity ?? "unknown")}</Badge>
+                          </div>
+                          <p className="mt-2 break-all font-mono text-xs">
+                            Source: {String(source?.file ?? "?")}:{String(source?.line ?? "?")} → Sink:{" "}
+                            {String(sink?.file ?? "?")}:{String(sink?.line ?? "?")}
+                          </p>
+                          {typeof candidate.why_unobstructed === "string" ? (
+                            <p className="mt-2 whitespace-pre-wrap text-sm">{candidate.why_unobstructed}</p>
+                          ) : null}
+                          {typeof candidate.evidence_excerpt === "string" ? (
+                            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono text-xs">
+                              {candidate.evidence_excerpt}
+                            </pre>
+                          ) : null}
+                          {item.reviewer_summary ? (
+                            <p className="mt-2 text-muted-foreground text-xs">独立复核：{item.reviewer_summary}</p>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </Card>
+                ))}
+              </div>
+            )}
+          </section>
+        </TabsContent>
       </Tabs>
 
       <AddTaskAssetsSheet onAttached={refresh} onOpenChange={setAddOpen} open={addOpen} taskId={taskId} />
+
+      <Sheet open={Boolean(auditTarget)} onOpenChange={(open) => !open && setAuditTarget(null)}>
+        <SheetContent className="w-full sm:max-w-2xl">
+          <SheetHeader>
+            <SheetTitle>启动 Java 白盒审计{auditTarget ? `：${auditTarget.name}` : ""}</SheetTitle>
+            <SheetDescription>
+              只读分析已确认服务的最新代码库版本。每次审计使用独立上下文，最多 4 个服务同时扫描。
+            </SheetDescription>
+          </SheetHeader>
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium">服务子目录（可选）</span>
+              <input
+                className="h-9 rounded-md border bg-background px-3 font-mono text-sm"
+                placeholder="留空表示整个服务；例如 src/main/java"
+                value={auditScope}
+                onChange={(event) => setAuditScope(event.target.value)}
+              />
+            </label>
+            <div className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium">LLM 配置</span>
+              <Select value={auditProfileID} onValueChange={setAuditProfileID}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">任务默认配置（任务链优先）</SelectItem>
+                  {auditProfiles.map((profile) => (
+                    <SelectItem key={profile.id} value={String(profile.id)}>
+                      {profile.name} · {profile.model}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium">Token 预算</span>
+              <input
+                className="h-9 rounded-md border bg-background px-3 font-mono text-sm"
+                type="number"
+                min={1000}
+                max={500000}
+                step={1000}
+                value={auditBudget}
+                onChange={(event) => setAuditBudget(event.target.value)}
+              />
+            </label>
+            <Card className="gap-2 p-3 text-sm">{auditConfigContent}</Card>
+            <label className="flex items-start gap-2 rounded-md border p-3 text-sm">
+              <input
+                className="mt-1 accent-primary"
+                type="checkbox"
+                checked={auditSourceAcknowledged}
+                onChange={(event) => setAuditSourceAcknowledged(event.target.checked)}
+              />
+              <span>
+                我确认该服务源码会发送给上方显示的 LLM
+                端点用于分析。平台默认不保存包含源码的请求和响应正文，仅保留用量、审计摘要和最小证据片段。
+              </span>
+            </label>
+          </div>
+          <SheetFooter>
+            <Button variant="outline" onClick={() => setAuditTarget(null)} disabled={auditStarting}>
+              取消
+            </Button>
+            <Button
+              onClick={() => void startCodeAudit()}
+              disabled={auditStarting || auditConfigLoading || !auditConfig?.llm.available || !auditSourceAcknowledged}
+            >
+              {auditStarting ? <Spinner data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}
+              手动启动审计
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
 
       <AlertDialog open={Boolean(removeTarget)} onOpenChange={(open) => !open && !removing && setRemoveTarget(null)}>
         <AlertDialogContent>

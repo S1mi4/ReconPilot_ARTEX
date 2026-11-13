@@ -97,6 +97,11 @@ import type {
   TaskAssetMutation,
   TaskAssetScopeMutation,
   TaskCategory,
+  TaskCodeAuditConfig,
+  TaskCodeAuditRun,
+  TaskCodebaseDiscoveryRun,
+  TaskCodebaseVersion,
+  TaskCodeService,
   TaskConstraint,
   TaskFileListing,
   TaskGoal,
@@ -603,6 +608,91 @@ export const api = {
   // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
 
+  taskCodebases: async (id: string) => {
+    if (MOCK) {
+      const { mockTaskCodebases } = await import("@/lib/mock/task-codebases");
+      return mockTaskCodebases(id);
+    }
+    const response = await get<{ versions: TaskCodebaseVersion[] | null }>(`/tasks/${id}/codebases`);
+    return arr(response.versions);
+  },
+  uploadTaskCodebase: async (id: string, kind: TaskCodebaseVersion["kind"], files: File[], codebaseID?: string) => {
+    if (MOCK) {
+      const { mockAddTaskCodebase } = await import("@/lib/mock/task-codebases");
+      return mockAddTaskCodebase(id, kind, files, codebaseID);
+    }
+    const form = new FormData();
+    form.append("kind", kind);
+    if (codebaseID) form.append("codebase_id", codebaseID);
+    for (const file of files) {
+      form.append("file", file, file.name);
+      form.append("relative_path", kind === "directory" ? file.webkitRelativePath : file.name);
+    }
+    const token = getToken();
+    const response = await apiFetch(`/api/tasks/${id}/codebases`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    if (!response.ok) {
+      if (response.status === 413) throw new Error("taskCodebases.tooLarge");
+      if (response.status === 400) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error || "taskCodebases.invalid");
+      }
+      throw new Error("taskCodebases.failed");
+    }
+    const payload = (await response.json()) as { version: TaskCodebaseVersion };
+    return payload.version;
+  },
+  taskCodeServices: async (id: string) => {
+    if (MOCK) return { services: [] as TaskCodeService[], runs: [] as TaskCodebaseDiscoveryRun[] };
+    const response = await get<{ services: TaskCodeService[] | null; runs: TaskCodebaseDiscoveryRun[] | null }>(
+      `/tasks/${id}/code-services`,
+    );
+    return { services: arr(response.services), runs: arr(response.runs) };
+  },
+  decideTaskCodeService: (id: string, serviceID: number, decision: "confirm" | "reject") =>
+    post<{ service: TaskCodeService }>(`/tasks/${id}/code-services/${serviceID}/decision`, { decision }),
+  taskCodeAuditConfig: (id: string, serviceID: number, scopePath = ".", profileID?: number) => {
+    if (MOCK) {
+      return Promise.resolve({
+        service: {} as TaskCodeService,
+        version: {} as TaskCodebaseVersion,
+        scope_path: scopePath,
+        production_source_files: 0,
+        test_java_files: 0,
+        config_files: 0,
+        source_available: false,
+        source_notice: "演示数据没有 Java 源码。",
+        llm: {
+          profile_name: "任务默认配置",
+          profile_source: "task_chain",
+          format: "openai",
+          model: "mock",
+          endpoint: "https://example.invalid/v1",
+          available: true,
+        },
+      } satisfies TaskCodeAuditConfig);
+    }
+    const params = new URLSearchParams({ scope_path: scopePath });
+    if (profileID) params.set("profile_id", String(profileID));
+    return get<TaskCodeAuditConfig>(`/tasks/${id}/code-services/${serviceID}/audit-config?${params.toString()}`);
+  },
+  startTaskCodeAudit: (
+    id: string,
+    serviceID: number,
+    body: { scope_path: string; profile_id?: number; budget_tokens: number; source_acknowledged: boolean },
+  ) => post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-services/${serviceID}/audits`, body),
+  taskCodeAudits: async (id: string) => {
+    if (MOCK) return [] as TaskCodeAuditRun[];
+    const response = await get<{ runs: TaskCodeAuditRun[] | null }>(`/tasks/${id}/code-audits`);
+    return arr(response.runs);
+  },
+  resumeTaskCodeAudit: (id: string, runID: number, additionalBudgetTokens: number) =>
+    post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-audits/${runID}/resume`, {
+      additional_budget_tokens: additionalBudgetTokens,
+    }),
   taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
   taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
   taskFileRead: (id: string, path: string) =>

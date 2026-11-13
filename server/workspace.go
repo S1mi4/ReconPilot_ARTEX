@@ -46,6 +46,37 @@ func (s *Server) wsRel(abs string) string {
 	return filepath.ToSlash(rel)
 }
 
+// Task codebase snapshots are versioned inputs. Keep generic workspace
+// mutations from changing a snapshot or deleting its task-owned parent.
+func taskCodebaseMutationForbidden(rel string, deleting bool) bool {
+	clean := filepath.ToSlash(filepath.Clean(rel))
+	if clean == "." || clean == "" {
+		return deleting
+	}
+	parts := strings.Split(clean, "/")
+	if len(parts) == 1 && parts[0] == "tasks" {
+		return deleting
+	}
+	if len(parts) < 2 || parts[0] != "tasks" {
+		return false
+	}
+	if _, ok := validCodebaseTaskID(parts[1]); !ok {
+		return false
+	}
+	if deleting && len(parts) == 2 {
+		return true
+	}
+	return len(parts) >= 3 && parts[2] == "codebases"
+}
+
+func (s *Server) rejectTaskCodebaseMutation(w http.ResponseWriter, abs string, deleting bool) bool {
+	if !taskCodebaseMutationForbidden(s.wsRel(abs), deleting) {
+		return false
+	}
+	writeErr(w, http.StatusForbidden, "代码库快照为只读")
+	return true
+}
+
 type wsEntry struct {
 	Name  string `json:"name"`
 	Path  string `json:"path"`
@@ -140,6 +171,9 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if s.rejectTaskCodebaseMutation(w, abs, false) {
+		return
+	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
 		return
@@ -169,6 +203,9 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if s.rejectTaskCodebaseMutation(w, abs, false) {
+		return
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -186,6 +223,9 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if abs == filepath.Clean(s.m.dir) {
 		writeErr(w, 400, "不能删除工作区根目录")
+		return
+	}
+	if s.rejectTaskCodebaseMutation(w, abs, true) {
 		return
 	}
 	if _, err := os.Stat(abs); err != nil {
@@ -370,6 +410,9 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {
 		writeErr(w, 400, "目标目录不存在")
+		return
+	}
+	if s.rejectTaskCodebaseMutation(w, dirAbs, false) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWorkspaceUpload)

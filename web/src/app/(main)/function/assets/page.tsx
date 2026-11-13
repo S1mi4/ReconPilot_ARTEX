@@ -7,6 +7,7 @@ import {
   BuildingIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  Code2Icon,
   GlobeIcon,
   KeyRoundIcon,
   LayoutTemplateIcon,
@@ -108,6 +109,7 @@ const TABS = (ui: UITranslate): { key: string; label: string; icon: LucideIcon }
   { key: "app", label: ui("screen.63c73c4730f447"), icon: SmartphoneIcon },
   { key: "service", label: ui("screen.ec309ab207ef7f"), icon: LayoutTemplateIcon },
   { key: "endpoint", label: ui("screen.c80d519245a7e8"), icon: LinkIcon },
+  { key: "code_service", label: "代码服务", icon: Code2Icon },
 ];
 
 function AssetsContent() {
@@ -835,6 +837,53 @@ function AssetsContent() {
                 </TableCell>
               </TableRow>
             ))}
+          </AssetCard>
+        </TabsContent>
+
+        <TabsContent value="code_service" className="mt-0 flex min-h-0 flex-1 flex-col gap-2">
+          {searchBox}
+          <AssetCard
+            cols={["", "服务", "代码库路径", "最新版本状态", "任务", ""]}
+            loaded={loaded}
+            total={total}
+            page={page}
+            size={size}
+            onSize={setSize}
+            onPage={setPage}
+            rows={currentRows}
+            selected={selected}
+            onToggleAll={(ids) => toggleSelectAll(ids)}
+          >
+            {slice(tabData("code_service")).map((asset) => {
+              const present = asset.extra?.present;
+              const relativePath = String(asset.extra?.relative_path ?? "—");
+              return (
+                <TableRow key={asset.id} className={selected.has(asset.id) ? "bg-muted/40" : undefined}>
+                  <TableCell className="w-8 pr-0">
+                    <Checkbox checked={selected.has(asset.id)} onCheckedChange={() => toggleSelect(asset.id)} />
+                  </TableCell>
+                  <TableCell className="font-medium">{asset.service_name || relativePath}</TableCell>
+                  <TableCell className="max-w-sm break-all font-mono text-xs">{relativePath}</TableCell>
+                  <TableCell>
+                    <Badge variant={present === false ? "outline" : "secondary"}>
+                      {present === false ? "新版本中缺失" : present === true ? "存在" : "未知"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{asset.task_ids.join(", ") || "—"}</TableCell>
+                  <TableCell className="w-8 pl-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([asset.id])}
+                      aria-label={ui("screen.2bf7036e5e76dc", { v0: asset.service_name || asset.id })}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </AssetCard>
         </TabsContent>
       </Tabs>

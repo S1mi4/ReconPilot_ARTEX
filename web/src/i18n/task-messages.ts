@@ -1,4 +1,38 @@
 export const taskMessages = {
+  "taskCodebases.title": ["代码库版本", "Codebase versions"],
+  "taskCodebases.description": [
+    "将服务源码目录或部署包作为独立版本保存到当前任务。",
+    "Save service source directories or deployment packages as separate versions in this task.",
+  ],
+  "taskCodebases.safety": [
+    "单次最多 512 MiB。ZIP、TAR、JAR 和 WAR 只检查归档结构，不会解包或执行。",
+    "Up to 512 MiB per upload. ZIP, TAR, JAR and WAR files are inspected without extraction or execution.",
+  ],
+  "taskCodebases.directory": ["上传源码目录", "Upload source directory"],
+  "taskCodebases.artifact": ["上传部署包或 CLASS", "Upload package or CLASS"],
+  "taskCodebases.identity": ["代码库身份", "Codebase identity"],
+  "taskCodebases.newIdentity": ["自动匹配名称或新建代码库", "Match by name or create a codebase"],
+  "taskCodebases.identityValue": ["代码库 {{id}}", "Codebase {{id}}"],
+  "taskCodebases.refresh": ["刷新版本", "Refresh versions"],
+  "taskCodebases.loading": ["正在读取代码库版本…", "Loading codebase versions…"],
+  "taskCodebases.empty": ["尚未上传代码库。", "No codebase has been uploaded."],
+  "taskCodebases.uploaded": ["代码库版本已保存", "Codebase version saved"],
+  "taskCodebases.fileCount": ["{{count}} 个文件", "{{count}} files"],
+  "taskCodebases.version": ["版本 {{id}}", "Version {{id}}"],
+  "taskCodebases.directoryKind": ["源码目录", "Source directory"],
+  "taskCodebases.artifactKind": ["部署包（{{format}}）", "Deployment package ({{format}})"],
+  "taskCodebases.emptyUpload": ["请选择文件后再上传。", "Select files before uploading."],
+  "taskCodebases.unsupported": [
+    "仅支持 ZIP、TAR、JAR、WAR 和 CLASS。",
+    "Only ZIP, TAR, JAR, WAR and CLASS files are supported.",
+  ],
+  "taskCodebases.tooLarge": ["上传超过 512 MiB 限制。", "Upload exceeds the 512 MiB limit."],
+  "taskCodebases.invalid": [
+    "代码库内容无效，请检查路径和归档结构。",
+    "Invalid codebase. Check its paths and archive structure.",
+  ],
+  "taskCodebases.failed": ["代码库上传失败，请重试。", "Codebase upload failed. Try again."],
+
   "taskFiles.tab": ["文件", "Files"],
   "taskFiles.tree": ["目录树", "Directory tree"],
   "taskFiles.recent": ["最近文件", "Recent files"],

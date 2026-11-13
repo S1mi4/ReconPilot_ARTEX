@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	TaskArchiveFormatVersion       = 4
+	TaskArchiveFormatVersion       = 5
 	TaskArchiveLegacyFormatVersion = 1
 	TaskArchiveLLMRecordsPath      = "database/llm_records.ndjson"
 )
@@ -589,6 +589,11 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"task_asset_links", `SELECT * FROM task_asset_links WHERE task_id=$1 ORDER BY asset_id`, []any{taskID}},
 		{"task_llm_profiles", `SELECT * FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, []any{taskID}},
 		{"task_scope", `SELECT * FROM task_scope WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_code_services", `SELECT * FROM task_code_services WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_code_service_versions", `SELECT observation.* FROM task_code_service_versions observation JOIN task_code_services service ON service.id=observation.code_service_id WHERE service.task_id=$1 ORDER BY observation.id`, []any{taskID}},
+		{"task_codebase_discovery_runs", `SELECT * FROM task_codebase_discovery_runs WHERE task_id=$1 ORDER BY created_at,version_id`, []any{taskID}},
+		{"task_code_audit_runs", `SELECT * FROM task_code_audit_runs WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_code_audit_candidates", `SELECT candidate.* FROM task_code_audit_candidates candidate JOIN task_code_audit_runs run ON run.id=candidate.run_id WHERE run.task_id=$1 ORDER BY candidate.id`, []any{taskID}},
 		{"findings", `SELECT * FROM findings WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"task_intelligence", `SELECT * FROM task_intelligence WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"finding_traffic_bindings", `SELECT b.* FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1 ORDER BY b.finding_id,b.position,b.id`, []any{taskID}},

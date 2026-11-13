@@ -176,6 +176,43 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	if err != nil {
 		t.Fatal(err)
 	}
+	codebaseID := fmt.Sprintf("archive-codebase-%d", task.ID)
+	codeVersion := TaskCodebaseVersionRef{ID: fmt.Sprintf("%032x", task.ID*100+1), CodebaseID: codebaseID, CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
+	missingVersion := TaskCodebaseVersionRef{ID: fmt.Sprintf("%032x", task.ID*100+2), CodebaseID: codebaseID, CreatedAt: codeVersion.CreatedAt.Add(time.Minute)}
+	for _, version := range []TaskCodebaseVersionRef{codeVersion, missingVersion} {
+		if err := d.QueueTaskCodebaseDiscovery(task.ID, version); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.StartTaskCodebaseDiscovery(task.ID, version.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.CompleteTaskCodebaseDiscovery(task.ID, codeVersion, []CodeServiceDiscoveryCandidate{{
+		RelativePath: "services/api", Name: "api", Decision: "service", Source: "discovery",
+		Reason: "Spring Boot application build plugin", Evidence: json.RawMessage(`{"strong_service_evidence":"Spring Boot application build plugin"}`),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CompleteTaskCodebaseDiscovery(task.ID, missingVersion, nil); err != nil {
+		t.Fatal(err)
+	}
+	codeServices, _, err := d.ListTaskCodeServices(task.ID)
+	if err != nil || len(codeServices) != 1 || codeServices[0].AssetID == nil || codeServices[0].LatestPresent {
+		t.Fatalf("code service snapshot fixture=%+v err=%v", codeServices, err)
+	}
+	codeServiceAssetID := *codeServices[0].AssetID
+	var codeAuditRunID int64
+	if err := d.QueryRow(`INSERT INTO task_code_audit_runs(task_id,code_service_id,codebase_id,version_id,scope_path,status,
+profile_id,profile_source,profile_name,profile_format,model,endpoint,source_acknowledged,files_total,files_analyzed,
+chunks_total,chunks_completed,next_file_index,budget_tokens,used_tokens,candidate_count,summary)
+VALUES($1,$2,$3,$4,'.','completed',$5,'task_chain','archive-chain','openai','archive-model','https://llm.example/v1',true,1,1,1,1,1,120000,500,1,'audit complete') RETURNING id`,
+		task.ID, codeServices[0].ID, codebaseID, codeVersion.ID, llmProfileID).Scan(&codeAuditRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO task_code_audit_candidates(run_id,candidate_key,review_status,candidate,reviewer_summary)
+VALUES($1,'archive-candidate','pending_review','{"title":"archive taint candidate","evidence_excerpt":"source -> sink"}'::jsonb,'reviewed but pending human review')`, codeAuditRunID); err != nil {
+		t.Fatal(err)
+	}
 	store := d.Exploration(task.ExplorationID)
 	nodeID, err := store.AddNode(KindFact, map[string]any{"summary": "archived fact", "asset_ids": []int64{assetID}}, 1, "confirmed", "worker", nil)
 	if err != nil {
@@ -232,8 +269,11 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	if rawRowCount(snapshot.Tables["llm_records"]) != 0 {
 		t.Fatal("streamed LLM records were also retained in manifest memory")
 	}
-	if snapshot.DataCounts["assets"] != 1 || snapshot.DataCounts["exploration_nodes"] < 2 {
+	if snapshot.DataCounts["assets"] != 2 || snapshot.DataCounts["exploration_nodes"] < 2 {
 		t.Fatalf("unexpected snapshot counts: %#v", snapshot.DataCounts)
+	}
+	if snapshot.DataCounts["task_code_audit_runs"] != 1 || snapshot.DataCounts["task_code_audit_candidates"] != 1 {
+		t.Fatalf("audit candidates missing from snapshot: %#v", snapshot.DataCounts)
 	}
 	if err := d.CompleteTaskArchive(archive.ID, snapshot, "/tmp/test-task.tar.zst", "abc", 100, 50); err != nil {
 		t.Fatal(err)
@@ -251,8 +291,12 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	if err := d.QueryRow(`SELECT count(*) FROM llm_usage WHERE task_id=$1`, fmt.Sprint(task.ID)).Scan(&usage); err != nil {
 		t.Fatal(err)
 	}
-	if nodes != 0 || assets != 0 || usage != 0 {
-		t.Fatalf("hot compaction left nodes=%d assets=%d usage=%d", nodes, assets, usage)
+	var codeAssets int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE id=$1`, codeServiceAssetID).Scan(&codeAssets); err != nil {
+		t.Fatal(err)
+	}
+	if nodes != 0 || assets != 0 || codeAssets != 0 || usage != 0 {
+		t.Fatalf("hot compaction left nodes=%d assets=%d code_assets=%d usage=%d", nodes, assets, codeAssets, usage)
 	}
 	ready, err := d.GetTaskArchive(archive.ID)
 	if err != nil || ready == nil || ready.State != ArchiveReady {
@@ -313,6 +357,23 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	}
 	if nodes < 2 || assets != 1 || usage != 1 {
 		t.Fatalf("restore incomplete nodes=%d assets=%d usage=%d", nodes, assets, usage)
+	}
+	restoredCodeServices, _, err := d.ListTaskCodeServices(task.ID)
+	if err != nil || len(restoredCodeServices) != 1 || restoredCodeServices[0].AssetID == nil ||
+		restoredCodeServices[0].LatestPresent || len(restoredCodeServices[0].Versions) != 2 ||
+		restoredCodeServices[0].Versions[0].VersionID != missingVersion.ID || restoredCodeServices[0].Versions[0].Present ||
+		restoredCodeServices[0].Versions[1].VersionID != codeVersion.ID || !restoredCodeServices[0].Versions[1].Present {
+		t.Fatalf("code service history did not survive archive restore: services=%+v err=%v", restoredCodeServices, err)
+	}
+	restoredAudits, err := d.ListTaskCodeAudits(task.ID)
+	if err != nil || len(restoredAudits) != 1 || restoredAudits[0].Status != "completed" ||
+		restoredAudits[0].CodeServiceID != restoredCodeServices[0].ID || len(restoredAudits[0].Candidates) != 1 ||
+		restoredAudits[0].Candidates[0].ReviewStatus != "pending_review" {
+		t.Fatalf("code audit history did not survive archive restore: audits=%+v err=%v", restoredAudits, err)
+	}
+	restoredCodeAssets, err := d.Assets().QueryByTask(task.ID, "code_service", 10, 0)
+	if err != nil || len(restoredCodeAssets) != 1 || restoredCodeAssets[0].ID != *restoredCodeServices[0].AssetID {
+		t.Fatalf("restored code service asset identity mismatch: assets=%+v services=%+v err=%v", restoredCodeAssets, restoredCodeServices, err)
 	}
 	var restoredRawRequest, restoredRawResponse string
 	if err := d.QueryRow(`SELECT COALESCE(raw_request,''),COALESCE(raw_response,'') FROM llm_records WHERE task_id=$1`, fmt.Sprint(task.ID)).

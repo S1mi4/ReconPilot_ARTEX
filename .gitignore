@@ -28,6 +28,11 @@ web/public/demo-version.json
 
 # docs
 /docs/
+!/docs/
+/docs/*
+!/docs/agents/
+/docs/agents/*
+!/docs/agents/*.md
 
 # os
 .DS_Store

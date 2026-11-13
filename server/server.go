@@ -128,6 +128,8 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake       chan struct{}
 	archiveWG         sync.WaitGroup
+	auditWake         chan struct{}
+	auditWG           sync.WaitGroup
 	credentialWake    chan struct{}
 	proxyReconnect    proxyReconnectSupervisor
 	proxyPoolWake     chan struct{}
@@ -174,7 +176,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), auditWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
 	m.SetTaskControlMutex(&s.concMu)
 	s.initSideQuestions()
 	if m.pg != nil {
@@ -297,11 +299,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
 	s.restoreTaskRuntimes()
+	s.resumeTaskCodebaseDiscoveries()
 	s.ensureProxySupervisor()
 	s.proxyPoolWG.Add(1)
 	go func() { defer s.proxyPoolWG.Done(); s.runProxyPoolSupervisor(s.ctx) }()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
+	s.startTaskCodeAuditWorkers()
 	if m.pg != nil {
 		agent.CredentialRecorded = func() {
 			select {
@@ -320,6 +324,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 func (s *Server) Close() {
 	if s != nil {
 		s.proxyPoolWG.Wait()
+		s.auditWG.Wait()
 	}
 }
 
@@ -873,6 +878,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)
 
 	// 工作空间文件管理器（针对 workDir）
+	mux.HandleFunc("GET /api/tasks/{id}/codebases", s.taskCodebasesList)
+	mux.HandleFunc("POST /api/tasks/{id}/codebases", s.taskCodebasesUpload)
+	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
+	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)
+	mux.HandleFunc("GET /api/tasks/{id}/code-services/{serviceID}/audit-config", s.taskCodeAuditConfigHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/audits", s.taskCodeAuditStartHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/code-audits", s.taskCodeAuditsListHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/code-audits/{runID}", s.taskCodeAuditGetHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/resume", s.taskCodeAuditResumeHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/files", s.taskFilesList)
 	mux.HandleFunc("GET /api/tasks/{id}/files/all", s.taskFilesAll)
 	mux.HandleFunc("GET /api/tasks/{id}/files/read", s.taskFilesServe)

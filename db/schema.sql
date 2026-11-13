@@ -40,7 +40,7 @@ CREATE TRIGGER trg_companies_upd BEFORE UPDATE ON companies
 CREATE TABLE IF NOT EXISTS assets (
     id              BIGSERIAL PRIMARY KEY,
     type            TEXT NOT NULL CHECK (type IN (
-                        'root_domain','ip','subdomain','app','service','endpoint'
+                        'root_domain','ip','subdomain','app','service','endpoint','code_service'
                     )),
     company_id      BIGINT REFERENCES companies(id) ON DELETE SET NULL,
     -- explicit: caller/user selected the company; scope: derived from company_scope.
@@ -80,6 +80,21 @@ CREATE TABLE IF NOT EXISTS assets (
     last_seen       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Keep the allowed type set current for databases created before code_service
+-- became a first-class asset. schema.sql runs at every startup.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='assets'::regclass AND conname='assets_type_check'
+          AND pg_get_constraintdef(oid) LIKE '%code_service%'
+    ) THEN
+        ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_type_check;
+        ALTER TABLE assets ADD CONSTRAINT assets_type_check CHECK (type IN (
+            'root_domain','ip','subdomain','app','service','endpoint','code_service'
+        ));
+    END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_root_domain  ON assets(domain) WHERE type = 'root_domain';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_ip           ON assets(ip)     WHERE type = 'ip';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_subdomain    ON assets(domain, COALESCE(record_type,'')) WHERE type = 'subdomain';
@@ -89,6 +104,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_http ON assets(url) WHERE type 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_other
     ON assets(COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE type = 'service' AND service_type = 'other';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_endpoint     ON assets(url, method) WHERE type = 'endpoint';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_code_service_identity
+    ON assets ((extra->>'task_id'), (extra->>'codebase_id'), (extra->>'relative_path'))
+    WHERE type = 'code_service';
 CREATE INDEX IF NOT EXISTS idx_av2_company      ON assets(company_id)       WHERE company_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_av2_company_type ON assets(company_id, type) WHERE company_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_av2_task_ids     ON assets USING GIN(task_ids);
@@ -671,6 +689,121 @@ CREATE TABLE IF NOT EXISTS task_relations (
     CONSTRAINT ck_task_relation_not_self CHECK (task_id <> source_task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_task_relations_source ON task_relations(source_task_id);
+
+-- Codebase discovery is task-scoped. Identity survives codebase versions, while
+-- each version row records whether that service was present in that snapshot.
+CREATE TABLE IF NOT EXISTS task_code_services (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    codebase_id       TEXT NOT NULL,
+    relative_path     TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    decision          TEXT NOT NULL CHECK (decision IN ('pending','confirmed','rejected')),
+    decision_source   TEXT NOT NULL DEFAULT 'discovery'
+                      CHECK (decision_source IN ('discovery','llm','manual')),
+    asset_id          BIGINT REFERENCES assets(id) ON DELETE SET NULL,
+    latest_version_id TEXT NOT NULL DEFAULT '',
+    latest_present    BOOLEAN NOT NULL DEFAULT false,
+    evidence          JSONB NOT NULL DEFAULT '{}',
+    reason            TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, codebase_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_task_code_services_pending
+    ON task_code_services(task_id, updated_at DESC) WHERE decision='pending';
+CREATE INDEX IF NOT EXISTS idx_task_code_services_asset ON task_code_services(asset_id)
+    WHERE asset_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS task_code_service_versions (
+    id                   BIGSERIAL PRIMARY KEY,
+    code_service_id      BIGINT NOT NULL REFERENCES task_code_services(id) ON DELETE CASCADE,
+    version_id           TEXT NOT NULL,
+    version_created_at   TIMESTAMPTZ NOT NULL,
+    present              BOOLEAN NOT NULL,
+    evidence             JSONB NOT NULL DEFAULT '{}',
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (code_service_id, version_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_code_service_versions_version
+    ON task_code_service_versions(version_id, code_service_id);
+
+CREATE TABLE IF NOT EXISTS task_codebase_discovery_runs (
+    task_id          BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    version_id       TEXT NOT NULL,
+    codebase_id      TEXT NOT NULL,
+    version_created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status           TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed')),
+    error            TEXT NOT NULL DEFAULT '',
+    candidate_count  INTEGER NOT NULL DEFAULT 0,
+    confirmed_count  INTEGER NOT NULL DEFAULT 0,
+    pending_count    INTEGER NOT NULL DEFAULT 0,
+    started_at       TIMESTAMPTZ,
+    completed_at     TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, version_id)
+);
+ALTER TABLE task_codebase_discovery_runs ADD COLUMN IF NOT EXISTS version_created_at TIMESTAMPTZ;
+UPDATE task_codebase_discovery_runs SET version_created_at=created_at WHERE version_created_at IS NULL;
+ALTER TABLE task_codebase_discovery_runs ALTER COLUMN version_created_at SET DEFAULT now();
+ALTER TABLE task_codebase_discovery_runs ALTER COLUMN version_created_at SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_task_codebase_discovery_runs_task
+    ON task_codebase_discovery_runs(task_id, created_at DESC);
+
+-- Explicit, user-started Java source audits. Source text is never stored in the
+-- run/chunk records; findings contain only bounded evidence excerpts.
+CREATE TABLE IF NOT EXISTS task_code_audit_runs (
+    id                    BIGSERIAL PRIMARY KEY,
+    task_id               BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    code_service_id       BIGINT NOT NULL REFERENCES task_code_services(id) ON DELETE CASCADE,
+    codebase_id           TEXT NOT NULL,
+    version_id            TEXT NOT NULL,
+    scope_path            TEXT NOT NULL DEFAULT '.',
+    status                TEXT NOT NULL CHECK (status IN ('queued','running','incomplete','completed','failed')),
+    profile_id            BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL,
+    profile_source        TEXT NOT NULL DEFAULT '',
+    profile_name          TEXT NOT NULL DEFAULT '',
+    profile_format        TEXT NOT NULL DEFAULT '',
+    model                 TEXT NOT NULL DEFAULT '',
+    endpoint              TEXT NOT NULL DEFAULT '',
+    source_acknowledged   BOOLEAN NOT NULL DEFAULT false,
+    files_total           INTEGER NOT NULL DEFAULT 0,
+    files_analyzed        INTEGER NOT NULL DEFAULT 0,
+    files_skipped         INTEGER NOT NULL DEFAULT 0,
+    chunks_total          INTEGER NOT NULL DEFAULT 0,
+    chunks_completed      INTEGER NOT NULL DEFAULT 0,
+    next_file_index       INTEGER NOT NULL DEFAULT 0,
+    budget_tokens         INTEGER NOT NULL DEFAULT 120000,
+    used_tokens           INTEGER NOT NULL DEFAULT 0,
+    candidate_count       INTEGER NOT NULL DEFAULT 0,
+    summary               TEXT NOT NULL DEFAULT '',
+    error                 TEXT NOT NULL DEFAULT '',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at            TIMESTAMPTZ,
+    completed_at          TIMESTAMPTZ,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_task
+    ON task_code_audit_runs(task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_queue
+    ON task_code_audit_runs(status, created_at, id) WHERE status='queued';
+CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_service
+    ON task_code_audit_runs(code_service_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS task_code_audit_candidates (
+    id                BIGSERIAL PRIMARY KEY,
+    run_id            BIGINT NOT NULL REFERENCES task_code_audit_runs(id) ON DELETE CASCADE,
+    candidate_key     TEXT NOT NULL,
+    review_status     TEXT NOT NULL DEFAULT 'pending_review' CHECK (review_status IN ('pending_review','dismissed')),
+    candidate         JSONB NOT NULL,
+    reviewer_summary  TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id, candidate_key)
+);
+CREATE INDEX IF NOT EXISTS idx_task_code_audit_candidates_run
+    ON task_code_audit_candidates(run_id, created_at, id);
 
 -- Task/asset provenance supplements the legacy assets.task_ids association. The
 -- array remains the compatibility source for existing query and cleanup paths;

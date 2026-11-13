@@ -90,6 +90,11 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 	}{
 		{`DELETE FROM task_relations WHERE task_id=$1 OR source_task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_asset_links WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM task_code_audit_candidates WHERE run_id IN (SELECT id FROM task_code_audit_runs WHERE task_id=$1)`, []any{taskID}},
+		{`DELETE FROM task_code_audit_runs WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM task_codebase_discovery_runs WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM task_code_service_versions WHERE code_service_id IN (SELECT id FROM task_code_services WHERE task_id=$1)`, []any{taskID}},
+		{`DELETE FROM task_code_services WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_intelligence WHERE task_id=$1`, []any{taskID}},
@@ -274,6 +279,16 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
+	serviceIDs, err := restoreTaskCodeServices(tx, remappedTables["task_code_services"], remappedTables["task_code_service_versions"])
+	if err != nil {
+		return nil, fmt.Errorf("restore task code services: %w", err)
+	}
+	if err := insertArchiveRows(tx, "task_codebase_discovery_runs", remappedTables["task_codebase_discovery_runs"]); err != nil {
+		return nil, fmt.Errorf("restore task codebase discovery runs: %w", err)
+	}
+	if err := restoreTaskCodeAudits(tx, remappedTables["task_code_audit_runs"], remappedTables["task_code_audit_candidates"], serviceIDs); err != nil {
+		return nil, fmt.Errorf("restore task code audits: %w", err)
+	}
 	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
@@ -360,7 +375,7 @@ func decodeArchiveRows(raw json.RawMessage) ([]map[string]any, error) {
 }
 
 func rowExists(tx *sql.Tx, table string, id int64) bool {
-	if table != "task_categories" && table != "llm_profiles" && table != "companies" && table != "tasks" && table != "assets" {
+	if table != "task_categories" && table != "llm_profiles" && table != "companies" && table != "tasks" && table != "assets" && table != "task_code_audit_runs" && table != "task_code_audit_candidates" {
 		return false
 	}
 	var exists bool
@@ -394,6 +409,8 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	allowed := map[string]bool{
 		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
 		"task_intelligence": true, "task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
+		"task_code_services": true, "task_code_service_versions": true, "task_codebase_discovery_runs": true,
+		"task_code_audit_runs": true, "task_code_audit_candidates": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
 	}
@@ -405,6 +422,121 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	}
 	_, err := tx.Exec(`INSERT INTO `+table+` SELECT * FROM json_populate_recordset(NULL::`+table+`,$1::json)`, string(raw))
 	return err
+}
+
+func restoreTaskCodeServices(tx *sql.Tx, rawServices, rawVersions json.RawMessage) (map[int64]int64, error) {
+	services, err := decodeArchiveRows(rawServices)
+	if err != nil {
+		return nil, err
+	}
+	serviceIDs := make(map[int64]int64, len(services))
+	for _, row := range services {
+		oldID, ok := jsonInt64(row["id"])
+		if !ok || oldID <= 0 {
+			return nil, errors.New("archived code service has invalid id")
+		}
+		newID := oldID
+		if rowExists(tx, "task_code_services", oldID) {
+			if err := tx.QueryRow(`SELECT nextval(pg_get_serial_sequence('task_code_services','id'))`).Scan(&newID); err != nil {
+				return nil, err
+			}
+			row["id"] = newID
+		}
+		serviceIDs[oldID] = newID
+	}
+	encodedServices, err := json.Marshal(services)
+	if err != nil {
+		return nil, err
+	}
+	if err := insertArchiveRows(tx, "task_code_services", encodedServices); err != nil {
+		return nil, err
+	}
+	versions, err := decodeArchiveRows(rawVersions)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range versions {
+		oldServiceID, ok := jsonInt64(row["code_service_id"])
+		if !ok || serviceIDs[oldServiceID] == 0 {
+			return nil, errors.New("archived code service history refers to a missing identity")
+		}
+		row["code_service_id"] = serviceIDs[oldServiceID]
+		if oldID, ok := jsonInt64(row["id"]); ok && rowExists(tx, "task_code_service_versions", oldID) {
+			var newID int64
+			if err := tx.QueryRow(`SELECT nextval(pg_get_serial_sequence('task_code_service_versions','id'))`).Scan(&newID); err != nil {
+				return nil, err
+			}
+			row["id"] = newID
+		}
+	}
+	encodedVersions, err := json.Marshal(versions)
+	if err != nil {
+		return nil, err
+	}
+	if err := insertArchiveRows(tx, "task_code_service_versions", encodedVersions); err != nil {
+		return nil, err
+	}
+	return serviceIDs, nil
+}
+
+func restoreTaskCodeAudits(tx *sql.Tx, rawRuns, rawCandidates json.RawMessage, serviceIDs map[int64]int64) error {
+	runs, err := decodeArchiveRows(rawRuns)
+	if err != nil {
+		return err
+	}
+	runIDs := make(map[int64]int64, len(runs))
+	for _, row := range runs {
+		oldID, ok := jsonInt64(row["id"])
+		if !ok || oldID <= 0 {
+			return errors.New("archived code audit has invalid id")
+		}
+		oldServiceID, ok := jsonInt64(row["code_service_id"])
+		if !ok || serviceIDs[oldServiceID] == 0 {
+			return errors.New("archived code audit refers to a missing service")
+		}
+		row["code_service_id"] = serviceIDs[oldServiceID]
+		if profileID, ok := jsonInt64(row["profile_id"]); ok && profileID > 0 && !rowExists(tx, "llm_profiles", profileID) {
+			row["profile_id"] = nil
+		}
+		newID := oldID
+		if rowExists(tx, "task_code_audit_runs", oldID) {
+			if err := tx.QueryRow(`SELECT nextval(pg_get_serial_sequence('task_code_audit_runs','id'))`).Scan(&newID); err != nil {
+				return err
+			}
+			row["id"] = newID
+		}
+		runIDs[oldID] = newID
+	}
+	encodedRuns, err := json.Marshal(runs)
+	if err != nil {
+		return err
+	}
+	if err := insertArchiveRows(tx, "task_code_audit_runs", encodedRuns); err != nil {
+		return err
+	}
+	candidates, err := decodeArchiveRows(rawCandidates)
+	if err != nil {
+		return err
+	}
+	for _, row := range candidates {
+		oldRunID, ok := jsonInt64(row["run_id"])
+		if !ok || runIDs[oldRunID] == 0 {
+			return errors.New("archived code audit candidate refers to a missing run")
+		}
+		row["run_id"] = runIDs[oldRunID]
+		if oldID, ok := jsonInt64(row["id"]); ok && rowExists(tx, "task_code_audit_candidates", oldID) {
+			var newID int64
+			if err := tx.QueryRow(`SELECT nextval(pg_get_serial_sequence('task_code_audit_candidates','id'))`).Scan(&newID); err != nil {
+				return err
+			}
+			row["id"] = newID
+		}
+	}
+	encodedCandidates, err := json.Marshal(candidates)
+	if err != nil {
+		return err
+	}
+	return insertArchiveRows(tx, "task_code_audit_candidates", encodedCandidates)
 }
 
 func insertArchiveJSONSequenceRows(tx *sql.Tx, table string, reader io.Reader) (int64, error) {
@@ -540,6 +672,17 @@ func findArchiveAssetNaturalID(tx *sql.Tx, row map[string]any) (int64, bool, err
 		}
 	case "endpoint":
 		query, args = `SELECT id FROM assets WHERE type='endpoint' AND url=$1 AND method=$2`, []any{stringValue("url"), stringValue("method")}
+	case "code_service":
+		extra, _ := row["extra"].(map[string]any)
+		value := func(key string) string {
+			if extra == nil || extra[key] == nil {
+				return ""
+			}
+			return fmt.Sprint(extra[key])
+		}
+		query, args = `SELECT id FROM assets WHERE type='code_service' AND extra->>'task_id'=$1
+AND extra->>'codebase_id'=$2 AND extra->>'relative_path'=$3`,
+			[]any{value("task_id"), value("codebase_id"), value("relative_path")}
 	default:
 		return 0, false, fmt.Errorf("unsupported archived asset type %q", typeName)
 	}
@@ -556,7 +699,7 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 	for name, raw := range tables {
 		out[name] = raw
 	}
-	for _, table := range []string{"exploration_anchors", "task_asset_links"} {
+	for _, table := range []string{"exploration_anchors", "task_asset_links", "task_code_services"} {
 		rows, err := decodeArchiveRows(tables[table])
 		if err != nil {
 			return nil, err

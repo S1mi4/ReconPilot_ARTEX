@@ -175,6 +175,7 @@ export default function DashboardPage() {
     app: translate("overview.asset.app"),
     service: translate("overview.asset.service"),
     endpoint: translate("overview.asset.endpoint"),
+    code_service: translate("overview.asset.code_service"),
   };
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);

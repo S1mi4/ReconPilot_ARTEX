@@ -92,6 +92,7 @@ export const overviewMessages = {
   "overview.asset.app": ["应用", "Application"],
   "overview.asset.service": ["服务", "Service"],
   "overview.asset.endpoint": ["端点", "Endpoint"],
+  "overview.asset.code_service": ["代码服务", "Code services"],
   "overview.resourceUnsupported": ["资源状态：暂不支持", "Resource metrics are unavailable on this platform"],
   "overview.memory": ["内存", "Memory"],
   "overview.disk": ["磁盘", "Disk"],

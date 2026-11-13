@@ -18,6 +18,7 @@ import (
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
+type sensitiveBodyContextKey struct{}
 
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
@@ -49,6 +50,25 @@ func WithWorker(ctx context.Context, worker string) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, workerContextKey{}, worker)
+}
+
+// WithSensitiveBody marks a request/response as sensitive. Usage is still
+// metered, but the recorder will not persist normalized or raw bodies even when
+// global LLM body recording is enabled.
+func WithSensitiveBody(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sensitiveBodyContextKey{}, true)
+}
+
+func bodyRecordingAllowed(ctx context.Context, enabled bool) bool {
+	if ctx != nil {
+		if sensitive, _ := ctx.Value(sensitiveBodyContextKey{}).(bool); sensitive {
+			return false
+		}
+	}
+	return enabled
 }
 
 // workerFrom returns the explicit lane override, or "" when none is set.
@@ -120,7 +140,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// llm_record setting. Lightweight usage metering always runs — it powers token
 	// stats and must be complete even for interrupted/failed runs, so it is NOT
 	// gated. Only body serialization + response accumulation are skipped when off.
-	recordBodies := r.enabled == nil || r.enabled()
+	recordBodies := bodyRecordingAllowed(ctx, r.enabled == nil || r.enabled())
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
@@ -220,7 +240,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 // Complete implements the atomic completion path while preserving the same
 // usage metering, normalized body recording and raw wire capture as Stream.
 func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
-	recordBodies := r.enabled == nil || r.enabled()
+	recordBodies := bodyRecordingAllowed(ctx, r.enabled == nil || r.enabled())
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)

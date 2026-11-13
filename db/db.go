@@ -211,6 +211,8 @@ var builtinAgents = []builtinAgent{
 	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil},
 	// Asset mapper: read-only assistant used by the topology canvas and asset views.
 	{"asset_mapper", "资产梳理", "assistant", "资产梳理助手：汇总公网、边界与内网资产关系，基于真实资产数据解释入站路径，不凭空推断连接。", nil, false, nil},
+	{"codebase_discovery", "代码服务发现", "assistant", "仅根据代码库目录和有限构建元数据识别任务内的 Java 服务候选；不读取源代码、不执行代码、不创建漏洞发现。", nil, false, nil},
+	{"whitebox_java_audit", "Java 白盒审计", "assistant", "按用户手动选择的服务只读分析 Java 污点路径；不执行代码，不直接写入 Findings。", nil, false, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
 	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
 }

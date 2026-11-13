@@ -13,6 +13,7 @@ import {
   FileIcon,
   FolderIcon,
   RefreshCwIcon,
+  UploadIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,7 +24,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
-import type { Task, TaskFileEntry, TaskFileListing, WorkspaceFile } from "@/lib/types";
+import type { Task, TaskCodebaseVersion, TaskFileEntry, TaskFileListing, WorkspaceFile } from "@/lib/types";
 
 function fileSize(n: number) {
   if (n < 1024) return `${n} B`;
@@ -44,6 +45,13 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
   const [preview, setPreview] = React.useState<{ path: string; file?: WorkspaceFile; error?: string } | null>(null);
+  const [codebases, setCodebases] = React.useState<TaskCodebaseVersion[]>([]);
+  const [codebaseLoading, setCodebaseLoading] = React.useState(false);
+  const [codebaseUploading, setCodebaseUploading] = React.useState(false);
+  const [codebaseError, setCodebaseError] = React.useState("");
+  const [codebaseTargetID, setCodebaseTargetID] = React.useState("");
+  const directoryInput = React.useRef<HTMLInputElement>(null);
+  const artifactInput = React.useRef<HTMLInputElement>(null);
   const generation = React.useRef(0);
   const previewGeneration = React.useRef(0);
 
@@ -80,6 +88,52 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
       if (generation.current === seq) setLoading(false);
     }
   }, [task.id, expanded, liveUI, message]);
+
+  const refreshCodebases = React.useCallback(async () => {
+    setCodebaseLoading(true);
+    try {
+      setCodebases(await api.taskCodebases(task.id));
+      setCodebaseError("");
+    } catch (err) {
+      const raw = (err as Error).message;
+      setCodebaseError(raw.startsWith("taskCodebases.") ? liveUI(raw) : raw);
+    } finally {
+      setCodebaseLoading(false);
+    }
+  }, [task.id, liveUI]);
+
+  React.useEffect(() => {
+    if (active) void refreshCodebases();
+  }, [active, refreshCodebases]);
+
+  React.useEffect(() => {
+    directoryInput.current?.setAttribute("webkitdirectory", "");
+  }, []);
+
+  const uploadCodebase = async (kind: TaskCodebaseVersion["kind"], selection: FileList | null) => {
+    const files = Array.from(selection ?? []);
+    if (!files.length) return;
+    setCodebaseUploading(true);
+    setCodebaseError("");
+    try {
+      await api.uploadTaskCodebase(task.id, kind, files, codebaseTargetID || undefined);
+      toast.success(ui("taskCodebases.uploaded"));
+      await refreshCodebases();
+    } catch (err) {
+      const raw = (err as Error).message;
+      setCodebaseError(raw.startsWith("taskCodebases.") ? liveUI(raw) : raw);
+    } finally {
+      setCodebaseUploading(false);
+    }
+  };
+
+  const codebaseChoices = React.useMemo(() => {
+    const choices = new Map<string, string>();
+    for (const version of codebases) {
+      if (!choices.has(version.codebase_id)) choices.set(version.codebase_id, version.name);
+    }
+    return Array.from(choices, ([id, name]) => ({ id, name }));
+  }, [codebases]);
 
   React.useEffect(() => {
     if (!active) return;
@@ -164,6 +218,112 @@ export function FilesTab({ task, active }: { task: Task; active: boolean }) {
 
   return (
     <div className="flex flex-col gap-4">
+      <section className="space-y-3 rounded-md border p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <h2 className="font-medium">{ui("taskCodebases.title")}</h2>
+            <p className="text-muted-foreground text-sm">{ui("taskCodebases.description")}</p>
+          </div>
+          <Button
+            variant="outline"
+            disabled={codebaseLoading || codebaseUploading}
+            onClick={() => void refreshCodebases()}
+          >
+            <RefreshCwIcon />
+            {ui("taskCodebases.refresh")}
+          </Button>
+        </div>
+        <p className="text-muted-foreground text-xs">{ui("taskCodebases.safety")}</p>
+        <div className="flex flex-wrap gap-2">
+          <input
+            ref={directoryInput}
+            type="file"
+            multiple
+            className="hidden"
+            aria-label={ui("taskCodebases.directory")}
+            onChange={(event) => {
+              void uploadCodebase("directory", event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <Button variant="outline" disabled={codebaseUploading} onClick={() => directoryInput.current?.click()}>
+            <UploadIcon />
+            {ui("taskCodebases.directory")}
+          </Button>
+          <input
+            ref={artifactInput}
+            type="file"
+            accept=".zip,.tar,.jar,.war,.class"
+            className="hidden"
+            aria-label={ui("taskCodebases.artifact")}
+            onChange={(event) => {
+              void uploadCodebase("artifact", event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <Button variant="outline" disabled={codebaseUploading} onClick={() => artifactInput.current?.click()}>
+            <UploadIcon />
+            {ui("taskCodebases.artifact")}
+          </Button>
+        </div>
+        <label className="flex flex-wrap items-center gap-2 text-sm">
+          <span>{ui("taskCodebases.identity")}</span>
+          <select
+            className="h-9 min-w-56 rounded-md border bg-background px-3 text-sm"
+            value={codebaseTargetID}
+            disabled={codebaseUploading}
+            onChange={(event) => setCodebaseTargetID(event.currentTarget.value)}
+          >
+            <option value="">{ui("taskCodebases.newIdentity")}</option>
+            {codebaseChoices.map((choice) => (
+              <option key={choice.id} value={choice.id}>
+                {choice.name} · {choice.id.slice(0, 8)}
+              </option>
+            ))}
+          </select>
+        </label>
+        {codebaseError && (
+          <p role="alert" className="text-destructive text-sm">
+            {codebaseError}
+          </p>
+        )}
+        {!codebases.length && (
+          <p className="text-muted-foreground text-sm">
+            {codebaseLoading ? ui("taskCodebases.loading") : ui("taskCodebases.empty")}
+          </p>
+        )}
+        {codebases.length > 0 && (
+          <ul className="divide-y rounded-md border">
+            {codebases.map((version) => (
+              <li key={version.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-sm">
+                <div className="min-w-0">
+                  <p className="truncate font-medium" title={version.name}>
+                    {version.name}
+                  </p>
+                  <p className="text-muted-foreground text-xs">
+                    {ui("taskCodebases.version", { id: version.id.slice(0, 8) })}
+                  </p>
+                  <p className="text-muted-foreground text-xs">
+                    {ui("taskCodebases.identityValue", { id: version.codebase_id.slice(0, 8) })}
+                  </p>
+                  <p className="text-muted-foreground text-xs">
+                    {ui(version.kind === "directory" ? "taskCodebases.directoryKind" : "taskCodebases.artifactKind", {
+                      format: version.format,
+                    })}
+                    {" · "}
+                    {ui("taskCodebases.fileCount", { count: version.file_count })}
+                    {" · "}
+                    {fileSize(version.total_size)}
+                  </p>
+                </div>
+                <time className="whitespace-nowrap text-muted-foreground text-xs" dateTime={version.created_at}>
+                  {new Date(version.created_at).toLocaleString(i18n.language)}
+                </time>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
       <p className="text-muted-foreground text-sm">{ui("taskFiles.scope")}</p>
       <div className="flex flex-wrap items-center gap-2">
         <Button variant={mode === "tree" ? "secondary" : "ghost"} onClick={() => setMode("tree")}>

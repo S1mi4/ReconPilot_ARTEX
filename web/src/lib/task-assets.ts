@@ -4,6 +4,7 @@ import type { NewAssetType } from "@/lib/types";
 
 const ASSET_TYPE_LABELS: Record<NewAssetType, string> = {
   app: "应用",
+  code_service: "代码服务",
   endpoint: "接口",
   ip: "IP",
   root_domain: "根域名",
@@ -15,6 +16,7 @@ const TASK_ASSET_SOURCE_LABELS: Record<string, string> = {
   agent: "Agent 发现",
   anchor: "黑板锚点",
   api: "资产 API",
+  codebase_discovery: "代码库发现 Agent",
   company: "企业关联",
   legacy: "历史关联",
   manual: "人工加入",

@@ -41,6 +41,50 @@ func TestTaskIDContextUsesExplicitRegistryID(t *testing.T) {
 	}
 }
 
+func TestSensitiveBodyContextOverridesGlobalRecording(t *testing.T) {
+	if !bodyRecordingAllowed(context.Background(), true) {
+		t.Fatal("ordinary calls should respect the global body-recording setting")
+	}
+	if bodyRecordingAllowed(context.Background(), false) {
+		t.Fatal("ordinary calls should not record bodies when globally disabled")
+	}
+	if bodyRecordingAllowed(WithSensitiveBody(context.Background()), true) {
+		t.Fatal("sensitive calls must suppress bodies even when globally enabled")
+	}
+}
+
+func TestSensitiveCompleteMetersUsageWithoutPersistingBodies(t *testing.T) {
+	dsn := os.Getenv("ARTEX_PG_DSN")
+	if dsn == "" {
+		t.Skip("requires isolated ARTEX_PG_DSN")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+	session := "sensitive-audit-" + uuid.NewString()
+	profile := "sensitive-audit-" + uuid.NewString()
+	defer pg.Exec(`DELETE FROM llm_records WHERE session_id=$1`, session)
+	defer pg.Exec(`DELETE FROM llm_usage WHERE profile_name=$1`, profile)
+	ctx := WithWorker(transcript.WithSessionID(t.Context(), session), "java_whitebox_audit")
+	ctx = WithSensitiveBody(ctx)
+	recorder := Wrap(completeProvider{}, pg, "audit-fixture", profile, "", "", func() bool { return true })
+	if _, _, _, err := recorder.Complete(ctx, llm.CompletionRequest{Messages: []llm.Message{llm.UserText("secret source snippet")}}); err != nil {
+		t.Fatal(err)
+	}
+	var records, usage int
+	if err := pg.QueryRow(`SELECT count(*) FROM llm_records WHERE session_id=$1`, session).Scan(&records); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.QueryRow(`SELECT count(*) FROM llm_usage WHERE profile_name=$1 AND worker='java_whitebox_audit'`, profile).Scan(&usage); err != nil {
+		t.Fatal(err)
+	}
+	if records != 0 || usage != 1 {
+		t.Fatalf("sensitive LLM call persisted bodies=%d usage=%d, want 0 and 1", records, usage)
+	}
+}
+
 func TestParseSessionFallbackIsExplorationScoped(t *testing.T) {
 	taskID, worker := parseSession("exp12-worker-i99")
 	if taskID != "12" || worker != "worker" {

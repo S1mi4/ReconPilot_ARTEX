@@ -249,7 +249,7 @@ export interface TaskAssetView {
 }
 
 // ---- New unified asset model (new backend) ----
-export type NewAssetType = "root_domain" | "ip" | "subdomain" | "app" | "service" | "endpoint";
+export type NewAssetType = "root_domain" | "ip" | "subdomain" | "app" | "service" | "endpoint" | "code_service";
 
 export interface Asset {
   id: number;
@@ -1996,4 +1996,122 @@ export interface TaskFileListing {
   size: number;
   truncated: boolean;
   missing: boolean;
+}
+export interface TaskCodebaseVersion {
+  id: string;
+  codebase_id: string;
+  name: string;
+  kind: "directory" | "artifact";
+  format: "directory" | "zip" | "tar" | "jar" | "war" | "class";
+  file_count: number;
+  total_size: number;
+  created_at: string;
+}
+
+export interface TaskCodeService {
+  id: number;
+  task_id: number;
+  codebase_id: string;
+  relative_path: string;
+  name: string;
+  decision: "pending" | "confirmed" | "rejected";
+  decision_source: "discovery" | "llm" | "manual";
+  asset_id?: number;
+  latest_version_id: string;
+  latest_present: boolean;
+  evidence: Record<string, unknown>;
+  reason: string;
+  created_at: string;
+  updated_at: string;
+  versions: TaskCodeServiceVersion[];
+}
+
+export interface TaskCodeServiceVersion {
+  version_id: string;
+  version_created_at: string;
+  present: boolean;
+  evidence: Record<string, unknown>;
+}
+
+export interface TaskCodeAuditCandidate {
+  id: number;
+  run_id: number;
+  candidate_key: string;
+  review_status: "pending_review" | "dismissed";
+  candidate: Record<string, unknown>;
+  reviewer_summary: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskCodeAuditRun {
+  id: number;
+  task_id: number;
+  code_service_id: number;
+  service_name: string;
+  codebase_id: string;
+  version_id: string;
+  scope_path: string;
+  status: "queued" | "running" | "incomplete" | "completed" | "failed";
+  profile_id?: number;
+  profile_source: string;
+  profile_name: string;
+  profile_format: string;
+  model: string;
+  endpoint: string;
+  source_acknowledged: boolean;
+  files_total: number;
+  files_analyzed: number;
+  files_skipped: number;
+  chunks_total: number;
+  chunks_completed: number;
+  next_file_index: number;
+  budget_tokens: number;
+  used_tokens: number;
+  candidate_count: number;
+  summary: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  completed_at?: string;
+  updated_at: string;
+  candidates?: TaskCodeAuditCandidate[];
+}
+
+export interface TaskCodeAuditLLMConfig {
+  profile_id?: number;
+  profile_name: string;
+  profile_source: string;
+  format: string;
+  model: string;
+  endpoint: string;
+  available: boolean;
+  reason?: string;
+}
+
+export interface TaskCodeAuditConfig {
+  service: TaskCodeService;
+  version: TaskCodebaseVersion;
+  scope_path: string;
+  production_source_files: number;
+  test_java_files: number;
+  config_files: number;
+  source_available: boolean;
+  source_notice?: string;
+  llm: TaskCodeAuditLLMConfig;
+}
+
+export interface TaskCodebaseDiscoveryRun {
+  task_id: number;
+  version_id: string;
+  codebase_id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  error?: string;
+  candidate_count: number;
+  confirmed_count: number;
+  pending_count: number;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+  updated_at: string;
 }
