@@ -2829,7 +2829,7 @@
   "screen.bd64add6e4c433": ["已解绑", "Unbound"],
   "screen.2e87bd556c124f": ["授予", "Grant"],
   "screen.093bf588b825d2": ["未获取到模型", "No models returned"],
-  "screen.79f326be4409d5": ["项目", "Project"],
+  "screen.79f326be4409d5": ["源项目", "Source project"],
   "screen.199aa393eac673": ["同严重度", "Same severity"],
   "screen.9ba4b48c2d1830": ["请稍后重试", "Try again later"],
   "screen.52daa71ebc3105": ["目录", "directory"],
