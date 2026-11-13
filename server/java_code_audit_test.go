@@ -211,7 +211,7 @@ func TestTaskCodeAuditReviewPublishesToTaskAndGlobalFindings(t *testing.T) {
 	taskID := *baseFinding.TaskID
 	versionID := fmt.Sprintf("%032x", taskID)
 	codebaseID := fmt.Sprintf("review-codebase-%d", taskID)
-	root := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	root := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	serviceRoot := filepath.Join(root, "contents", "repository", "service")
 	for name, content := range map[string]string{
 		"src/main/java/app/Controller.java": "package app;\nclass Controller {\n  String search(String q) {\n    return dao.find(q);\n  }\n}\n",
@@ -317,7 +317,7 @@ func TestTaskCodeAuditRetryEndpointRequeuesFailedServiceRun(t *testing.T) {
 	codebaseID := fmt.Sprintf("retry-codebase-%d", taskID)
 	versionID := fmt.Sprintf("%032x", taskID)
 	version := taskCodebaseVersion{ID: versionID, CodebaseID: codebaseID, Name: "repository", Kind: "directory", Format: "directory"}
-	versionRoot := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	versionRoot := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	serviceRoot := filepath.Join(versionRoot, "contents", "repository", "service")
 	if err := os.MkdirAll(filepath.Join(serviceRoot, "src/main/java/app"), 0o750); err != nil {
 		t.Fatal(err)

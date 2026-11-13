@@ -71,7 +71,7 @@ func (s *Server) taskCodebasesList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	rootPath := taskCodebaseRootPath(s.m.dir, taskID)
+	rootPath := s.m.taskCodebaseRoot(taskID)
 	if err := ensureTaskCodebaseDirectories(rootPath, false); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			writeJSON(w, http.StatusOK, map[string]any{"versions": []taskCodebaseVersion{}})
@@ -373,7 +373,7 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 	if err != nil {
 		return version, err
 	}
-	rootPath := taskCodebaseRootPath(s.m.dir, taskID)
+	rootPath := s.m.taskCodebaseRoot(taskID)
 	if err := ensureTaskCodebaseDirectories(rootPath, true); err != nil {
 		return version, err
 	}

@@ -142,7 +142,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return pgdb.ErrTaskArchiveNotFound
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "stage_files", 10)
-	fileStage, err := stageTaskArchiveFiles(s.m.dir, job.ID, taskID, task.ExplorationID)
+	fileStage, err := stageTaskArchiveFiles(s.m.dir, job.ID, taskID, s.m.taskDataDir(task.ProjectID, task.ID), task.ExplorationID)
 	if err != nil {
 		return err
 	}
@@ -316,7 +316,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 		}
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "restore_files", 55)
-	files, err := installTaskArchiveFiles(s.m.dir, extracted, strconv.FormatInt(job.TaskID, 10), job.ID)
+	files, err := installTaskArchiveFiles(extracted, strconv.FormatInt(job.TaskID, 10), s.m.taskDataDirForRestore(job.TaskID), job.ID, filepath.Join(s.m.dir, "transcripts"))
 	if err != nil {
 		return err
 	}

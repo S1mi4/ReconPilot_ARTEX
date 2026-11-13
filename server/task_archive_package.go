@@ -89,7 +89,7 @@ func taskArchivePath(dataDir string, archiveID int64, taskID string) string {
 	return filepath.Join(taskArchiveRoot(dataDir), fmt.Sprintf("task-%s-%d.tar.zst", taskID, archiveID))
 }
 
-func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explorationID int64) (*taskArchiveFileStage, error) {
+func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID, taskDir string, explorationID int64) (*taskArchiveFileStage, error) {
 	root := filepath.Join(taskArchiveRoot(dataDir), ".staging", strconv.FormatInt(archiveID, 10))
 	stage := &taskArchiveFileStage{root: root, payload: filepath.Join(root, "payload")}
 	journalPath := filepath.Join(root, "journal.json")
@@ -117,7 +117,6 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	}
 	stage.journal = archiveStageJournal{ArchiveID: archiveID, TaskID: taskID}
 	targets := []archiveFileMove{}
-	taskDir := filepath.Join(dataDir, "tasks", taskID)
 	if _, err := os.Lstat(taskDir); err == nil {
 		targets = append(targets, archiveFileMove{Source: taskDir, Relative: filepath.Join("files", "tasks", taskID)})
 	} else if !os.IsNotExist(err) {
@@ -227,7 +226,7 @@ func (s *taskArchiveFileStage) commit() error {
 	return os.RemoveAll(s.root)
 }
 
-func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int64) (*taskArchiveRestoreFiles, error) {
+func installTaskArchiveFiles(extractedDir, taskID, taskDir string, archiveID int64, transcriptDir string) (*taskArchiveRestoreFiles, error) {
 	stage := &taskArchiveRestoreFiles{extracted: extractedDir}
 	numericTaskID, err := strconv.ParseInt(taskID, 10, 64)
 	if err != nil || numericTaskID <= 0 {
@@ -236,7 +235,7 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 	sources := []restoredArchivePath{}
 	workspace := filepath.Join(extractedDir, "files", "tasks", taskID)
 	if _, err := os.Lstat(workspace); err == nil {
-		sources = append(sources, restoredArchivePath{Source: workspace, Destination: filepath.Join(dataDir, "tasks", taskID)})
+		sources = append(sources, restoredArchivePath{Source: workspace, Destination: taskDir})
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -247,7 +246,7 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 	}
 	for _, entry := range entries {
 		sources = append(sources, restoredArchivePath{
-			Source: filepath.Join(transcripts, entry.Name()), Destination: filepath.Join(dataDir, "transcripts", entry.Name()),
+			Source: filepath.Join(transcripts, entry.Name()), Destination: filepath.Join(transcriptDir, entry.Name()),
 		})
 	}
 	for _, move := range sources {

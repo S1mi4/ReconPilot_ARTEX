@@ -544,7 +544,7 @@ func installBinaryAuditCodeService(t *testing.T, s *Server, taskID int64, classe
 	}
 	codebaseID := fmt.Sprintf("binary-codebase-%d-%s", taskID, versionID[:8])
 	version := taskCodebaseVersion{ID: versionID, CodebaseID: codebaseID, Name: "service.jar", Kind: "artifact", Format: "jar", CreatedAt: time.Now().UTC()}
-	root := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	root := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	contents := filepath.Join(root, "contents")
 	if err := os.MkdirAll(contents, 0o750); err != nil {
 		t.Fatal(err)
@@ -600,7 +600,7 @@ func installBinaryAuditClassCodeService(t *testing.T, s *Server, taskID int64, c
 	}
 	codebaseID := fmt.Sprintf("direct-class-codebase-%d-%s", taskID, versionID[:8])
 	version := taskCodebaseVersion{ID: versionID, CodebaseID: codebaseID, Name: className, Kind: "artifact", Format: "class", CreatedAt: time.Now().UTC()}
-	root := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	root := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	contents := filepath.Join(root, "contents")
 	if err := os.MkdirAll(contents, 0o750); err != nil {
 		t.Fatal(err)

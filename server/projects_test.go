@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	pgdb "github.com/Autumn-27/artex/db"
 )
@@ -61,11 +62,14 @@ func TestFindingsAreIsolatedPerProject(t *testing.T) {
 	}
 	defer m.Close()
 
-	other, err := m.pg.Projects().Create("隔离测试 B", "")
+	other, err := m.pg.Projects().Create("隔离测试 B "+time.Now().Format("150405.000000"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.pg.Projects().Purge(other.ID) })
+	t.Cleanup(func() {
+		_ = m.pg.Projects().SoftDelete(other.ID)
+		_ = m.pg.Projects().Purge(other.ID)
+	})
 	mine := testProjectID(t, m)
 	if mine == other.ID {
 		t.Fatal("test project must differ from the isolation project")

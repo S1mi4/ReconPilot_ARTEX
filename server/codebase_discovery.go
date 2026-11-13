@@ -215,7 +215,7 @@ func (s *Server) loadTaskCodebaseVersion(taskID, versionID string) (taskCodebase
 	if !validCodebaseVersionID(versionID) {
 		return version, errors.New("invalid codebase version id")
 	}
-	root := taskCodebaseRootPath(s.m.dir, taskID)
+	root := s.m.taskCodebaseRoot(taskID)
 	if err := ensureTaskCodebaseDirectories(filepath.Join(root, versionID), false); err != nil {
 		return version, err
 	}
@@ -241,7 +241,7 @@ func (s *Server) scanCodebaseServiceMetadata(ctx context.Context, taskID int64, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	root := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), version.ID, "contents")
+	root := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), version.ID, "contents")
 	if err := ensureTaskCodebaseDirectories(root, false); err != nil {
 		return nil, err
 	}
