@@ -1861,7 +1861,6 @@ ALTER TABLE traffic_evidence_snapshots ADD COLUMN IF NOT EXISTS project_id BIGIN
 -- 发现也直接带项目：发现通常来自任务（→ 任务的项目），但任务被物理删除后任务
 -- 关系会置空，发现本身仍要留在它原来的项目里。
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
-UPDATE findings f SET project_id = t.project_id FROM tasks t WHERE t.id = f.task_id AND f.project_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id, created_at DESC);
 -- 项目删除=保留期到点后的物理清理，所以项目外键按 CASCADE 建；存量库在这里重建约束。
 ALTER TABLE companies DROP CONSTRAINT IF EXISTS companies_project_id_fkey;
@@ -1955,6 +1954,17 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ALTER COLUMN project_id SET NOT NULL', tbl);
     END LOOP;
 END $$;
+
+-- 发现的归属从任务继承。必须放在上面「存量数据归入默认项目」之后：任务一旦有了
+-- 项目，发现才有可继承的项目。
+UPDATE findings f SET project_id = t.project_id
+  FROM tasks t
+ WHERE t.id = f.task_id AND f.project_id IS NULL AND t.project_id IS NOT NULL;
+-- 任务早已被物理删除的老发现没有可继承的项目，作为升级前的存量归入默认项目，
+-- 而不是让它们从所有视图里悄悄消失（默认项目本来就收纳升级前的全部数据）。
+UPDATE findings SET project_id = (SELECT id FROM projects WHERE nkey = 'default')
+ WHERE project_id IS NULL
+   AND EXISTS (SELECT 1 FROM projects WHERE nkey = 'default');
 
 -- 唯一性迁移：全局唯一 → 项目内唯一。
 -- 同一域名/企业名/分类名允许在不同项目各存一份。先 DROP 旧索引（存量库存在），
