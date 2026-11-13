@@ -24,6 +24,7 @@ function client(mock, payload) {
     require: (id) => {
       if (id === "@/lib/mock/enabled") return { MOCK: mock };
       if (id === "@/lib/mock/handler") return { mockHandle };
+      if (id === "@/lib/project") return { getProjectID: () => null };
       throw new Error(`Unexpected runtime import: ${id}`);
     },
     fetch: async () => {

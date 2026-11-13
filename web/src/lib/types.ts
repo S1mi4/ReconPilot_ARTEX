@@ -1365,6 +1365,27 @@ export interface PromptVar {
   source: "exploration" | "runtime" | "distilled";
 }
 
+/**
+ * 项目是最高级分层：项目 ⊃ 企业 ⊃ 任务。
+ * status=archived 时数据仍可读，但不能新建任务或启动工作。
+ */
+export interface Project {
+  id: number;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  archived_at?: string;
+  deleted_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectStats {
+  assets: number;
+  tasks: number;
+  findings: number;
+}
+
 export interface PromptVersion {
   version: number;
   ts: string;

@@ -24,6 +24,7 @@ vm.runInNewContext(
     require: (id) => {
       if (id === "@/lib/mock/enabled") return { MOCK: true };
       if (id === "@/lib/mock/handler") return { mockHandle };
+      if (id === "@/lib/project") return { getProjectID: () => null };
       throw new Error(`Unexpected import: ${id}`);
     },
     fetch: () => {

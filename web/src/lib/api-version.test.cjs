@@ -20,6 +20,7 @@ function client(fetch) {
     require: (id) => {
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected demo request") };
+      if (id === "@/lib/project") return { getProjectID: () => null };
       throw new Error(`Unexpected runtime import: ${id}`);
     },
     fetch,

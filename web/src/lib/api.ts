@@ -6,6 +6,7 @@
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
+import { getProjectID } from "@/lib/project";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -76,6 +77,8 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  Project,
+  ProjectStats,
   PromptVar,
   PromptVersion,
   ProxyPoolEntry,
@@ -159,7 +162,18 @@ let basicAuthProbe: Promise<void> | null = null;
 // Keep the admin token and collapse concurrent failures into one reload.
 export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
   if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
-  const response = await fetch(input, init);
+  // 项目上下文在这里统一注入：所有 /api 调用（含上传/下载这类绕过 http() 的裸
+  // 调用）都会带上当前项目，业务代码不再各自拼参数。
+  let request = init;
+  if (input.startsWith("/api")) {
+    const projectID = getProjectID();
+    if (projectID) {
+      const headers = new Headers(init?.headers);
+      if (!headers.has("X-Project-ID")) headers.set("X-Project-ID", String(projectID));
+      request = { ...init, headers };
+    }
+  }
+  const response = await fetch(input, request);
   if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
   if (response.status === 401 && response.headers.get("X-Artex-Auth") === "basic") {
     basicAuthReloading = true;
@@ -264,9 +278,15 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
+  // EventSource 无法设置请求头，项目上下文只能走 ?project=（服务端两种都认）。
   const token = getToken();
-  const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  const projectID = getProjectID();
+  const params = new URLSearchParams();
+  if (token) params.set("token", token);
+  if (projectID) params.set("project", String(projectID));
+  const query = params.toString();
+  if (!query) return `${base}${path}`;
+  return `${base}${path}${path.includes("?") ? "&" : "?"}${query}`;
 }
 
 export function openSSE(path: string): EventSource {
@@ -380,6 +400,20 @@ export const api = {
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+
+  // ---- projects (最高级分层；本身是全局资源，不带项目上下文) ----
+  projects: (includeArchived = false) =>
+    get<{ projects: Project[] }>(`/projects${includeArchived ? "?include_archived=1" : ""}`).then((r) =>
+      arr(r.projects),
+    ),
+  project: (id: number) => get<Project>(`/projects/${id}`),
+  createProject: (name: string, description = "") => post<Project>("/projects", { name, description }),
+  updateProject: (id: number, input: { name?: string; description?: string }) =>
+    patch<Project>(`/projects/${id}`, input),
+  archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
+  restoreProject: (id: number) => post<Project>(`/projects/${id}/restore`),
+  deleteProject: (id: number) => del<{ ok: boolean }>(`/projects/${id}`),
+  projectStats: (id: number) => get<ProjectStats>(`/projects/${id}/stats`),
 
   // ---- tasks ----
   tasks: () =>
