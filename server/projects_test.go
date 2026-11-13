@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -49,4 +51,79 @@ func testProjectID(t *testing.T, owner any) int64 {
 		t.Fatalf("ensure test project: %v", err)
 	}
 	return p.ID
+}
+
+// 跨项目的发现必须看起来「不存在」：列表只收本项目的，按 id 取别项目的返回 404。
+func TestFindingsAreIsolatedPerProject(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+
+	other, err := m.pg.Projects().Create("隔离测试 B", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.pg.Projects().Purge(other.ID) })
+	mine := testProjectID(t, m)
+	if mine == other.ID {
+		t.Fatal("test project must differ from the isolation project")
+	}
+
+	marker := "project-isolation-" + t.Name()
+	mineTask, err := m.CreateTask(mine, "我的任务", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTask, err := m.CreateTask(other.ID, "别人的任务", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mineTaskID, _ := strconv.ParseInt(mineTask.ID, 10, 64)
+	otherTaskID, _ := strconv.ParseInt(otherTask.ID, 10, 64)
+	myFinding, err := m.pg.AddFinding(mineTaskID, 0, marker, "mine", pgdb.SeverityHigh, "", "", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFinding, err := m.pg.AddFinding(otherTaskID, 0, marker, "theirs", pgdb.SeverityHigh, "", "", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = m.pg.Exec(`DELETE FROM findings WHERE vulnclass=$1`, marker)
+	})
+
+	s := &Server{m: m}
+	s.engine = NewEngine(m)
+	reqProject := strconv.FormatInt(mine, 10)
+
+	rec := httptest.NewRecorder()
+	req := newReqWithProject(http.MethodGet, "/api/exploration/findings?vulnclass="+marker, nil)
+	req.Header.Set(projectIDHeader, reqProject)
+	s.findings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "mine") || strings.Contains(body, "theirs") {
+		t.Fatalf("list leaked another project's findings: %s", body)
+	}
+
+	rec = httptest.NewRecorder()
+	req = newReqWithProject(http.MethodGet, "/api/exploration/findings/"+strconv.FormatInt(otherFinding, 10), nil)
+	req.SetPathValue("id", strconv.FormatInt(otherFinding, 10))
+	req.Header.Set(projectIDHeader, reqProject)
+	s.getFinding(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-project finding status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = newReqWithProject(http.MethodGet, "/api/exploration/findings/"+strconv.FormatInt(myFinding, 10), nil)
+	req.SetPathValue("id", strconv.FormatInt(myFinding, 10))
+	req.Header.Set(projectIDHeader, reqProject)
+	s.getFinding(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("own finding status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }

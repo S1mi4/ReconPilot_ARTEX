@@ -342,8 +342,7 @@ func (s *ProjectStore) Stats(id int64) (ProjectStats, error) {
 SELECT
   (SELECT count(*) FROM assets  WHERE project_id = $1),
   (SELECT count(*) FROM tasks   WHERE project_id = $1 AND deleted_at IS NULL),
-  (SELECT count(*) FROM findings f JOIN tasks t ON t.id = f.task_id
-     WHERE t.project_id = $1 AND t.deleted_at IS NULL)`, id).
+  (SELECT count(*) FROM findings WHERE project_id = $1)`, id).
 		Scan(&st.Assets, &st.Tasks, &st.Findings)
 	return st, err
 }

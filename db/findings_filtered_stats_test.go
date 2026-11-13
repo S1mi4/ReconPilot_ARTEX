@@ -62,7 +62,7 @@ func TestFilteredFindingStatsMatchesList(t *testing.T) {
 		})
 	}
 	// Deleted-task records remain selectable through the unassigned sentinel.
-	orphan, err := d.AddFinding(0, 0, "__issue125_orphan__", "orphan", "medium", "", "", "test", nil)
+	orphan, err := d.AddFindingForProject(testProjectID(t, d), 0, 0, "__issue125_orphan__", "orphan", "medium", "", "", "test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

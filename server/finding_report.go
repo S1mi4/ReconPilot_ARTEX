@@ -18,6 +18,9 @@ func (s *Server) generateFindingReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad finding id")
 		return
 	}
+	if !s.requireFindingInProject(w, r, id) {
+		return
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

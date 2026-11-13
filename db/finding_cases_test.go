@@ -46,7 +46,7 @@ func TestFindingCaseMergePreservesRecordsAndVersions(t *testing.T) {
 	if c.Count != 3 || c.High != 1 || c.Medium != 1 || c.Low != 1 {
 		t.Fatalf("counts %+v", c)
 	}
-	stats, err := d.DistinctFindingStats(fmt.Sprint(task.ID))
+	stats, err := d.DistinctFindingStats(testProjectID(t, d), fmt.Sprint(task.ID))
 	if err != nil {
 		t.Fatal(err)
 	}

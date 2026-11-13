@@ -796,8 +796,8 @@ type FindingDistinctStats struct {
 	Unassessed int `json:"unassessed"`
 }
 
-func (d *DB) DistinctFindingStats(taskID string) (*FindingDistinctStats, error) {
-	filter := FindingFilter{TaskID: taskID}
+func (d *DB) DistinctFindingStats(projectID int64, taskID string) (*FindingDistinctStats, error) {
+	filter := FindingFilter{TaskID: taskID, ProjectID: projectID}
 	where, args := filter.where()
 	s := new(FindingDistinctStats)
 	err := d.QueryRow(`WITH observations AS (SELECT f.id,f.severity,COALESCE(m.case_id,0) cid FROM findings f LEFT JOIN tasks t ON t.id=f.task_id LEFT JOIN finding_case_members m ON m.finding_id=f.id`+where+`), defects AS (SELECT severity FROM observations WHERE cid=0 UNION ALL SELECT c.severity FROM finding_cases c WHERE c.id IN(SELECT cid FROM observations WHERE cid>0)) SELECT count(*),(SELECT count(*) FROM observations),count(*) FILTER(WHERE severity='critical'),count(*) FILTER(WHERE severity='high'),count(*) FILTER(WHERE severity='medium'),count(*) FILTER(WHERE severity='low'),count(*) FILTER(WHERE severity='') FROM defects`, args...).Scan(&s.Total, &s.Reports, &s.Critical, &s.High, &s.Medium, &s.Low, &s.Unassessed)

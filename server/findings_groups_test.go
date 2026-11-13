@@ -36,10 +36,11 @@ func TestFindingGroupsNoResultStopReason(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	for _, taskID := range []int64{id, 0} {
-		if _, err := m.pg.AddFinding(taskID, 0, marker, "", db.SeverityHigh, "", "", "test", nil); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := m.pg.AddFinding(id, 0, marker, "", db.SeverityHigh, "", "", "test", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.AddFindingForProject(testProjectID(t, m), 0, 0, marker, "", db.SeverityHigh, "", "", "test", nil); err != nil {
+		t.Fatal(err)
 	}
 	engine := NewEngine(m)
 	engine.SetAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) { return &agent.Planner{}, &agent.Worker{} })

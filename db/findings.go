@@ -84,7 +84,22 @@ func ValidSeverity(s string) bool {
 // AddFinding inserts a finding into the standalone findings table. taskID and
 // nodeID may be 0 (stored as NULL). name may be "" (frontend falls back to
 // vulnclass). Returns the new finding id.
+// AddFinding records a finding that belongs to the project of the given task. The
+// task is the usual way a finding acquires its project, so the caller does not have
+// to repeat it; AddFindingForProject covers the task-less case.
 func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
+	var projectID int64
+	if taskID > 0 {
+		if err := d.QueryRow(`SELECT project_id FROM tasks WHERE id = $1`, taskID).Scan(&projectID); err != nil {
+			return 0, err
+		}
+	}
+	return d.AddFindingForProject(projectID, taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+}
+
+// AddFindingForProject records a finding whose project is given explicitly. Use it
+// when there is no task to inherit from (manual entry, imported legacy rows).
+func (d *DB) AddFindingForProject(projectID, taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	aidsJSON, _ := json.Marshal(assetIDs)
 	if assetIDs == nil {
 		aidsJSON = []byte("[]")
@@ -96,11 +111,15 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if nodeID > 0 {
 		nid = &nodeID
 	}
+	var pid *int64
+	if projectID > 0 {
+		pid = &projectID
+	}
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (project_id, task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+		pid, tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
 	).Scan(&id)
 	return id, err
 }
@@ -138,7 +157,7 @@ func scanFindings(rows interface {
 
 // ListFindings returns all findings (newest first), joined with task description.
 // Kept for the dashboard's summary; the paginated 发现 page uses ListFindingsPage.
-func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
+func (d *DB) ListFindings(projectID int64, limit int) ([]*DBFinding, error) {
 	if limit <= 0 {
 		limit = 500
 	}
@@ -146,8 +165,9 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 		SELECT `+findingSelectCols+`
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
+		WHERE f.project_id = $2
 		ORDER BY f.created_at DESC
-		LIMIT $1`, limit)
+		LIMIT $1`, limit, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +188,10 @@ type FindingFilter struct {
 	TimeDirection string // "asc" | "desc"; applies to time, not the severity ranking
 	From          string // RFC3339 timestamp, inclusive
 	To            string // RFC3339 timestamp, inclusive
+	// ProjectID 限定发现所属项目。发现跟随任务、任务跟随项目，所以这里按
+	// 任务所属项目过滤；没有任务的遗留发现不属于任何项目。
+	ProjectID int64
+
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
@@ -197,6 +221,10 @@ const FindingUnassignedTask = "__unassigned__"
 func (f FindingFilter) where() (string, []any) {
 	var conds []string
 	var args []any
+	if f.ProjectID > 0 {
+		args = append(args, f.ProjectID)
+		conds = append(conds, fmt.Sprintf("f.project_id = $%d", len(args)))
+	}
 	add := func(col, val string) {
 		if val == "" {
 			return
@@ -514,11 +542,15 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 			ph[i] = fmt.Sprintf("$%d", i+1)
 			args = append(args, id)
 		}
+		scope := ""
+		if f.ProjectID > 0 {
+			args = append(args, f.ProjectID)
+			scope = fmt.Sprintf(` AND f.project_id = $%d`, len(args))
+		}
 		q = `SELECT ` + cols + `
 			FROM findings f
 			LEFT JOIN tasks t ON f.task_id = t.id
-			WHERE f.id IN (` + strings.Join(ph, ",") + `)
-			` + order
+			WHERE f.id IN (` + strings.Join(ph, ",") + `)` + scope + ` ` + order
 	} else {
 		scoped, err := d.applyAssetScope(f)
 		if err != nil {

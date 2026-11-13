@@ -2265,11 +2265,15 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	// 带 task 参数 → 仅该任务（任务概览/发现 Tab 用），从 exploration_nodes 读（任务在则节点在）。
 	q := r.URL.Query()
 	taskParam := q.Get("task")
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	if taskParam == "" {
 		// 带 page/limit → 服务端分页 {items,total,...}；不带 → 裸数组（dashboard 汇总用，
 		// 与 intents 端点的兼容策略一致）。筛选/排序统一下推到 SQL。
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			fs, _ := s.m.pg.ListFindings(projectID, 500)
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -2280,7 +2284,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		}
 		page := findingPaginationParam(q.Get("page"), 1, 0)
 		limit := findingPaginationParam(q.Get("limit"), 20, 200)
-		fs, total, err := s.m.pg.ListFindingsPage(findingFilterFromQuery(q), page, limit)
+		fs, total, err := s.m.pg.ListFindingsPage(findingFilterForProject(projectID, q), page, limit)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -2294,7 +2298,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.m.ResolveTask(taskParam)
-	if t == nil {
+	if t == nil || (t.ProjectID != 0 && t.ProjectID != projectID) {
 		writeJSON(w, 200, []any{})
 		return
 	}
@@ -2398,7 +2402,11 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 
 // findingStats serves filtered, pagination-independent counts and global options.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FilteredFindingStats(findingFilterFromQuery(r.URL.Query()))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	st, err := s.m.pg.FilteredFindingStats(findingFilterForProject(projectID, r.URL.Query()))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2412,6 +2420,9 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	f, err := s.m.pg.GetFinding(id)
@@ -2461,9 +2472,14 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	format := q.Get("format")
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 
 	var ids []int64
-	var filter db.FindingFilter
+	// 导出同样受项目边界约束：all 也必须只导出当前项目。
+	filter := db.FindingFilter{ProjectID: projectID}
 	switch scope {
 	case "selected":
 		for _, part := range strings.Split(q.Get("ids"), ",") {
@@ -2483,9 +2499,9 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "all":
-		// 空 filter = 不加任何条件。
+		// 只带项目边界，不加其它筛选。
 	case "filtered", "":
-		filter = findingFilterFromQuery(q)
+		filter = findingFilterForProject(projectID, q)
 	default:
 		writeErr(w, 400, "bad scope: "+scope)
 		return
@@ -2601,6 +2617,9 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
+	if !s.requireFindingInProject(w, r, id) {
+		return
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2636,6 +2655,9 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	var body struct {
@@ -2728,6 +2750,9 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	n, err := s.m.pg.DeleteFinding(id)

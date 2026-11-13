@@ -107,6 +107,14 @@ func (s *Server) findingTrafficAccess(w http.ResponseWriter, r *http.Request, wr
 		writeErr(w, 400, "invalid finding id")
 		return 0, false
 	}
+	projectID, ok := s.requireProject(w, r, !write)
+	if !ok {
+		return 0, false
+	}
+	if s.projectOfFinding(id) != projectID {
+		writeErr(w, 404, "finding not found")
+		return 0, false
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())

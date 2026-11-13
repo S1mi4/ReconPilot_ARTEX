@@ -73,8 +73,8 @@ func (d *DB) SearchChatMentionsPage(ctx context.Context, projectID int64, kind, 
 SELECT kind, id, left(label, 160), left(description, 240) FROM (
  (SELECT 'finding' AS kind, f.id, COALESCE(NULLIF(f.name,''), f.vulnclass) AS label,
          concat_ws(' · ', f.severity, f.status, left(f.summary, 160)) AS description
-  FROM findings f JOIN tasks ft ON ft.id=f.task_id AND ft.project_id=$7
-  WHERE ($1='' OR $1='finding') AND
+  FROM findings f
+  WHERE f.project_id=$7 AND ($1='' OR $1='finding') AND
     ($2='' OR f.id::text=$2 OR concat_ws(' ',f.name,f.vulnclass,f.summary) ILIKE $3)
     AND ($4::bigint=0 OR (f.id::text=$2)<$6 OR ((f.id::text=$2)=$6 AND (f.id<$4 OR (f.id=$4 AND 'finding'>$5))))
   ORDER BY (f.id::text=$2) DESC, f.id DESC LIMIT 21)

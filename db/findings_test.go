@@ -88,7 +88,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 	}
 	var ids []int64
 	for i, s := range seed {
-		id, err := d.AddFinding(0, 0, vc, s.name, s.sev, "summary", "poc", "tester", nil)
+		id, err := d.AddFindingForProject(testProjectID(t, d), 0, 0, vc, s.name, s.sev, "summary", "poc", "tester", nil)
 		if err != nil {
 			t.Fatalf("AddFinding[%d]: %v", i, err)
 		}
@@ -227,7 +227,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 	defer d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc)
 	ids := make([]int64, 0, 7)
 	for i := 0; i < 7; i++ {
-		id, addErr := d.AddFinding(0, 0, vc, "", SeverityHigh, fmt.Sprintf("finding %d", i), "", "test", nil)
+		id, addErr := d.AddFindingForProject(testProjectID(t, d), 0, 0, vc, "", SeverityHigh, fmt.Sprintf("finding %d", i), "", "test", nil)
 		if addErr != nil {
 			t.Fatalf("AddFinding[%d]: %v", i, addErr)
 		}

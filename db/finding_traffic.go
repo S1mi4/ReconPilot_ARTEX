@@ -404,8 +404,8 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	if codeAuditEvidence == "" {
 		codeAuditEvidence = "{}"
 	}
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,code_audit_evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, codeAuditEvidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(project_id,task_id,node_id,vulnclass,name,severity,summary,evidence,code_audit_evidence,worker,asset_ids)
+VALUES((SELECT project_id FROM tasks WHERE id=$1),NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, codeAuditEvidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」

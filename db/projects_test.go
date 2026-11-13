@@ -280,3 +280,69 @@ func testProjectID(t *testing.T, owner any) int64 {
 	testProjectIDs.Store(d, p.ID)
 	return p.ID
 }
+
+// 发现跟随任务、任务跟随项目：写入时落项目，读时按项目过滤，任务被物理删除后
+// 发现仍留在原来的项目里（否则它会「漂」到所有项目之外）。
+func TestFindingsFollowTheirProject(t *testing.T) {
+	d := openProjectTestDB(t)
+	a := newTestProject(t, d, "Findings A "+time.Now().Format("150405.000000"))
+	b := newTestProject(t, d, "Findings B "+time.Now().Format("150405.000000"))
+
+	taskA, err := d.CreateTask(a.ID, "findings a", "goal a", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskB, err := d.CreateTask(b.ID, "findings b", "goal b", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskAID, taskBID := taskA.ID, taskB.ID
+
+	fa, err := d.AddFinding(taskAID, 0, "scoped-a", "a", SeverityHigh, "", "", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AddFinding(taskBID, 0, "scoped-b", "b", SeverityHigh, "", "", "test", nil); err != nil {
+		t.Fatal(err)
+	}
+	filed, err := d.AddFindingForProject(a.ID, 0, 0, "scoped-a-no-task", "a2", SeverityLow, "", "", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, total, err := d.ListFindingsPage(FindingFilter{ProjectID: a.ID, VulnClass: "scoped-a"}, 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(rows) != 1 || rows[0].ID != fa {
+		t.Fatalf("project A should see exactly its own finding: total=%d rows=%d", total, len(rows))
+	}
+	if rows, _, err := d.ListFindingsPage(FindingFilter{ProjectID: b.ID, VulnClass: "scoped-a"}, 1, 50); err != nil || len(rows) != 0 {
+		t.Fatalf("project B must not see project A's findings: rows=%d err=%v", len(rows), err)
+	}
+
+	// 没有任务的发现同样有归属：按项目写入，按项目读回。
+	rows, _, err = d.ListFindingsPage(FindingFilter{ProjectID: a.ID, VulnClass: "scoped-a-no-task"}, 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != filed {
+		t.Fatalf("task-less finding should stay in its project: rows=%d", len(rows))
+	}
+
+	// 任务被物理删除后，发现不跟着丢项目。
+	if err := d.DeleteTask(taskAID); err != nil {
+		t.Fatal(err)
+	}
+	f, err := d.GetFinding(fa)
+	if err != nil || f == nil {
+		t.Fatalf("finding should survive task deletion: %v", err)
+	}
+	var projectID int64
+	if err := d.QueryRow(`SELECT COALESCE(project_id,0) FROM findings WHERE id=$1`, fa).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	if projectID != a.ID {
+		t.Fatalf("finding lost its project after task deletion: project=%d want=%d", projectID, a.ID)
+	}
+}

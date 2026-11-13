@@ -120,6 +120,59 @@ func (s *Server) purgeExpiredProjects() {
 	}
 }
 
+// projectOfFinding resolves a finding's project through its task: findings follow
+// tasks, tasks follow projects. A finding without a task belongs to no project and
+// resolves to 0.
+func (s *Server) projectOfFinding(findingID int64) int64 {
+	if s.m == nil || s.m.pg == nil || findingID <= 0 {
+		return 0
+	}
+	var projectID int64
+	if err := s.m.pg.QueryRow(`SELECT COALESCE(project_id, 0) FROM findings WHERE id = $1`, findingID).Scan(&projectID); err != nil {
+		return 0
+	}
+	return projectID
+}
+
+// projectOfFindingCase resolves a case's project from its task, falling back to its
+// member findings (a case may outlive the task that carried it).
+func (s *Server) projectOfFindingCase(caseID int64) int64 {
+	if s.m == nil || s.m.pg == nil || caseID <= 0 {
+		return 0
+	}
+	var projectID int64
+	if err := s.m.pg.QueryRow(`
+SELECT COALESCE(
+  (SELECT t.project_id FROM finding_cases c JOIN tasks t ON t.id = c.task_id WHERE c.id = $1),
+  (SELECT MAX(f.project_id) FROM finding_case_members m
+     JOIN findings f ON f.id = m.finding_id
+   WHERE m.case_id = $1),
+  0)`, caseID).Scan(&projectID); err != nil {
+		return 0
+	}
+	return projectID
+}
+
+// requireFindingInProject writes 404 and returns false when the finding is missing or
+// belongs to another project. Isolation must not leak existence either.
+func (s *Server) requireFindingInProject(w http.ResponseWriter, r *http.Request, findingID int64) bool {
+	if s.m == nil || s.m.pg == nil {
+		// No database (bare test server): downstream handlers report that themselves.
+		return true
+	}
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return false
+	}
+	// 发现跟随任务、任务跟随项目。任务被物理删除后这条发现不再属于任何项目，
+	// 它本来就不可能属于「别的」项目，因此交给处理函数自己给出冲突/校验错误。
+	if owner := s.projectOfFinding(findingID); owner != 0 && owner != projectID {
+		writeErr(w, http.StatusNotFound, "finding not found")
+		return false
+	}
+	return true
+}
+
 // --- handlers ---
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
