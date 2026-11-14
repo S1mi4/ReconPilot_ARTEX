@@ -142,3 +142,44 @@ func TestEscalationApprovalExpires(t *testing.T) {
 		t.Fatal("expired approval must not start a run")
 	}
 }
+
+// 人工执行后回填结果：批准的提案能结案并记下真实影响，未批准的不行。
+func TestRecordEscalationOutcome(t *testing.T) {
+	d := openProjectTestDB(t)
+	ctx := context.Background()
+	task, err := d.CreateTask(testProjectID(t, d), "outcome "+time.Now().Format("150405.000000"), "g", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteFindingsByTask(task.ID); d.DeleteTask(task.ID) })
+	findingID, err := d.AddFinding(task.ID, 0, "SSRF", "内网探测", "medium", "s", "e", "w", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Exec(`DELETE FROM finding_escalations WHERE finding_id=$1`, findingID) })
+	e, err := d.CreateEscalation(ctx, EscalationInput{
+		FindingID: findingID, Level: "L2", Title: "读取内网元数据", Steps: "1. curl 169.254.169.254",
+		ExpectedImpact: "读到实例凭据", RollbackPlan: "只读", StopConditions: []string{"拿到凭据即停"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 未批准就回填 → 拒绝（避免"没批也能记成执行过"）。
+	if _, err := d.RecordEscalationOutcome(ctx, e.ID, EscalationExecuted, "read", ""); err == nil {
+		t.Fatal("recording an outcome for an unapproved proposal must fail")
+	}
+	if _, err := d.DecideEscalation(ctx, e.ID, true, "admin", "可以", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.RecordEscalationOutcome(ctx, e.ID, EscalationExecuted, "read", "只读到了元数据")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != EscalationExecuted || got.ImpactObserved != "read" || got.DecisionNote != "只读到了元数据" {
+		t.Fatalf("outcome = %+v", got)
+	}
+	// 非法影响取值不能被写进去。
+	if _, err := d.RecordEscalationOutcome(ctx, e.ID, EscalationFailed, "destroyed", ""); err == nil {
+		t.Fatal("bogus impact must be rejected")
+	}
+}

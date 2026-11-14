@@ -1098,6 +1098,18 @@ export const api = {
     }),
   cancelEscalation: (id: string, note?: string) =>
     post<FindingEscalation>(`/exploration/escalations/${encodeURIComponent(id)}/cancel`, { note }),
+  // 人工执行后回填结果：批准只开窗口，真实影响得由执行的人记回来。
+  recordEscalationOutcome: (
+    id: string,
+    status: "executed" | "failed",
+    impactObserved: "none" | "read" | "write" | "exec",
+    note?: string,
+  ) =>
+    post<FindingEscalation>(`/exploration/escalations/${encodeURIComponent(id)}/outcome`, {
+      status,
+      impact_observed: impactObserved,
+      note,
+    }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),
   intents: (task?: string) => get<TaskNode[]>(`/exploration/intents${tq(task)}`).then(arr),

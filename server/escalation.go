@@ -21,6 +21,7 @@ func (s *Server) registerEscalations(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/exploration/findings/{id}/escalations", s.createFindingEscalation)
 	mux.HandleFunc("POST /api/exploration/escalations/{id}/decide", s.decideEscalation)
 	mux.HandleFunc("POST /api/exploration/escalations/{id}/cancel", s.cancelEscalation)
+	mux.HandleFunc("POST /api/exploration/escalations/{id}/outcome", s.recordEscalationOutcome)
 }
 
 func (s *Server) listFindingEscalations(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +170,51 @@ func (s *Server) cancelEscalation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e, err := s.m.pg.CancelEscalation(r.Context(), id, s.adminActor(r), body.Note)
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, 200, e)
+}
+
+// recordEscalationOutcome 回填「人工执行」的结果：人按批准的理论步骤自己做完之后，
+// 把成败与真实影响记回来。这是让审计闭环的最后一步——没有它，批准过的提案永远停在
+// approved，也没人知道那次操作到底造成了什么。
+func (s *Server) recordEscalationOutcome(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoiDefault(r.PathValue("id"), 0))
+	if id <= 0 {
+		writeErr(w, 400, "bad escalation id")
+		return
+	}
+	if _, ok := s.requireProject(w, r, false); !ok {
+		return
+	}
+	var body struct {
+		Status         string `json:"status"`
+		ImpactObserved string `json:"impact_observed"`
+		Note           string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	if s.m.pg == nil {
+		writeErr(w, 503, "数据库不可用")
+		return
+	}
+	cur, err := s.m.pg.GetEscalation(r.Context(), id)
+	if err != nil || cur == nil {
+		writeErr(w, 404, "提案不存在")
+		return
+	}
+	if pid, ok := resolveProjectID(r); ok && cur.ProjectID != pid {
+		writeErr(w, 404, "提案不存在")
+		return
+	}
+	if body.ImpactObserved == "" {
+		body.ImpactObserved = "none"
+	}
+	e, err := s.m.pg.RecordEscalationOutcome(r.Context(), id, strings.TrimSpace(body.Status), body.ImpactObserved, strings.TrimSpace(body.Note))
 	if err != nil {
 		writeErr(w, 409, err.Error())
 		return

@@ -11,10 +11,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
+import { IMPACT_KEYS } from "@/lib/finding-verification";
 import type { EscalationStatus, FindingEscalation } from "@/lib/types";
 
 // 状态 → 文案/色调。这里刻意把「仅保留理论」（rejected）和「作废」（cancelled）
@@ -63,6 +65,12 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState<string>("");
   const [openForm, setOpenForm] = React.useState<{ id: string; approve: boolean } | null>(null);
+  const [outcome, setOutcome] = React.useState<{
+    id: string;
+    status: "executed" | "failed";
+    impact: string;
+    note: string;
+  } | null>(null);
   const [note, setNote] = React.useState("");
   const [hours, setHours] = React.useState("24");
   const requestSeq = React.useRef(0);
@@ -112,6 +120,26 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
       await api.cancelEscalation(id, note.trim() || undefined);
       toast.success(liveUI("screen.58e65e336fb7fc"));
       setNote("");
+      await load();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const saveOutcome = async () => {
+    if (!outcome) return;
+    setBusy(outcome.id);
+    try {
+      await api.recordEscalationOutcome(
+        outcome.id,
+        outcome.status,
+        outcome.impact as "none" | "read" | "write" | "exec",
+        outcome.note.trim() || undefined,
+      );
+      toast.success(liveUI("screen.58e65e336fb7fc"));
+      setOutcome(null);
       await load();
     } catch (e) {
       toast.error((e as Error).message);
@@ -208,6 +236,8 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
               {approved && e.expires_at ? (
                 <p className="text-xs text-amber-600">
                   {ui("screen.cbfe87aaae18ac", { v0: fmt(e.expires_at) })} · {ui("screen.5d61887e36948e")}
+                  {" · "}
+                  {ui("screen.e58d69f32d57ac")}
                 </p>
               ) : null}
 
@@ -279,13 +309,70 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
                         </Button>
                       </>
                     ) : (
-                      <Button size="sm" variant="outline" disabled={busy === e.id} onClick={() => void cancel(e.id)}>
-                        <AlertTriangleIcon data-icon="inline-start" />
-                        {ui("screen.d1a61d663759ba")}
-                      </Button>
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy === e.id}
+                          onClick={() => setOutcome({ id: e.id, status: "executed", impact: "none", note: "" })}
+                        >
+                          <CheckIcon data-icon="inline-start" />
+                          {ui("screen.094d7c1310ede4")}
+                        </Button>
+                        <Button size="sm" variant="ghost" disabled={busy === e.id} onClick={() => void cancel(e.id)}>
+                          <AlertTriangleIcon data-icon="inline-start" />
+                          {ui("screen.d1a61d663759ba")}
+                        </Button>
+                      </>
                     )}
                   </div>
                 )
+              ) : null}
+
+              {outcome?.id === e.id ? (
+                <div className="flex flex-col gap-2 rounded-md border p-2">
+                  <p className="text-xs text-muted-foreground">{ui("screen.0dac72b6944aa1")}</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Select
+                      value={outcome.status}
+                      onValueChange={(v) => setOutcome({ ...outcome, status: v as "executed" | "failed" })}
+                    >
+                      <SelectTrigger className="w-36" aria-label={ui("screen.e04bd1b72f4b06")}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="executed">{ui("screen.5f4d7cf2c82dd0")}</SelectItem>
+                        <SelectItem value="failed">{ui("screen.9344597efd4950")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select value={outcome.impact} onValueChange={(v) => setOutcome({ ...outcome, impact: v })}>
+                      <SelectTrigger className="w-36" aria-label={ui("screen.e8baec335dc4a6")}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(["none", "read", "write", "exec"] as const).map((k) => (
+                          <SelectItem key={k} value={k}>
+                            {ui(IMPACT_KEYS[k])}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Textarea
+                    value={outcome.note}
+                    onChange={(ev) => setOutcome({ ...outcome, note: ev.target.value })}
+                    placeholder={ui("screen.b405227c7e3f93")}
+                    rows={2}
+                  />
+                  <div className="flex gap-2">
+                    <Button size="sm" disabled={busy === e.id} onClick={() => void saveOutcome()}>
+                      {ui("screen.9fad24e2c377ee")}
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => setOutcome(null)}>
+                      {ui("screen.d1a61d663759ba")}
+                    </Button>
+                  </div>
+                </div>
               ) : null}
             </CardContent>
           </Card>

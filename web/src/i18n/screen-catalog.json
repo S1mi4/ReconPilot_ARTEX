@@ -3013,5 +3013,11 @@
   "screen.58e65e336fb7fc": ["审批已记录", "Decision saved"],
   "screen.8646363a96500c": ["L2 · 受限读取", "L2 · Limited read"],
   "screen.1024d95090102b": ["L3 · 高危动作", "L3 · High-impact action"],
-  "screen.5d61887e36948e": ["批准后 agent 仍需在窗口内单独发起执行；这里的批准不等于已执行。", "Approval only opens a window — nothing runs until the controlled executor is started."]
+  "screen.5d61887e36948e": ["批准后 agent 仍需在窗口内单独发起执行；这里的批准不等于已执行。", "Approval only opens a window — nothing runs until the controlled executor is started."],
+  "screen.094d7c1310ede4": ["记录执行结果", "Record outcome"],
+  "screen.e04bd1b72f4b06": ["执行结果", "Outcome"],
+  "screen.b405227c7e3f93": ["备注（可选）", "Note (optional)"],
+  "screen.9fad24e2c377ee": ["记录", "Save"],
+  "screen.0dac72b6944aa1": ["批准后由你按上面的理论步骤执行；执行完在这里回填结果与真实影响。", "Approve first, run the steps yourself, then record what actually happened here."],
+  "screen.e58d69f32d57ac": ["平台受控执行尚未启用：批准只开窗口，不替你执行。", "Controlled execution is not enabled yet — approval only opens a window."]
 }

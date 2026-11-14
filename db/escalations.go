@@ -303,6 +303,30 @@ WHERE id=$1 AND status='approved' RETURNING `+escalationCols, id, runID)
 	return e, err
 }
 
+// RecordEscalationOutcome 是「人工执行」这条路的结案入口：人按批准的理论步骤自己执行
+// （或在受监督的会话里执行）之后，把结果与真实影响回填。它接受 approved 和 running
+// 两种来源，因为人工路径不会有 running 阶段——平台受控执行（P2-A）才会先置 running。
+func (d *DB) RecordEscalationOutcome(ctx context.Context, id int64, status, impact, note string) (*FindingEscalation, error) {
+	if status != EscalationExecuted && status != EscalationFailed {
+		return nil, fmt.Errorf("结案状态只能是 executed 或 failed")
+	}
+	if !validImpactObserved[impact] {
+		return nil, fmt.Errorf("非法的影响取值 %q", impact)
+	}
+	row := d.QueryRowContext(ctx, `
+UPDATE finding_escalations
+SET status=$2, impact_observed=$3,
+	decision_note = CASE WHEN $4::text='' THEN decision_note ELSE $4::text END,
+	updated_at=now()
+WHERE id=$1 AND status IN ('approved','running')
+RETURNING `+escalationCols, id, status, impact, note)
+	e, err := scanEscalation(row)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("提案 %d 不在已批准/执行中状态，无法回填结果", id)
+	}
+	return e, err
+}
+
 // MarkEscalationFinished 落最终状态并记录实际观察到的影晌。
 func (d *DB) MarkEscalationFinished(ctx context.Context, id int64, status, impact string) (*FindingEscalation, error) {
 	if status != EscalationExecuted && status != EscalationFailed && status != EscalationCancelled {
