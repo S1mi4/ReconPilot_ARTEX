@@ -52,11 +52,14 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
-	ts              *db.ExplorationStore
-	worker          string
-	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// escalations 是提案存储；nil 时 propose_escalation 明确报"不可用"，而不是静默成功
+	// ——静默成功会让 agent 以为提案已提交，人却永远看不到。
+	escalations EscalationRecorder
+	as          *db.AssetStore   // asset store (optional; nil = asset tools not available)
+	cs          *db.CompanyStore // company store (optional)
+	ts          *db.ExplorationStore
+	worker      string
+	taskID      int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the

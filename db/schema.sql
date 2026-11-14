@@ -1838,6 +1838,46 @@ DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
 CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- 利用扩展提案：agent 想「扩大影响」时只产出提案，绝不自己执行。人工在漏洞详情页
+-- 审核批准后，才由受控执行器单独跑一次（见 docs/利用安全整改方案.md §5/§6）。
+-- 刻意把"理论步骤"和"审批结论"分开存：步骤是 agent 写的，status/decided_by 只有人能写。
+CREATE TABLE IF NOT EXISTS finding_escalations (
+    id                BIGSERIAL PRIMARY KEY,
+    project_id        BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    finding_id        BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    task_id           BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    -- L2=受限读取(批量/非最小), L3=写目标/命令执行/持久化/提权/横向/删数据。
+    -- L1 只影响自建对象，允许自动执行，不需要提案。
+    level             TEXT NOT NULL CHECK (level IN ('L2','L3')),
+    title             TEXT NOT NULL,
+    objective         TEXT NOT NULL DEFAULT '',
+    preconditions     TEXT[] NOT NULL DEFAULT '{}',
+    -- 理论操作步骤(Markdown)。只描述、不执行。
+    steps             TEXT NOT NULL,
+    expected_impact   TEXT NOT NULL DEFAULT '',
+    blast_radius      TEXT NOT NULL DEFAULT '',
+    stop_conditions   TEXT[] NOT NULL DEFAULT '{}',
+    rollback_plan     TEXT NOT NULL DEFAULT '',
+    alternative       TEXT NOT NULL DEFAULT '',
+    proposed_by       TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('proposed','approved','rejected','running','executed','failed','cancelled','expired')),
+    decided_by        TEXT NOT NULL DEFAULT '',
+    decided_at        TIMESTAMPTZ,
+    decision_note     TEXT NOT NULL DEFAULT '',
+    -- 批准时写下的执行窗口终点；过期的批准既不能再执行，也不该继续假装有效。
+    expires_at        TIMESTAMPTZ,
+    run_id            BIGINT,
+    impact_observed   TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_escalations_finding ON finding_escalations(finding_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_finding_escalations_project ON finding_escalations(project_id, status, created_at DESC);
+-- 同一漏洞同一等级只允许一条待审提案：避免 agent 反复提同一件事把审批列表刷满。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_finding_escalations_pending
+    ON finding_escalations(finding_id, level) WHERE status = 'proposed';
+
 -- 项目级 LLM 白名单：空集合 = 全部 LLM 配置可用（向后兼容）。
 CREATE TABLE IF NOT EXISTS project_llm_profiles (
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

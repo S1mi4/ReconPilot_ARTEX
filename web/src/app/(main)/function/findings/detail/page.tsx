@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
 import { FindingAutoChat } from "@/components/finding-auto-chat";
+import { FindingEscalationPanel } from "@/components/finding-escalation-panel";
 import { FindingReproductionPanel } from "@/components/finding-reproduction-panel";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
@@ -386,6 +387,7 @@ function FindingDetailInner() {
           </div>
           <TabsList>
             <TabsTrigger value="overview">{ui("screen.fea405f9b01d14")}</TabsTrigger>
+            <TabsTrigger value="exploit">{ui("screen.a9995c895587c6")}</TabsTrigger>
             <TabsTrigger value="lineage">{ui("screen.c292d0de066e85")}</TabsTrigger>
           </TabsList>
         </header>
@@ -606,6 +608,9 @@ function FindingDetailInner() {
           </TabsContent>
 
           {/* 链路图：从任务初始节点回溯到本漏洞节点的攻击链路 */}
+          <TabsContent value="exploit" className="mt-0">
+            <FindingEscalationPanel findingId={finding.id} readOnly={finding.inherited} />
+          </TabsContent>
           <TabsContent value="lineage" className="mt-0">
             <FindingLineageView findingId={finding.id} />
           </TabsContent>

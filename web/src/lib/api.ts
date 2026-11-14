@@ -45,6 +45,7 @@ import type {
   FindingCaseReviewRun,
   FindingCaseSuggestion,
   FindingDeepenResponse,
+  FindingEscalation,
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
@@ -1071,6 +1072,32 @@ export const api = {
     post<{ retest: FindingRetest; created: boolean }>(`/exploration/findings/${encodeURIComponent(id)}/retests`, {
       notes,
     }),
+  // 利用扩展提案：agent 想扩大影响时只写提案，人工在这里读、批、作废。
+  findingEscalations: (id: string) =>
+    get<FindingEscalation[]>(`/exploration/findings/${encodeURIComponent(id)}/escalations`).then(arr),
+  createFindingEscalation: (
+    id: string,
+    body: {
+      level: "L2" | "L3";
+      title: string;
+      objective?: string;
+      preconditions?: string[];
+      steps: string;
+      expected_impact: string;
+      blast_radius?: string;
+      stop_conditions: string[];
+      rollback_plan: string;
+      alternative?: string;
+    },
+  ) => post<FindingEscalation>(`/exploration/findings/${encodeURIComponent(id)}/escalations`, body),
+  decideEscalation: (id: string, approve: boolean, note: string, ttlHours?: number) =>
+    post<FindingEscalation>(`/exploration/escalations/${encodeURIComponent(id)}/decide`, {
+      approve,
+      note,
+      ttl_hours: ttlHours,
+    }),
+  cancelEscalation: (id: string, note?: string) =>
+    post<FindingEscalation>(`/exploration/escalations/${encodeURIComponent(id)}/cancel`, { note }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),
   intents: (task?: string) => get<TaskNode[]>(`/exploration/intents${tq(task)}`).then(arr),

@@ -652,6 +652,46 @@ export interface Finding {
   ts: string;
 }
 
+// 利用扩展提案（agent 提出、人审）。status 是状态机：
+// proposed → approved（带窗口）→ running → executed/failed；approved 可 cancel，
+// 过窗口自动 expired；rejected = 只保留理论，不执行。
+export type EscalationStatus =
+  | "proposed"
+  | "approved"
+  | "rejected"
+  | "running"
+  | "executed"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export interface FindingEscalation {
+  id: string;
+  project_id: string;
+  finding_id: string;
+  task_id?: string;
+  level: "L2" | "L3";
+  title: string;
+  objective: string;
+  preconditions: string[];
+  steps: string;
+  expected_impact: string;
+  blast_radius: string;
+  stop_conditions: string[];
+  rollback_plan: string;
+  alternative: string;
+  proposed_by: string;
+  status: EscalationStatus;
+  decided_by: string;
+  decided_at?: string;
+  decision_note: string;
+  expires_at?: string;
+  run_id?: string;
+  impact_observed: string;
+  created_at: string;
+  updated_at: string;
+}
+
 // FindingsPage 是发现列表的服务端分页响应。
 export interface FindingsPage {
   items: Finding[];

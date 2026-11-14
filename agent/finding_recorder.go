@@ -20,3 +20,11 @@ func (t *ToolSet) SetFindingRecorder(r FindingRecorder)   { t.findingRecorder = 
 func (w *Worker) SetFindingRecorder(r FindingRecorder)    { w.findingRecorder = r }
 func (p *Planner) SetFindingRecorder(r FindingRecorder)   { p.findingRecorder = r }
 func (m *MainAgent) SetFindingRecorder(r FindingRecorder) { m.findingRecorder = r }
+
+// SetEscalationRecorder wires the proposal store used by propose_escalation. Same
+// wiring points as the finding recorder: the server passes its project-scoped DB
+// handle; tests and the catalog shell leave it nil (the tool then reports unavailable).
+func (t *ToolSet) SetEscalationRecorder(r EscalationRecorder)   { t.escalations = r }
+func (w *Worker) SetEscalationRecorder(r EscalationRecorder)    { w.escalations = r }
+func (p *Planner) SetEscalationRecorder(r EscalationRecorder)   { p.escalations = r }
+func (m *MainAgent) SetEscalationRecorder(r EscalationRecorder) { m.escalations = r }
