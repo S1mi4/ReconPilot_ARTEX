@@ -564,6 +564,81 @@ VALUES ($1, $2, $3, $4, 'tool_input', 'regex', $5, $6, $7, false, 60, 'deny')`,
 	return nil
 }
 
+// builtinRulesV4 是高影响利用动作的默认拦截档：只覆盖「效果明确是写目标/落地文件/
+// 持久化/提权横向/整库导出」的动作——这些问题人一定会说"这本来就该先问我"。刻意
+// 不覆盖 SELECT/sleep/并发/请求体这类正常探测里天天出现的东西（见 docs/利用安全整改方案.md §4.1）。
+// 每条都导出成包级变量，便于不连库直接单测正则的命中与不命中。
+var builtinRulesV4 = []struct {
+	Name    string
+	Pattern string
+	Message string
+}{
+	{
+		Name:    "[内置] 数据库写入目标文件",
+		Pattern: `(?i)\bINTO\s+(?:OUTFILE|DUMPFILE)\s+['"$@/]`,
+		Message: "禁止把查询结果写成目标上的文件（INTO OUTFILE / DUMPFILE），会在目标磁盘留下可控内容",
+	},
+	{
+		Name:    "[内置] PostgreSQL COPY 导出到文件",
+		Pattern: `(?i)\bCOPY\b[^\n;]{0,200}\bTO\s+(?:'[^']*'|PROGRAM)`,
+		Message: "禁止用 COPY ... TO 把数据写到目标文件或执行命令",
+	},
+	{
+		Name:    "[内置] 数据库整库导出",
+		Pattern: `(?i)\b(?:mysqldump|pg_dump|pg_dumpall|mongodump)\b|\bsqlmap\b[^\n]{0,160}--(?:dump|dump-all|sql-shell|os-shell|os-pwn)\b`,
+		Message: "禁止整库导出（mysqldump / pg_dump / mongodump / sqlmap --dump）：会批量拉走业务数据且极易压垮数据库",
+	},
+	{
+		Name:    "[内置] 反弹 shell",
+		Pattern: `(?i)/dev/tcp/|\bnc\b[^\n]{0,40}\s-[a-z]{0,4}e\b|\bncat\b[^\n]{0,40}\s-e\b|\bsocat\b[^\n]{0,80}\bexec:|\b(?:bash|sh)\s+-i\b[^\n]{0,40}>&`,
+		Message: "禁止建立反弹 shell（/dev/tcp、nc -e、socat exec、bash -i >&）",
+	},
+	{
+		Name:    "[内置] 向 Web 根目录落地文件",
+		Pattern: `(?i)(?:>|>>|\btee\b)[^\n]{0,80}/(?:var|srv|usr/share|opt|home)[^\n]{0,40}(?:www|html|htdocs|nginx|apache|tomcat)[^\n]{0,40}`,
+		Message: "禁止向站点根目录写入文件（webshell 落地），会直接影响目标业务",
+	},
+	{
+		Name:    "[内置] 写入系统关键文件",
+		Pattern: `(?i)(?:>|>>|\btee\b)\s*/(?:etc/(?:passwd|shadow|sudoers|cron|rc\.local|systemd/|init\.d/)|root/\.ssh/)|\b(?:>|>>)\s*(?:~|\$HOME)/\.ssh/authorized_keys`,
+		Message: "禁止改写系统账户/凭据/开机自启文件（passwd、shadow、sudoers、cron、rc.local、authorized_keys）",
+	},
+	{
+		Name:    "[内置] 持久化",
+		Pattern: `(?i)\bcrontab\s+(?:-e|-r|[^-\s])|\bsystemctl\s+enable\b|\bschtasks\b[^\n]{0,60}/create\b|\breg\s+add\b[^\n]{0,80}\bRun\b|/etc/cron\.(?:d|daily|hourly)/`,
+		Message: "禁止在目标上建立持久化（crontab 写入、systemctl enable、计划任务、注册表 Run）",
+	},
+	{
+		Name:    "[内置] 提权与横向工具",
+		Pattern: `(?i)\bmimikatz\b|\bpsexec\b|\bwmiexec\b|\bimpacket-|\bchmod\s+(?:[ug]\+s|[24][0-7]{3})\b`,
+		Message: "禁止执行提权/横向工具或设置 SUID（mimikatz、psexec、wmiexec、impacket、chmod u+s）",
+	},
+	{
+		Name:    "[内置] 创建系统账号",
+		Pattern: `(?i)\b(?:useradd|adduser)\b|\bnet\s+user\s+\S+\s+\S+\s+/add\b`,
+		Message: "禁止在目标上创建系统账号（useradd / adduser / net user ... /add）",
+	},
+}
+
+// approvalHint 追加到每条 V4 规则的提示里：拒绝不是死路，而是要求走审批。
+const approvalHint = "（如需执行：漏洞详情 → 利用验证 → 提交扩展提案，批准后由受控执行单独下发）"
+
+// seedInterceptRulesV4 给单个项目补上高影响动作的拦截规则。语句自带 WHERE NOT EXISTS，
+// 因此可以（也必须）对已经灌过内置规则的老项目重复执行——它放在 rules_seeded_at 闸门之前。
+func (d *DB) seedInterceptRulesV4(projectID int64) error {
+	for _, r := range builtinRulesV4 {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, $2, true, 85, 'tool_input', 'regex', $3, 'deny', $4, false, 60, 'deny'
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE project_id = $1 AND name = $2)`,
+			projectID, r.Name, r.Pattern, r.Message+approvalHint,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.Name, err)
+		}
+	}
+	return nil
+}
+
 // seedInterceptRulesV3 adds the delete-endpoint path rule. 项目层隔离后每个项目
 // 各灌一份，因此不再需要独立的 settings 闸门。The v1 HTTP rules only catch the
 // DELETE *method* (curl -X DELETE, requests.delete(, method:'DELETE'),

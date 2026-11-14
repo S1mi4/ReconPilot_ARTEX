@@ -380,6 +380,11 @@ func (d *DB) SeedProjectRules() error {
 // single project. A project that already carries rules (an upgraded database whose
 // rules used to be global) is left untouched — only the marker is set.
 func (d *DB) seedRulesForProject(projectID int64) error {
+	// V4（高影响利用动作）是后补的安全基线，必须落到已经灌过规则的老项目上，所以
+	// 放在 rules_seeded_at 闸门之前；语句自带 WHERE NOT EXISTS，重复执行只是空转。
+	if err := d.seedInterceptRulesV4(projectID); err != nil {
+		return err
+	}
 	var seeded sql.NullTime
 	if err := d.QueryRow(`SELECT rules_seeded_at FROM projects WHERE id = $1`, projectID).Scan(&seeded); err != nil {
 		return err

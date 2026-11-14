@@ -618,6 +618,9 @@ export interface CodeAuditFindingEvidence {
   review: CodeAuditReviewEvidence;
 }
 
+export type VerifyLevel = "unknown" | "minimal" | "standard" | "theoretical";
+export type ImpactObserved = "none" | "read" | "write" | "exec";
+
 export interface Finding {
   case_id?: string;
   traffic_count?: number;
@@ -630,6 +633,10 @@ export interface Finding {
   name?: string; // 漏洞名称;为空时展示回退到 vulnclass
   severity: Severity;
   status: FindingStatus;
+  // verify_level 记录这条漏洞是怎么被证实的；impact_observed 记录验证过程对目标
+  // 实际做了什么。历史数据是 unknown/none，不代表"没有影响"，只代表"没有记录"。
+  verify_level?: VerifyLevel;
+  impact_observed?: ImpactObserved;
   summary: string;
   evidence: string;
   code_audit_evidence?: CodeAuditFindingEvidence;

@@ -25,6 +25,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
+import { IMPACT_KEYS, VERIFY_LEVEL_KEYS } from "@/lib/finding-verification";
 import { statusMeta } from "@/lib/status";
 import type { CodeAuditFindingEvidence, Finding, FindingStatus, Severity } from "@/lib/types";
 
@@ -346,6 +347,16 @@ function FindingDetailInner() {
             <Separator orientation="vertical" className="mx-1 h-4" />
             <StatusBadge domain="severity" value={finding.severity} dot />
             <StatusBadge domain="finding" value={finding.status} dot />
+            <Badge
+              variant="outline"
+              title={ui("screen.5f14e4a22da42c")}
+              className={finding.verify_level === "standard" ? "border-amber-500/40 text-amber-600" : undefined}
+            >
+              {ui(VERIFY_LEVEL_KEYS[finding.verify_level ?? "unknown"])}
+            </Badge>
+            <Badge variant="outline" title={ui("screen.e8baec335dc4a6")}>
+              {ui(IMPACT_KEYS[finding.impact_observed ?? "none"])}
+            </Badge>
             <Button
               variant="outline"
               size="sm"

@@ -58,22 +58,27 @@ func renderSystem(agentKey, def string, vars any) string {
 		}
 	}
 	if out, err := renderTmpl(tmpl, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
-		}
-		return out
+		return withCodeBlocks(agentKey, out)
 	}
 	// DB template broke (e.g. references an out-of-catalog var) → code default.
 	if out, err := renderTmpl(def, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
-		}
-		return out
+		return withCodeBlocks(agentKey, out)
 	}
+	return withCodeBlocks(agentKey, def)
+}
+
+// withCodeBlocks appends the blocks the application owns, so a DB-edited prompt can
+// never drop them: the opsec note (when enabled) and the minimal-proof policy for roles
+// that touch a live target. Order is fixed — opsec first, then minimal proof.
+func withCodeBlocks(agentKey, body string) string {
+	out := body
 	if OpsecEnabled != nil && OpsecEnabled() {
-		return def + "\n\n" + opsecPromptBlock
+		out += "\n\n" + opsecPromptBlock
 	}
-	return def
+	if minimalExploitRoles(agentKey) {
+		out += minimalExploitBlock
+	}
+	return out
 }
 
 func renderTmpl(tmpl string, vars any) (string, error) {

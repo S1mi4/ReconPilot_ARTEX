@@ -23,16 +23,20 @@ type DBFinding struct {
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID                   int64
-	TaskID               *int64
-	NodeID               *int64
-	VulnClass            string
-	Name                 string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity             string
-	Summary              string
-	Evidence             string
-	CodeAuditEvidence    json.RawMessage
-	Worker               string
+	ID                int64
+	TaskID            *int64
+	NodeID            *int64
+	VulnClass         string
+	Name              string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity          string
+	Summary           string
+	Evidence          string
+	CodeAuditEvidence json.RawMessage
+	Worker            string
+	// VerifyLevel 记录这条漏洞是怎么被证实的（minimal=只做最小证明），
+	// ImpactObserved 记录验证过程对目标做了什么（none/read/write/exec）。
+	VerifyLevel          string
+	ImpactObserved       string
 	AssetIDs             []int64
 	Status               string
 	Report               string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
@@ -87,19 +91,26 @@ func ValidSeverity(s string) bool {
 // AddFinding records a finding that belongs to the project of the given task. The
 // task is the usual way a finding acquires its project, so the caller does not have
 // to repeat it; AddFindingForProject covers the task-less case.
-func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
+// FindingVerification 是可选的验证元数据：老的调用方不传时按 unknown/none 落库，
+// 而不是把它们一律记成 minimal（历史数据没法追溯它当时怎么验证的）。
+type FindingVerification struct {
+	Level  string
+	Impact string
+}
+
+func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64, verification ...FindingVerification) (int64, error) {
 	var projectID int64
 	if taskID > 0 {
 		if err := d.QueryRow(`SELECT project_id FROM tasks WHERE id = $1`, taskID).Scan(&projectID); err != nil {
 			return 0, err
 		}
 	}
-	return d.AddFindingForProject(projectID, taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+	return d.AddFindingForProject(projectID, taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs, verification...)
 }
 
 // AddFindingForProject records a finding whose project is given explicitly. Use it
 // when there is no task to inherit from (manual entry, imported legacy rows).
-func (d *DB) AddFindingForProject(projectID, taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
+func (d *DB) AddFindingForProject(projectID, taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64, verification ...FindingVerification) (int64, error) {
 	aidsJSON, _ := json.Marshal(assetIDs)
 	if assetIDs == nil {
 		aidsJSON = []byte("[]")
@@ -115,11 +126,21 @@ func (d *DB) AddFindingForProject(projectID, taskID, nodeID int64, vulnclass, na
 	if projectID > 0 {
 		pid = &projectID
 	}
+	// 手动/导入的发现没有验证过程可循：不传就记 unknown/none，不臆测成 minimal。
+	level, impact := "unknown", "none"
+	if len(verification) > 0 {
+		if validVerifyLevels[verification[0].Level] {
+			level = verification[0].Level
+		}
+		if validImpactObserved[verification[0].Impact] {
+			impact = verification[0].Impact
+		}
+	}
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (project_id, task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-		pid, tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (project_id, task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, verify_level, impact_observed)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+		pid, tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), level, impact,
 	).Scan(&id)
 	return id, err
 }
@@ -129,6 +150,7 @@ func (d *DB) AddFindingForProject(projectID, taskID, nodeID int64, vulnclass, na
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 		f.evidence, f.code_audit_evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
+	f.verify_level, f.impact_observed,
 	(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
 
 // scanFindings materializes rows selected via findingSelectCols.
@@ -143,7 +165,7 @@ func scanFindings(rows interface {
 		var aidsJSON string
 		var codeAuditJSON []byte
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &codeAuditJSON, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &codeAuditJSON, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.VerifyLevel, &f.ImpactObserved, &f.TrafficCount); err != nil {
 			return nil, err
 		}
 		if len(codeAuditJSON) > 0 && string(codeAuditJSON) != "{}" {
@@ -577,7 +599,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var codeAuditJSON []byte
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &codeAuditJSON, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.VerifyLevel, &f.ImpactObserved,
+			&f.TrafficCount, &f.Report); err != nil {
 			return nil, err
 		}
 		if len(codeAuditJSON) > 0 && string(codeAuditJSON) != "{}" {
@@ -748,7 +771,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &codeAuditJSON, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report, &reportConv)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.VerifyLevel, &f.ImpactObserved, &f.TrafficCount, &f.Report, &reportConv)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

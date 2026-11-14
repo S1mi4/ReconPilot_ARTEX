@@ -2970,5 +2970,15 @@
   "punctuation.f114611cd6": ["：", ": "],
   "punctuation.d6a4e79b56": ["？", "?"],
   "punctuation.5432cbf694": ["JSON（.json）", "JSON(.json)"],
-  "punctuation.b269e4a091": ["「", "“"]
+  "punctuation.b269e4a091": ["「", "“"],
+  "screen.844637e6f51cce": ["最小验证", "Minimal proof"],
+  "screen.3998092df3de38": ["标准验证", "Standard verification"],
+  "screen.929ecd07f6068d": ["理论验证", "Theoretical"],
+  "screen.6f8940cf435e49": ["验证尺度未记录", "Verification not recorded"],
+  "screen.4137cd5b3c5af6": ["只观察", "Observed only"],
+  "screen.a879c89a7d3334": ["读取数据", "Read data"],
+  "screen.c2069aab33a5b3": ["写入数据", "Wrote data"],
+  "screen.988af27c0cf285": ["命令执行", "Command execution"],
+  "screen.5f14e4a22da42c": ["验证尺度", "Verification level"],
+  "screen.e8baec335dc4a6": ["实际影响", "Observed impact"]
 }

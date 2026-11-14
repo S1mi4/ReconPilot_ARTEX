@@ -1307,6 +1307,12 @@ CREATE TABLE IF NOT EXISTS findings (
     code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
     worker      TEXT NOT NULL DEFAULT '',
     asset_ids   JSONB NOT NULL DEFAULT '[]',
+    -- 验证尺度：为了证明它存在花了多大力气（unknown=历史数据，未记录过）。
+    verify_level    TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (verify_level IN ('unknown','minimal','standard','theoretical')),
+    -- 验证过程实际对目标做了什么（none=只观察，没有造成任何变化）。
+    impact_observed TEXT NOT NULL DEFAULT 'none'
+                    CHECK (impact_observed IN ('none','read','write','exec')),
     -- 处置状态：pending 待处理 / in_progress 处理中 / confirmed 已确认 / resolved 已处理 / fixed 已修复 /
     -- false_positive 误报 / ignored 忽略 / duplicate 重复 / risk_accepted 风险接受。
     -- 取值不加 CHECK：旧库靠下面的 ALTER 补列,CHECK 无法回填,统一由 server 侧白名单校验。
@@ -1321,6 +1327,9 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- 补旧库:验证尺度/实际影响。老行没有记录过,默认 unknown/none(不臆测成 minimal)。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verify_level    TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact_observed TEXT NOT NULL DEFAULT 'none';
 -- White-box findings are deduplicated by a stable service/source/sink identity in
 -- the application. A candidate key includes line coordinates and changes across
 -- versions, so it must not be a uniqueness constraint on the long-lived Finding.
