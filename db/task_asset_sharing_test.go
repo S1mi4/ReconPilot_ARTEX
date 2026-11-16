@@ -9,7 +9,7 @@ import (
 func TestTaskAssetSharingOffAllowsManualAssociations(t *testing.T) {
 	d, assets, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("manual assets while sharing off", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "manual assets while sharing off", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,8 @@ func TestTaskAssetSharingOffAllowsManualAssociations(t *testing.T) {
 func TestTaskAssetSharingLegacyArchiveDefault(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTaskWithOptions("legacy sharing archive", "goal", TaskCreateOptions{ShareGlobalAssets: true})
+	task, err := d.CreateTaskWithOptions("legacy sharing archive", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), ShareGlobalAssets: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestTaskAssetSharingLegacyArchiveDefault(t *testing.T) {
 	if err := json.Unmarshal(raw, &row); err != nil {
 		t.Fatal(err)
 	}
-	delete(row, "share_global_assets")
+	delete(row, "share_project_assets")
 	tx, err := d.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +70,7 @@ func TestTaskAssetSharingLegacyArchiveDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	var enabled bool
-	if err := tx.QueryRow(`SELECT share_global_assets FROM tasks WHERE id=$1`, task.ID).Scan(&enabled); err != nil {
+	if err := tx.QueryRow(`SELECT share_project_assets FROM tasks WHERE id=$1`, task.ID).Scan(&enabled); err != nil {
 		t.Fatal(err)
 	}
 	if enabled {

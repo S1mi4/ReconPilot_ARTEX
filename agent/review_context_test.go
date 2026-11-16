@@ -93,7 +93,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	}
 	rawIntent, _ := json.Marshal(intentPayload)
 	worker := NewWorker(provider, "test-model", workDir, nil, 0, 3, probe)
-	_, _, err = worker.Execute(ctx, "test-agent", expID, nil, ts, &db.Node{ID: intentID, Payload: rawIntent}, guard.NewWithInterceptor(ic).Hooks(), nil, nil, nil)
+	_, _, err = worker.Execute(ctx, "test-agent", expID, nil, ts, &db.Node{ID: intentID, Payload: rawIntent}, guard.NewWithInterceptor(ic).WithProject(testProjectID(t, d)).Hooks(), nil, nil, nil)
 	runDir := ensureRunDir(workDir, expID, intentID)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 		if json.Unmarshal(detail.Audit.ModelInput, &saved) != nil || saved.Background != nil || saved.Version != 5 {
 			t.Fatal("stored Worker review input retained a background")
 		}
-			if row.Status == "allowed" && (detail.Audit.ExecutionStatus != "succeeded" || saved.Version != 5) {
+		if row.Status == "allowed" && (detail.Audit.ExecutionStatus != "succeeded" || saved.Version != 5) {
 			t.Fatal("automatic allow lost execution result or its original background snapshot")
 		}
 		if detail.Audit.Correlation != "exact" {

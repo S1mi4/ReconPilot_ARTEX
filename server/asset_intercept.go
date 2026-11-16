@@ -19,7 +19,11 @@ func (s *Server) assetInterceptListRules(w http.ResponseWriter, r *http.Request)
 	if pg == nil {
 		return
 	}
-	rules, err := pg.ListAssetInterceptRules()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	rules, err := pg.ListAssetInterceptRules(projectID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -44,7 +48,11 @@ func (s *Server) assetInterceptCreateRule(w http.ResponseWriter, r *http.Request
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateAssetInterceptRule(req.Kind, req.Pattern, req.Note, req.Enabled)
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	rule, err := pg.CreateAssetInterceptRule(projectID, req.Kind, req.Pattern, req.Note, req.Enabled)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

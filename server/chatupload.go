@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -63,8 +64,9 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法 id")
 		return
 	}
+	var task *Task
 	if taskScoped {
-		if s.m.ResolveTask(id) == nil {
+		if task = s.m.ResolveTask(id); task == nil {
 			writeErr(w, 404, "task not found")
 			return
 		}
@@ -74,7 +76,12 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.engine.decInflight(id)
 	}
+	// 任务附件落在项目目录下；会话/暂存目录保持全局（它们不属于任何项目）。
 	dir := filepath.Join(s.m.dir, sub, id, "uploads")
+	if task != nil {
+		idNum, _ := strconv.ParseInt(task.ID, 10, 64)
+		dir = filepath.Join(s.m.taskDataDir(task.ProjectID, idNum), "uploads")
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeErr(w, 500, "建目录失败: "+err.Error())
 		return

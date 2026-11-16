@@ -24,10 +24,19 @@ type Store struct {
 	DB      *db.DB
 	Traffic *traffic.Traffic
 	Dir     string
+	// LegacyDir is the pre-project shared blob root. Reads fall back to it so an
+	// upgraded install can still open evidence recorded before the split; writes
+	// and GC always target Dir.
+	LegacyDir string
 }
 
 func New(pg *db.DB, tr *traffic.Traffic, dir string) *Store {
 	return &Store{DB: pg, Traffic: tr, Dir: dir}
+}
+
+// NewWithLegacy adds a read-only fallback root for pre-project blobs.
+func NewWithLegacy(pg *db.DB, tr *traffic.Traffic, dir, legacy string) *Store {
+	return &Store{DB: pg, Traffic: tr, Dir: dir, LegacyDir: legacy}
 }
 
 func hashPath(dir, hash string) (string, error) {
@@ -255,7 +264,14 @@ func (s *Store) OpenBody(snapshot db.TrafficEvidenceSnapshot, side string) (*os.
 	if err != nil {
 		return nil, 0, err
 	}
-	if err = verifyFile(path, hash, length); err != nil {
+	if verifyFile(path, hash, length) != nil && s.LegacyDir != "" && s.LegacyDir != s.Dir {
+		// 升级前的证据在共享目录里；读的时候回退过去，不搬动（内容寻址，可能是共享的）。
+		if legacy, legacyErr := hashPath(s.LegacyDir, hash); legacyErr == nil && verifyFile(legacy, hash, length) == nil {
+			path = legacy
+		} else if err = verifyFile(path, hash, length); err != nil {
+			return nil, 0, err
+		}
+	} else if err = verifyFile(path, hash, length); err != nil {
 		return nil, 0, err
 	}
 	f, err := os.Open(path)

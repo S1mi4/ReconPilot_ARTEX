@@ -16,7 +16,7 @@ func testSetup(t *testing.T) (*DB, *AssetStore, *CompanyStore) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	return d, d.Assets(), d.Companies()
+	return d, d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d))
 }
 
 // deleteAsset removes one v2 asset by id.
@@ -912,8 +912,8 @@ func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		var id int64
 		domain := fmt.Sprintf("%s-%d.invalid", marker, i)
-		if err := d.QueryRow(`INSERT INTO assets(type,domain,root_domain,task_ids,last_seen)
-			VALUES ('root_domain',$1,$1,ARRAY[$2]::bigint[],$3) RETURNING id`,
+		if err := d.QueryRow(`INSERT INTO assets(project_id,type,domain,root_domain,task_ids,last_seen)
+			VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'root_domain',$1,$1,ARRAY[$2]::bigint[],$3) RETURNING id`,
 			domain, taskID, sharedSeen).Scan(&id); err != nil {
 			t.Fatal(err)
 		}
@@ -1006,11 +1006,12 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	d, assets, companies := testSetup(t)
 	t.Cleanup(func() { _ = d.Close() })
 	// Older asset fixtures tag synthetic task IDs 1/2; use a task with no existing membership.
-	task, err := d.CreateTask("isolated task", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "isolated task", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := d.CreateTaskWithOptions("source", "goal", TaskCreateOptions{ShareGlobalAssets: true})
+	source, err := d.CreateTaskWithOptions("source", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), ShareGlobalAssets: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1025,7 +1026,8 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 			}
 			shared := candidate.ShareGlobalAssets
 			_ = d.DeleteTask(candidate.ID)
-			replacement, err := d.CreateTaskWithOptions("clean membership", "goal", TaskCreateOptions{ShareGlobalAssets: shared})
+			replacement, err := d.CreateTaskWithOptions("clean membership", "goal", TaskCreateOptions{
+				ProjectID: testProjectID(t, d), ShareGlobalAssets: shared})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1047,8 +1049,8 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	insert := func(typ, domain, url string, owner int64) int64 {
 		t.Helper()
 		var id int64
-		err := d.QueryRow(`INSERT INTO assets(type,domain,root_domain,url,ip,company_id,task_ids,last_seen)
-   VALUES($1,$2,$3,NULLIF($4,''),'198.51.100.9',$5,ARRAY[$6]::bigint[],now()) RETURNING id`, typ, domain, root, url, companyID, owner).Scan(&id)
+		err := d.QueryRow(`INSERT INTO assets(project_id,type,domain,root_domain,url,ip,company_id,task_ids,last_seen)
+   VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),$1,$2,$3,NULLIF($4,''),'198.51.100.9',$5,ARRAY[$6]::bigint[],now()) RETURNING id`, typ, domain, root, url, companyID, owner).Scan(&id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1139,7 +1141,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	}
 	got, err = assets.QueryDSLInScope(query, "", 0, 50, 0)
 	assertIDs(got, err, ids...)
-	empty, err := d.CreateTask("empty task", "goal", nil, 0, 0)
+	empty, err := d.CreateTask(testProjectID(t, d), "empty task", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1147,7 +1149,8 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	got, err = assets.QueryDSLInScope(query, "", empty.ID, 50, 0)
 	assertIDs(got, err)
 	// Explicit company selection imports a snapshot even with global sharing off.
-	associated, err := d.CreateTaskWithOptions("company task", "goal", TaskCreateOptions{CompanyIDs: []int64{companyID}})
+	associated, err := d.CreateTaskWithOptions("company task", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), CompanyIDs: []int64{companyID}})
 	if err != nil {
 		t.Fatal(err)
 	}

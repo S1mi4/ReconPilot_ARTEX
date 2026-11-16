@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
 import { FindingAutoChat } from "@/components/finding-auto-chat";
+import { FindingEscalationPanel } from "@/components/finding-escalation-panel";
 import { FindingReproductionPanel } from "@/components/finding-reproduction-panel";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
@@ -25,6 +26,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
+import { IMPACT_KEYS, VERIFY_LEVEL_KEYS } from "@/lib/finding-verification";
 import { statusMeta } from "@/lib/status";
 import type { CodeAuditFindingEvidence, Finding, FindingStatus, Severity } from "@/lib/types";
 
@@ -346,6 +348,16 @@ function FindingDetailInner() {
             <Separator orientation="vertical" className="mx-1 h-4" />
             <StatusBadge domain="severity" value={finding.severity} dot />
             <StatusBadge domain="finding" value={finding.status} dot />
+            <Badge
+              variant="outline"
+              title={ui("screen.5f14e4a22da42c")}
+              className={finding.verify_level === "standard" ? "border-amber-500/40 text-amber-600" : undefined}
+            >
+              {ui(VERIFY_LEVEL_KEYS[finding.verify_level ?? "unknown"])}
+            </Badge>
+            <Badge variant="outline" title={ui("screen.e8baec335dc4a6")}>
+              {ui(IMPACT_KEYS[finding.impact_observed ?? "none"])}
+            </Badge>
             <Button
               variant="outline"
               size="sm"
@@ -375,6 +387,7 @@ function FindingDetailInner() {
           </div>
           <TabsList>
             <TabsTrigger value="overview">{ui("screen.fea405f9b01d14")}</TabsTrigger>
+            <TabsTrigger value="exploit">{ui("screen.a9995c895587c6")}</TabsTrigger>
             <TabsTrigger value="lineage">{ui("screen.c292d0de066e85")}</TabsTrigger>
           </TabsList>
         </header>
@@ -595,6 +608,9 @@ function FindingDetailInner() {
           </TabsContent>
 
           {/* 链路图：从任务初始节点回溯到本漏洞节点的攻击链路 */}
+          <TabsContent value="exploit" className="mt-0">
+            <FindingEscalationPanel findingId={finding.id} readOnly={finding.inherited} />
+          </TabsContent>
           <TabsContent value="lineage" className="mt-0">
             <FindingLineageView findingId={finding.id} />
           </TabsContent>

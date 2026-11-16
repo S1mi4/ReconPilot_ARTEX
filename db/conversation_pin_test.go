@@ -14,11 +14,11 @@ func TestConversationPinOrderingAndPatch(t *testing.T) {
 	defer d.Close()
 
 	suffix := time.Now().UnixNano()
-	first, err := d.CreateConversation("mainagent", fmt.Sprintf("pin-first-%d", suffix), nil)
+	first, err := d.CreateConversation(testProjectID(t, d), "mainagent", fmt.Sprintf("pin-first-%d", suffix), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.CreateConversation("mainagent", fmt.Sprintf("pin-second-%d", suffix), nil)
+	second, err := d.CreateConversation(testProjectID(t, d), "mainagent", fmt.Sprintf("pin-second-%d", suffix), nil)
 	if err != nil {
 		_ = d.DeleteConversation(first.ID)
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestConversationPinOrderingAndPatch(t *testing.T) {
 		t.Fatalf("repeat pin should preserve pin time: %+v (want %v)", first, firstPinnedAt)
 	}
 
-	conversations, err := d.ListConversations()
+	conversations, err := d.ListConversations(testProjectID(t, d))
 	if err != nil {
 		t.Fatal(err)
 	}

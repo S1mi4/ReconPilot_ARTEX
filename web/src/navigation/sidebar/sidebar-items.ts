@@ -7,6 +7,7 @@ import {
   Bug,
   CalendarClock,
   ClipboardList,
+  FolderKanban,
   FolderOpen,
   FolderSync,
   LayoutDashboard,
@@ -68,6 +69,7 @@ export const sidebarItems: NavGroup[] = [
     id: 1,
     label: "功能",
     items: [
+      { id: "projects", title: "项目管理", url: "/projects", icon: FolderKanban },
       { id: "dashboard", title: "仪表盘", url: "/dashboard", icon: LayoutDashboard },
       { id: "chat", title: "对话", url: "/chat", icon: MessageSquare },
       { id: "tasks", title: "任务", url: "/function/tasks", icon: Target },

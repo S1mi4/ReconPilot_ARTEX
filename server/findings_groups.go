@@ -43,10 +43,23 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 	}
 }
 
+// findingFilterForProject is findingFilterFromQuery plus the project boundary:
+// every findings view is scoped to the caller's project, so the filter is built
+// in one place and the project always wins over anything in the query string.
+func findingFilterForProject(projectID int64, q url.Values) db.FindingFilter {
+	filter := findingFilterFromQuery(q)
+	filter.ProjectID = projectID
+	return filter
+}
+
 // findingAssetTree serves the「按资产」view's left-hand tree: every asset that
 // carries at least one matching finding, plus the ancestors needed to place it.
 func (s *Server) findingAssetTree(w http.ResponseWriter, r *http.Request) {
-	tree, err := s.m.pg.BuildFindingAssetTree(findingFilterFromQuery(r.URL.Query()))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	tree, err := s.m.pg.BuildFindingAssetTree(findingFilterForProject(projectID, r.URL.Query()))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -62,7 +75,11 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := findingPaginationParam(q.Get("page"), 1, 0)
 	limit := findingPaginationParam(q.Get("limit"), 10, 100)
-	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(findingFilterFromQuery(q), page, limit)
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(findingFilterForProject(projectID, q), page, limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -98,6 +115,9 @@ func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)

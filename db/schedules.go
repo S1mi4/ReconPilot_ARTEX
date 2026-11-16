@@ -13,6 +13,7 @@ import (
 // Weekdays is kept as JSON text so the API can expose a stable []int shape.
 type TaskSchedule struct {
 	ID               int64      `json:"id"`
+	ProjectID        int64      `json:"project_id"`
 	Name             string     `json:"name"`
 	Remark           string     `json:"remark"`
 	Enabled          bool       `json:"enabled"`
@@ -45,9 +46,10 @@ type TaskScheduleInput struct {
 	EndTime          string
 	StartImmediately bool
 	TaskIDs          []int64
+	ProjectID        int64
 }
 
-const scheduleCols = `id,name,remark,enabled,timezone_mode,schedule_type,
+const scheduleCols = `id,project_id,name,remark,enabled,timezone_mode,schedule_type,
 COALESCE(to_char(run_date,'YYYY-MM-DD'),''),weekdays,to_char(start_time,'HH24:MI:SS'),
 COALESCE(to_char(end_date,'YYYY-MM-DD'),''),
 COALESCE(to_char(end_time,'HH24:MI:SS'),''),start_immediately,status,last_window_key,
@@ -64,7 +66,7 @@ func marshalWeekdays(days []int) string {
 func scanSchedule(sc interface{ Scan(...any) error }) (*TaskSchedule, error) {
 	var s TaskSchedule
 	var rawDays string
-	if err := sc.Scan(&s.ID, &s.Name, &s.Remark, &s.Enabled, &s.TimezoneMode, &s.ScheduleType,
+	if err := sc.Scan(&s.ID, &s.ProjectID, &s.Name, &s.Remark, &s.Enabled, &s.TimezoneMode, &s.ScheduleType,
 		&s.RunDate, &rawDays, &s.StartTime, &s.EndDate, &s.EndTime, &s.StartImmediately,
 		&s.Status, &s.LastWindowKey, &s.LastTransitionAt, &s.LastError,
 		&s.CreatedAt, &s.UpdatedAt); err != nil {
@@ -148,6 +150,9 @@ func normalizeScheduleInput(in TaskScheduleInput) (TaskScheduleInput, error) {
 }
 
 func (d *DB) CreateTaskSchedule(in TaskScheduleInput) (*TaskSchedule, error) {
+	if in.ProjectID <= 0 {
+		return nil, ErrProjectRequired
+	}
 	var err error
 	if in, err = normalizeScheduleInput(in); err != nil {
 		return nil, err
@@ -172,9 +177,9 @@ func createTaskScheduleTxCommit(tx *sql.Tx, in TaskScheduleInput) (*TaskSchedule
 }
 
 func insertTaskSchedule(tx *sql.Tx, in TaskScheduleInput) (*TaskSchedule, error) {
-	row := tx.QueryRow(`INSERT INTO task_schedules(name,enabled,timezone_mode,schedule_type,run_date,end_date,weekdays,start_time,end_time,start_immediately)
-VALUES ($1,$2,$3,$4,NULLIF($5,'')::date,NULLIF($6,'')::date,$7,$8::time,NULLIF($9,'')::time,$10) RETURNING `+scheduleCols,
-		in.Name, in.Enabled, in.TimezoneMode, in.ScheduleType, in.RunDate, in.EndDate, marshalWeekdays(in.Weekdays), in.StartTime, in.EndTime, in.StartImmediately)
+	row := tx.QueryRow(`INSERT INTO task_schedules(project_id,name,enabled,timezone_mode,schedule_type,run_date,end_date,weekdays,start_time,end_time,start_immediately)
+VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::date,NULLIF($7,'')::date,$8,$9::time,NULLIF($10,'')::time,$11) RETURNING `+scheduleCols,
+		in.ProjectID, in.Name, in.Enabled, in.TimezoneMode, in.ScheduleType, in.RunDate, in.EndDate, marshalWeekdays(in.Weekdays), in.StartTime, in.EndTime, in.StartImmediately)
 	s, err := scanSchedule(row)
 	if err != nil {
 		return nil, err
@@ -184,7 +189,7 @@ VALUES ($1,$2,$3,$4,NULLIF($5,'')::date,NULLIF($6,'')::date,$7,$8::time,NULLIF($
 			return nil, fmt.Errorf("task_id 无效")
 		}
 		var exists bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND deleted_at IS NULL)`, taskID).Scan(&exists); err != nil || !exists {
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL)`, taskID, in.ProjectID).Scan(&exists); err != nil || !exists {
 			if err != nil {
 				return nil, err
 			}
@@ -429,4 +434,32 @@ func (d *DB) UpdateTaskScheduleMetadata(id int64, patch TaskSchedulePatch) (*Tas
 	}
 	item.TaskIDs, err = d.scheduleTaskIDs(id)
 	return item, err
+}
+
+// ListTaskSchedulesByProject returns one project's schedules for the UI. The
+// scheduler itself keeps using the unfiltered list: it must fire every project's
+// plans, and task ids are globally unique so window evaluation stays correct.
+func (d *DB) ListTaskSchedulesByProject(projectID int64) ([]*TaskSchedule, error) {
+	rows, err := d.Query(`SELECT `+scheduleCols+` FROM task_schedules WHERE project_id = $1 ORDER BY id DESC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*TaskSchedule
+	for rows.Next() {
+		s, err := scanSchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, s := range out {
+		if s.TaskIDs, err = d.scheduleTaskIDs(s.ID); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }

@@ -12,7 +12,7 @@ func TestTaskRunSegmentLifecycle(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("runtime lifecycle", "runtime lifecycle test", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "runtime lifecycle", "runtime lifecycle test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestClearOpenTaskRunSegmentsPreservesAccumulatedRuntime(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("runtime restart clear", "runtime restart clear test", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "runtime restart clear", "runtime restart clear test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

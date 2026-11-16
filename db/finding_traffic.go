@@ -73,6 +73,7 @@ func ValidTrafficRole(role string) bool {
 
 type TrafficEvidenceSnapshot struct {
 	ID              string    `json:"id"`
+	ProjectID       int64     `json:"project_id"`
 	SourceTrafficID string    `json:"source_traffic_id"`
 	CapturedAt      int64     `json:"captured_at"`
 	URL             string    `json:"url"`
@@ -131,6 +132,7 @@ func TrafficSnapshotID(snapshot TrafficEvidenceSnapshot) string {
 	snapshot = snapshot.Normalize()
 	snapshot.ID = ""
 	snapshot.CreatedAt = time.Time{}
+	snapshot.ProjectID = 0
 	raw, _ := json.Marshal(snapshot)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
@@ -195,20 +197,28 @@ func InsertEvidenceSnapshotTx(tx *sql.Tx, s TrafficEvidenceSnapshot) error {
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now().UTC()
 	}
+	if s.ProjectID <= 0 {
+		return ErrProjectRequired
+	}
 	_, err := tx.Exec(`INSERT INTO traffic_evidence_snapshots
-(id,source_traffic_id,captured_at,url,method,status,content_type,req_head,resp_head,req_hash,resp_hash,req_len,resp_len,created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,
-		s.ID, s.SourceTrafficID, s.CapturedAt, s.URL, s.Method, s.Status, s.ContentType, s.ReqHead, s.RespHead, s.ReqHash, s.RespHash, s.ReqLen, s.RespLen, s.CreatedAt)
+(id,project_id,source_traffic_id,captured_at,url,method,status,content_type,req_head,resp_head,req_hash,resp_hash,req_len,resp_len,created_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,
+		s.ID, s.ProjectID, s.SourceTrafficID, s.CapturedAt, s.URL, s.Method, s.Status, s.ContentType, s.ReqHead, s.RespHead, s.ReqHash, s.RespHash, s.ReqLen, s.RespLen, s.CreatedAt)
 	return err
 }
 
 func AddFindingTrafficTx(tx *sql.Tx, findingID int64, prepared []PreparedTrafficEvidence) error {
+	var projectID int64
+	if err := tx.QueryRow(`SELECT task.project_id FROM findings finding JOIN tasks task ON task.id=finding.task_id WHERE finding.id=$1`, findingID).Scan(&projectID); err != nil {
+		return fmt.Errorf("resolve finding project: %w", err)
+	}
 	var position int
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(position)+1,0) FROM finding_traffic_bindings WHERE finding_id=$1`, findingID).Scan(&position); err != nil {
 		return err
 	}
 	changed := false
 	for _, item := range prepared {
+		item.Snapshot.ProjectID = projectID
 		if err := InsertEvidenceSnapshotTx(tx, item.Snapshot); err != nil {
 			return err
 		}
@@ -330,6 +340,30 @@ type RecordFindingInput struct {
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
 	CodeAuditEvidence                                    json.RawMessage
+	// VerifyLevel: minimal（只做最小证明，默认）/ standard（常规验证）/ theoretical。
+	// ImpactObserved: none / read / write / exec，记录验证过程实际造成的影响。
+	// 空值按极小影响处理——上报方没声明，就不能假设它做得更多。
+	VerifyLevel    string
+	ImpactObserved string
+}
+
+// 允许的验证尺度与实际影响取值。故意不在库层用 CHECK 卡老库（见 schema 注释里的
+// ALTER），由这里统一收敛：调用方给空值或未知值时退到最保守的一档。
+var (
+	validVerifyLevels   = map[string]bool{"minimal": true, "standard": true, "theoretical": true}
+	validImpactObserved = map[string]bool{"none": true, "read": true, "write": true, "exec": true}
+)
+
+// NormalizeVerification 把调用方给的验证尺度收敛到合法取值：空值→minimal/unknown，
+// 未知值→最小影响。宁可把"不知道该算哪档"记成最轻的一档，也不要凭空记成 standard。
+func NormalizeVerification(level, impact string) (string, string) {
+	if !validVerifyLevels[level] {
+		level = "minimal"
+	}
+	if !validImpactObserved[impact] {
+		impact = "none"
+	}
+	return level, impact
 }
 
 type RecordedFinding struct {
@@ -394,8 +428,9 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	if codeAuditEvidence == "" {
 		codeAuditEvidence = "{}"
 	}
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,code_audit_evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, codeAuditEvidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	verifyLevel, impactObserved := NormalizeVerification(in.VerifyLevel, in.ImpactObserved)
+	if err := tx.QueryRow(`INSERT INTO findings(project_id,task_id,node_id,vulnclass,name,severity,summary,evidence,code_audit_evidence,worker,asset_ids,verify_level,impact_observed)
+VALUES((SELECT project_id FROM tasks WHERE id=$1),NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, codeAuditEvidence, in.Worker, string(raw), verifyLevel, impactObserved).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」

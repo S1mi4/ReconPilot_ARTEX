@@ -27,7 +27,7 @@ func testCaseServer(t *testing.T) (*Server, int64, []int64) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pg.Close() })
-	task, err := pg.CreateTask("case server", "goal", nil, 0, 0)
+	task, err := pg.CreateTask(testProjectID(t, pg), "case server", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestFindingCaseAPIPaginationAndTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	cid := result.(map[string]string)["case_id"]
-	r := httptest.NewRequest("GET", fmt.Sprintf("/api/exploration/finding-cases?task_id=%d&severity=low&page=1&limit=1", task), nil)
+	r := newReqWithProject("GET", fmt.Sprintf("/api/exploration/finding-cases?task_id=%d&severity=low&page=1&limit=1", task), nil)
 	w := httptest.NewRecorder()
 	s.listFindingCases(w, r)
 	if w.Code != 200 {
@@ -186,7 +186,7 @@ func TestFindingCaseAPIPaginationAndTools(t *testing.T) {
 	if page.Total != 1 || page.Items[0].Case.Count != 3 || page.Items[0].Case.Report != "" || len(page.Items[0].Matched) != 1 {
 		t.Fatalf("page %+v", page)
 	}
-	r = httptest.NewRequest("GET", "/", nil)
+	r = newReqWithProject("GET", "/", nil)
 	r.SetPathValue("id", cid)
 	w = httptest.NewRecorder()
 	s.getFindingCaseMembers(w, r)
@@ -253,7 +253,7 @@ func TestFindingCaseConsolidatedExportPreservesScope(t *testing.T) {
 }
 func TestFindingCaseManualSelectionScope(t *testing.T) {
 	s, task, ids := testCaseServer(t)
-	conv, err := s.m.pg.CreateConversation("reporter", "manual", nil)
+	conv, err := s.m.pg.CreateConversation(testProjectID(t, s.m.pg), "reporter", "manual", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestFindingCaseManualSelectionScope(t *testing.T) {
 
 func TestFindingCaseReviewStatusSurvivesTaskDeletion(t *testing.T) {
 	s, task, ids := testCaseServer(t)
-	conv, err := s.m.pg.CreateConversation("reporter", "review", nil)
+	conv, err := s.m.pg.CreateConversation(testProjectID(t, s.m.pg), "reporter", "review", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func TestFindingCaseReviewStatusSurvivesTaskDeletion(t *testing.T) {
 		}
 	}()
 	w := httptest.NewRecorder()
-	s.caseReviewRuns(w, httptest.NewRequest("GET", "/", nil))
+	s.caseReviewRuns(w, newReqWithProject("GET", "/", nil))
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"task_id":"0"`) {
 		t.Fatal(w.Code, w.Body)
 	}
@@ -300,7 +300,7 @@ func TestFindingCaseReviewStatusSurvivesTaskDeletion(t *testing.T) {
 
 func TestFindingCaseSelectedReviewCannotRewriteOtherOriginal(t *testing.T) {
 	s, task, ids := testCaseServer(t)
-	conv, err := s.m.pg.CreateConversation("reporter", "review", nil)
+	conv, err := s.m.pg.CreateConversation(testProjectID(t, s.m.pg), "reporter", "review", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,8 @@ func TestFindingCaseGroupedTrafficExportAndInheritedAccess(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"id": "case:`) || !strings.Contains(w.Body.String(), `"member_ids"`) {
 		t.Fatal(w.Code, w.Body)
 	}
-	child, err := s.m.CreateTaskWithOptions("inherited folders", "fixture", db.TaskCreateOptions{SourceTaskIDs: []int64{task.ID}})
+	child, err := s.m.CreateTaskWithOptions("inherited folders", "fixture", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, s.m), SourceTaskIDs: []int64{task.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +442,7 @@ func TestFindingCaseListIncludesContextAndFilteredCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := httptest.NewRequest("GET", fmt.Sprintf("/api/finding-cases?task_id=%d&severity=medium", task), nil)
+	r := newReqWithProject("GET", fmt.Sprintf("/api/finding-cases?task_id=%d&severity=medium", task), nil)
 	w := httptest.NewRecorder()
 	s.listFindingCases(w, r)
 	if w.Code != 200 {
@@ -476,7 +477,7 @@ func TestOriginalFindingRowsKeepEvidenceAndOmitReportBody(t *testing.T) {
 		if original {
 			suffix = "&original_rows=1"
 		}
-		r := httptest.NewRequest("GET", fmt.Sprintf("/api/finding-cases?task_id=%d%s", task, suffix), nil)
+		r := newReqWithProject("GET", fmt.Sprintf("/api/finding-cases?task_id=%d%s", task, suffix), nil)
 		w := httptest.NewRecorder()
 		s.listFindingCases(w, r)
 		if w.Code != 200 {

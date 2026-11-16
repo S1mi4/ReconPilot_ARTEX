@@ -20,7 +20,7 @@ func TestCompanyUpsertAndGet(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, created, err := cs.UpsertCompany("Test Corp", "https://example.com/logo.png")
 	if err != nil {
@@ -67,7 +67,7 @@ func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	stamp := time.Now().UnixNano()
 	name := fmt.Sprintf("Strict Company %d", stamp)
@@ -106,7 +106,7 @@ func TestCreateCompanyWithScopeRollsBackOnScopeWriteFailure(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	name := fmt.Sprintf("Atomic Create %d", time.Now().UnixNano())
 	_, _, _, _, _, err = cs.CreateCompanyWithScope(name, "", []ScopeInput{
@@ -131,7 +131,7 @@ func TestCompanyScope(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("ScopeTestCorp", "")
 	if err != nil {
@@ -169,7 +169,7 @@ func TestCompanyScopeInvalid(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("InvalidScopeCorp", "")
 	if err != nil {
@@ -198,7 +198,7 @@ func TestResolveCompany(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("ResolveCorp", "")
 	if err != nil {
@@ -239,7 +239,7 @@ func TestUpdateScope(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("UpdateScopeCorp", "")
 	if err != nil {
@@ -284,7 +284,7 @@ func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	name := fmt.Sprintf("Atomic Scope Update %d", time.Now().UnixNano())
 	id, _, err := cs.UpsertCompany(name, "")
@@ -319,7 +319,7 @@ func TestDeleteCompany(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("DeleteMeCorp", "")
 	if err != nil {
@@ -347,7 +347,7 @@ func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	stamp := time.Now().UnixNano()
 	id, _, err := cs.UpsertCompany(fmt.Sprintf("Delete Assets Company %d", stamp), "")
@@ -358,8 +358,8 @@ func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
 	var assetID int64
 	domain := fmt.Sprintf("delete-assets-%d.example", stamp)
 	if err := d.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, company_id, company_source)
-VALUES ('root_domain', $1, $1, $2, 'explicit')
+INSERT INTO assets(project_id,type, domain, root_domain, company_id, company_source)
+VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'root_domain', $1, $1, $2, 'explicit')
 RETURNING id`, domain, id).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
@@ -394,8 +394,8 @@ func TestRecomputeAttribution(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
-	as := d.Assets()
+	cs := d.Companies(testProjectID(t, d))
+	as := d.Assets(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("AttributeTestCorp", "")
 	if err != nil {
@@ -436,7 +436,7 @@ func TestListCompanies(t *testing.T) {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
 	defer d.Close()
-	cs := d.Companies()
+	cs := d.Companies(testProjectID(t, d))
 
 	id, _, err := cs.UpsertCompany("ListTestCorp", "")
 	if err != nil {

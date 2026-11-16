@@ -10,7 +10,7 @@ import (
 func TestTaskCodeServiceDiscoveryCreatesAssetsAndTracksVersionAbsence(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("code service discovery test", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "code service discovery test", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestTaskCodeServiceDiscoveryCreatesAssetsAndTracksVersionAbsence(t *testing
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	assets, err := d.Assets().QueryByTask(task.ID, "code_service", 10, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "code_service", 10, 0)
 	if err != nil || len(assets) != 1 {
 		t.Fatalf("code service assets=%+v err=%v", assets, err)
 	}
@@ -67,7 +67,7 @@ func TestTaskCodeServiceDiscoveryCreatesAssetsAndTracksVersionAbsence(t *testing
 func TestTaskCodeServiceCandidateConfirmationCreatesAsset(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("code service confirmation test", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "code service confirmation test", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestTaskCodeServiceCandidateConfirmationCreatesAsset(t *testing.T) {
 	if confirmed.Decision != "confirmed" || confirmed.AssetID == nil {
 		t.Fatalf("confirmation did not register an asset: %+v", confirmed)
 	}
-	assets, err := d.Assets().QueryByTask(task.ID, "code_service", 10, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "code_service", 10, 0)
 	if err != nil || len(assets) != 1 || assets[0].ID != *confirmed.AssetID {
 		t.Fatalf("confirmed asset not visible in task: assets=%+v err=%v", assets, err)
 	}

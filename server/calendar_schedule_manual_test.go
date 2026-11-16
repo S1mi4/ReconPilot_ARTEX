@@ -34,7 +34,7 @@ func manualScheduleTestServer(t *testing.T) (*Server, *Scheduler) {
 
 func manualScheduleTask(t *testing.T, s *Server) *Task {
 	t.Helper()
-	task, err := s.m.CreateTask("manual schedule test", "test admission", nil, 0, 0)
+	task, err := s.m.CreateTask(testProjectID(t, s.m), "manual schedule test", "test admission", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func manualSchedulePlan(t *testing.T, s *Server, tasks ...*Task) *db.TaskSchedul
 		id, _ := strconv.ParseInt(task.ID, 10, 64)
 		ids = append(ids, id)
 	}
-	plan, err := s.m.pg.CreateTaskSchedule(db.TaskScheduleInput{Name: "18:00 calendar", Enabled: true, ScheduleType: "weekly", TimezoneMode: "beijing", Weekdays: []int{1, 2, 3, 4, 5}, StartTime: "18:00", EndTime: "23:00", TaskIDs: ids})
+	plan, err := s.m.pg.CreateTaskSchedule(db.TaskScheduleInput{ProjectID: testProjectID(t, s.m.pg), Name: "18:00 calendar", Enabled: true, ScheduleType: "weekly", TimezoneMode: "beijing", Weekdays: []int{1, 2, 3, 4, 5}, StartTime: "18:00", EndTime: "23:00", TaskIDs: ids})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestCalendarManualTaskResumeSurvivesTicks(t *testing.T) {
 			if batch {
 				body = fmt.Sprintf(`{"action":"resume","task_ids":[%q]}`, task.ID)
 			}
-			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body))
+			req := newReqWithProject(http.MethodPost, "/", bytes.NewBufferString(body))
 			req.SetPathValue("id", task.ID)
 			rec := httptest.NewRecorder()
 			if batch {
@@ -191,7 +191,7 @@ func TestCalendarScheduleRunNowStillWorks(t *testing.T) {
 	task := manualScheduleTask(t, s)
 	plan := manualSchedulePlan(t, s, task)
 	sc.fireTaskSchedulesAt(calendarTestTime("2026-10-19T17:00:00+08:00"))
-	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req := newReqWithProject(http.MethodPost, "/", nil)
 	req.SetPathValue("id", strconv.FormatInt(plan.ID, 10))
 	rec := httptest.NewRecorder()
 	s.runScheduleNow(rec, req)

@@ -30,6 +30,7 @@ func TestTaskLLMProfileMutationsLockTaskBeforeProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, err := d.CreateTaskWithOptions("LLM lock order", "verify concurrent mutation locks", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		LLMProfileIDs: []int64{first, second},
 	})
 	if err != nil {
@@ -178,7 +179,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		conversation, err := d.CreateConversation("planner", "lock conversation", &profileID)
+		conversation, err := d.CreateConversation(testProjectID(t, d), "planner", "lock conversation", &profileID)
 		if err != nil {
 			_ = d.DeleteProfile(profileID)
 			t.Fatal(err)
@@ -282,7 +283,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		conversation, err := d.CreateConversation("planner", "write lock conversation", nil)
+		conversation, err := d.CreateConversation(testProjectID(t, d), "planner", "write lock conversation", nil)
 		if err != nil {
 			_ = d.DeleteProfile(profileID)
 			t.Fatal(err)
@@ -355,7 +356,7 @@ func TestCreateConversationAndDeleteProfileDoNotDeadlock(t *testing.T) {
 	createDone := make(chan createResult, 1)
 	createStatus := make(chan error, 1)
 	go func() {
-		conversation, err := createDB.CreateConversation("planner", title, &profileID)
+		conversation, err := createDB.CreateConversation(testProjectID(t, createDB), "planner", title, &profileID)
 		createDone <- createResult{conversation: conversation, err: err}
 		createStatus <- err
 	}()
@@ -412,7 +413,7 @@ func TestDeleteProfileRetriesReferenceCommittedAfterInitialScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, err := d.CreateTask("late profile reference", "exercise delete retry", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "late profile reference", "exercise delete retry", nil, 0, 0)
 	if err != nil {
 		_ = d.DeleteProfile(profileID)
 		t.Fatal(err)

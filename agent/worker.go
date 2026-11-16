@@ -43,6 +43,7 @@ type WebSearchOpts struct {
 
 type Worker struct {
 	findingRecorder FindingRecorder
+	escalations     EscalationRecorder
 	prov            llm.Provider
 	model           string
 	workDir         string
@@ -226,6 +227,7 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 1. **只做你领到的这一条意图**。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**。
 2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
 3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
+4. **验证只做最小可行证明**（见文末【最小化利用】）：能证明漏洞存在就够了，不要为了让证据"更硬"而加深利用——写文件、改数据、命令执行里读业务配置、dump 表都属于越界。要扩大影响不在你这一层做，写成 fact 交出去。
 
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
@@ -354,6 +356,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetEscalationRecorder(w.escalations)
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)

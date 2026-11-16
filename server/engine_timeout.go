@@ -333,7 +333,7 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, reason strin
 		Summary: fmt.Sprintf("%s·终局判定(第 %d 轮)", label, e.nextPlannerRound(t.ID))})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
-	met, decision, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
+	met, decision, err := planner.Plan(fctx, tTaskID, e.m.assetsForTask(t), t.Store, t.Goal, t.drainTriggers(), emit)
 	e.EndLLMCall(t.ID)
 	if err != nil {
 		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, err)

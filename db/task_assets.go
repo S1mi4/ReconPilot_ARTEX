@@ -169,7 +169,7 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 		return mutation, ErrTaskAssetTaskNotFound
 	}
 
-	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+	scoped := &AssetStore{db: s.db, company: s.company, tx: tx, projectID: s.projectID}
 	for _, rule := range parsed {
 		taskScope := TaskScope{
 			TaskID: taskID,

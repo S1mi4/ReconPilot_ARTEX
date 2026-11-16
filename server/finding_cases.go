@@ -57,9 +57,13 @@ func (s *Server) caseFindingDTO(f *db.DBFinding) FindingDTO {
 }
 func (s *Server) listFindingCases(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	page := findingPaginationParam(q.Get("page"), 1, 0)
 	size := findingPaginationParam(q.Get("limit"), 20, 100)
-	rows, total, err := s.m.pg.ListFindingCases(findingFilterFromQuery(q), page, size)
+	rows, total, err := s.m.pg.ListFindingCases(findingFilterForProject(projectID, q), page, size)
 	if err != nil {
 		caseHTTPError(w, err)
 		return
@@ -102,12 +106,12 @@ func (s *Server) listFindingCases(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, v)
 	}
-	stats, err := s.m.pg.DistinctFindingStats(q.Get("task_id"))
+	stats, err := s.m.pg.DistinctFindingStats(projectID, q.Get("task_id"))
 	if err != nil {
 		caseHTTPError(w, err)
 		return
 	}
-	matchingReports, err := s.m.pg.MatchingFindingReportCount(findingFilterFromQuery(q))
+	matchingReports, err := s.m.pg.MatchingFindingReportCount(findingFilterForProject(projectID, q))
 	if err != nil {
 		caseHTTPError(w, err)
 		return
@@ -122,6 +126,14 @@ func (s *Server) findingCaseAccess(w http.ResponseWriter, r *http.Request, mutat
 		return nil, false
 	}
 	if c == nil {
+		writeErr(w, 404, "漏洞组不存在")
+		return nil, false
+	}
+	projectID, ok := s.requireProject(w, r, !mutation)
+	if !ok {
+		return nil, false
+	}
+	if s.projectOfFindingCase(c.ID) != projectID {
 		writeErr(w, 404, "漏洞组不存在")
 		return nil, false
 	}

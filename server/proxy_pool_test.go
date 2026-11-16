@@ -53,7 +53,7 @@ func TestProxyPoolEmptyResponseUsesArrays(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &Server{m: &Manager{proxyPool: tc.pool}}
 			w := httptest.NewRecorder()
-			s.getProxyPool(w, httptest.NewRequest(http.MethodGet, "/api/settings/proxy-pool", nil))
+			s.getProxyPool(w, newReqWithProject(http.MethodGet, "/api/settings/proxy-pool", nil))
 			if w.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
@@ -130,7 +130,7 @@ func TestProxyPoolHealthThresholdCooldownAndRecovery(t *testing.T) {
 
 func TestProxyPoolUncheckedMemberDoesNotPauseBeforeFailureThreshold(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("unchecked proxy", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "unchecked proxy", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,11 +206,11 @@ func TestProxyPoolFailureSwitchRecoversOnlyEligibleTasks(t *testing.T) {
 		{ProxyPoolEntry: ProxyPoolEntry{ID: "a", Enabled: true, Health: "healthy"}, RawURL: "http://a"},
 		{ProxyPoolEntry: ProxyPoolEntry{ID: "b", Enabled: true, Health: "healthy"}, RawURL: "http://b"},
 	}}
-	eligible, err := m.CreateTask("eligible", "goal", nil, 0, 0)
+	eligible, err := m.CreateTask(testProjectID(t, m), "eligible", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	exhausted, err := m.CreateTask("exhausted", "goal", nil, 0, 0)
+	exhausted, err := m.CreateTask(testProjectID(t, m), "exhausted", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestProxyPoolReconnectKeepsAttemptsAndDoesNotAutoResumeExhausted(t *testing
 	m.proxyPool = &proxyPoolState{active: "legacy", entries: []proxyPoolEntry{{
 		ProxyPoolEntry: ProxyPoolEntry{ID: "legacy", Enabled: true, Health: "healthy"}, RawURL: "http://legacy",
 	}}}
-	task, err := m.CreateTask("legacy reconnect", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "legacy reconnect", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestProxyPoolDisableOrClearActiveRoutesAway(t *testing.T) {
 			{ProxyPoolEntry: ProxyPoolEntry{ID: "a", Enabled: true, Health: "healthy"}, RawURL: "http://a"},
 			{ProxyPoolEntry: ProxyPoolEntry{ID: "b", Enabled: true, Health: "healthy"}, RawURL: "http://b"},
 		})
-		r := httptest.NewRequest(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"enabled":false}`))
+		r := newReqWithProject(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"enabled":false}`))
 		r.SetPathValue("id", "a")
 		w := httptest.NewRecorder()
 		s.updateProxyPool(w, r)
@@ -318,7 +318,7 @@ func TestProxyPoolDisableOrClearActiveRoutesAway(t *testing.T) {
 		s, m := newServer([]proxyPoolEntry{{
 			ProxyPoolEntry: ProxyPoolEntry{ID: "a", Enabled: true, Health: "healthy"}, RawURL: "http://a",
 		}})
-		r := httptest.NewRequest(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":""}`))
+		r := newReqWithProject(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":""}`))
 		r.SetPathValue("id", "a")
 		w := httptest.NewRecorder()
 		s.updateProxyPool(w, r)
@@ -335,15 +335,15 @@ func TestProxyPoolClearOrDeleteLastMemberRecoversOnlyEligibleProxyPauses(t *test
 		m.proxyPool = &proxyPoolState{active: "a", entries: []proxyPoolEntry{{
 			ProxyPoolEntry: ProxyPoolEntry{ID: "a", Enabled: true, Health: "healthy"}, RawURL: "http://a",
 		}}}
-		eligible, err := m.CreateTask("eligible", "goal", nil, 0, 0)
+		eligible, err := m.CreateTask(testProjectID(t, m), "eligible", "goal", nil, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		exhausted, err := m.CreateTask("exhausted", "goal", nil, 0, 0)
+		exhausted, err := m.CreateTask(testProjectID(t, m), "exhausted", "goal", nil, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		userPaused, err := m.CreateTask("user paused", "goal", nil, 0, 0)
+		userPaused, err := m.CreateTask(testProjectID(t, m), "user paused", "goal", nil, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -369,7 +369,7 @@ func TestProxyPoolClearOrDeleteLastMemberRecoversOnlyEligibleProxyPauses(t *test
 			s.engine.Pause(task.ID, agent.AbortPausedByProxy)
 		}
 		if deleteLast {
-			r := httptest.NewRequest(http.MethodDelete, "/api/settings/proxy-pool/a", nil)
+			r := newReqWithProject(http.MethodDelete, "/api/settings/proxy-pool/a", nil)
 			r.SetPathValue("id", "a")
 			w := httptest.NewRecorder()
 			s.deleteProxyPool(w, r)
@@ -377,7 +377,7 @@ func TestProxyPoolClearOrDeleteLastMemberRecoversOnlyEligibleProxyPauses(t *test
 				t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
 			}
 		} else {
-			r := httptest.NewRequest(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":""}`))
+			r := newReqWithProject(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":""}`))
 			r.SetPathValue("id", "a")
 			w := httptest.NewRecorder()
 			s.updateProxyPool(w, r)
@@ -538,7 +538,7 @@ func TestProxyPoolMaskedEditHotCutsCoolingActiveMember(t *testing.T) {
 		RawURL:         "http://old:secret@old.example:8080",
 	}}}}
 	s := &Server{m: m}
-	r := httptest.NewRequest(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":"http://***@new.example:9090"}`))
+	r := newReqWithProject(http.MethodPatch, "/api/settings/proxy-pool/a", strings.NewReader(`{"url":"http://***@new.example:9090"}`))
 	r.SetPathValue("id", "a")
 	w := httptest.NewRecorder()
 	s.updateProxyPool(w, r)
@@ -560,7 +560,7 @@ func TestProxyPoolDeleteNeverRetainsDeletedRuntimeURL(t *testing.T) {
 	}}}
 	s := &Server{m: m}
 	deleteEntry := func(id string) {
-		r := httptest.NewRequest(http.MethodDelete, "/api/settings/proxy-pool/"+id, nil)
+		r := newReqWithProject(http.MethodDelete, "/api/settings/proxy-pool/"+id, nil)
 		r.SetPathValue("id", id)
 		w := httptest.NewRecorder()
 		s.deleteProxyPool(w, r)
@@ -605,7 +605,7 @@ func TestProxyPoolEmptyPersistenceDoesNotResurrectLegacyProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{m: m}
-	r := httptest.NewRequest(http.MethodDelete, "/api/settings/proxy-pool/a", nil)
+	r := newReqWithProject(http.MethodDelete, "/api/settings/proxy-pool/a", nil)
 	r.SetPathValue("id", "a")
 	w := httptest.NewRecorder()
 	s.deleteProxyPool(w, r)

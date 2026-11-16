@@ -64,7 +64,7 @@ func taskCodebasePost(t *testing.T, mux *http.ServeMux, taskID, kind string, fil
 	if err := form.Close(); err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/codebases", &body)
+	req := newReqWithProject(http.MethodPost, "/api/tasks/"+taskID+"/codebases", &body)
 	req.Header.Set("Content-Type", form.FormDataContentType())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -116,7 +116,7 @@ func TestTaskCodebaseDirectoryUploadsCreateIndependentVersions(t *testing.T) {
 		t.Fatalf("new upload modified the earlier snapshot: data=%q err=%v", data, err)
 	}
 
-	listReq := httptest.NewRequest(http.MethodGet, "/api/tasks/313/codebases", nil)
+	listReq := newReqWithProject(http.MethodGet, "/api/tasks/313/codebases", nil)
 	listRec := httptest.NewRecorder()
 	mux.ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {
@@ -404,21 +404,21 @@ func TestTaskCodebaseSnapshotsAreProtectedFromWorkspaceMutations(t *testing.T) {
 
 	writeBody, _ := json.Marshal(map[string]string{"path": filePath, "content": "changed"})
 	writeRec := httptest.NewRecorder()
-	mux.ServeHTTP(writeRec, httptest.NewRequest(http.MethodPost, "/api/workspace/write", bytes.NewReader(writeBody)))
+	mux.ServeHTTP(writeRec, newReqWithProject(http.MethodPost, "/api/workspace/write", bytes.NewReader(writeBody)))
 	if writeRec.Code != http.StatusForbidden {
 		t.Fatalf("workspace write status %d: %s", writeRec.Code, writeRec.Body.String())
 	}
 
 	mkdirBody, _ := json.Marshal(map[string]string{"path": filepath.ToSlash(filepath.Join("tasks", "313", "codebases", version.ID, "contents", "new"))})
 	mkdirRec := httptest.NewRecorder()
-	mux.ServeHTTP(mkdirRec, httptest.NewRequest(http.MethodPost, "/api/workspace/mkdir", bytes.NewReader(mkdirBody)))
+	mux.ServeHTTP(mkdirRec, newReqWithProject(http.MethodPost, "/api/workspace/mkdir", bytes.NewReader(mkdirBody)))
 	if mkdirRec.Code != http.StatusForbidden {
 		t.Fatalf("workspace mkdir status %d: %s", mkdirRec.Code, mkdirRec.Body.String())
 	}
 
 	for _, target := range []string{"tasks/313/codebases", "tasks/313", "tasks"} {
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/workspace/delete?path="+url.QueryEscape(target), nil))
+		mux.ServeHTTP(rec, newReqWithProject(http.MethodDelete, "/api/workspace/delete?path="+url.QueryEscape(target), nil))
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("delete %q status %d: %s", target, rec.Code, rec.Body.String())
 		}
@@ -437,7 +437,7 @@ func TestTaskCodebaseSnapshotsAreProtectedFromWorkspaceMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	uploadPath := filepath.ToSlash(filepath.Join("tasks", "313", "codebases", version.ID, "contents", "project", "src"))
-	uploadReq := httptest.NewRequest(http.MethodPost, "/api/workspace/upload?path="+url.QueryEscape(uploadPath), &uploadBody)
+	uploadReq := newReqWithProject(http.MethodPost, "/api/workspace/upload?path="+url.QueryEscape(uploadPath), &uploadBody)
 	uploadReq.Header.Set("Content-Type", form.FormDataContentType())
 	uploadRec := httptest.NewRecorder()
 	mux.ServeHTTP(uploadRec, uploadReq)

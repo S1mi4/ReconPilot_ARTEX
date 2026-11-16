@@ -26,14 +26,14 @@ type scheduleRequest struct {
 	TaskIDs          []int64 `json:"task_ids"`
 }
 
-func (s *Server) scheduleInput(req scheduleRequest, existing *db.TaskSchedule) db.TaskScheduleInput {
+func (s *Server) scheduleInput(projectID int64, req scheduleRequest, existing *db.TaskSchedule) db.TaskScheduleInput {
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	} else if existing != nil {
 		enabled = existing.Enabled
 	}
-	return db.TaskScheduleInput{Name: req.Name, Enabled: enabled, TimezoneMode: req.TimezoneMode, ScheduleType: req.ScheduleType,
+	return db.TaskScheduleInput{ProjectID: projectID, Name: req.Name, Enabled: enabled, TimezoneMode: req.TimezoneMode, ScheduleType: req.ScheduleType,
 		RunDate: req.RunDate, EndDate: req.EndDate, Weekdays: req.Weekdays, StartTime: req.StartTime, EndTime: req.EndTime,
 		StartImmediately: req.StartImmediately, TaskIDs: req.TaskIDs}
 }
@@ -62,7 +62,11 @@ func (s *Server) scheduleDTO(item *db.TaskSchedule) map[string]any {
 	return dto
 }
 func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
-	items, err := s.m.pg.ListTaskSchedules()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	items, err := s.m.pg.ListTaskSchedulesByProject(projectID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -108,12 +112,16 @@ func decodeSchedule(r *http.Request) (scheduleRequest, error) {
 }
 
 func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	req, err := decodeSchedule(r)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	item, err := s.m.pg.CreateTaskSchedule(s.scheduleInput(req, nil))
+	item, err := s.m.pg.CreateTaskSchedule(s.scheduleInput(projectID, req, nil))
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -125,13 +133,17 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	id, err := parseScheduleID(r)
 	if err != nil {
 		writeErr(w, 400, "计划编号无效")
 		return
 	}
 	old, err := s.m.pg.GetTaskSchedule(id)
-	if err != nil {
+	if err != nil || old.ProjectID != projectID {
 		writeErr(w, 404, "计划不存在")
 		return
 	}
@@ -140,7 +152,7 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	item, err := s.m.pg.UpdateTaskSchedule(id, s.scheduleInput(req, old))
+	item, err := s.m.pg.UpdateTaskSchedule(id, s.scheduleInput(projectID, req, old))
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return

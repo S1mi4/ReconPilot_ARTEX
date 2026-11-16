@@ -86,14 +86,14 @@ func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 func TestIntelligenceAssetAndFactWriteback(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
-	task, err := d.CreateTask("intelligence tool integration", "local fixtures", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "intelligence tool integration", "local fixtures", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(task.ID)
 	ts := NewToolSet(d.Exploration(task.ExplorationID), "qa")
 	ts.SetTaskID(task.ID)
-	ts.SetAssetStore(d.Assets(), d.Companies())
+	ts.SetAssetStore(d.Assets(testProjectID(t, d)), d.Companies(testProjectID(t, d)))
 	node, err := d.Exploration(task.ExplorationID).AddIntent(map[string]any{"summary": "fixture"}, 5, nil, "qa")
 	if err != nil {
 		t.Fatal(err)

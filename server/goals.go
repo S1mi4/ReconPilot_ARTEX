@@ -441,7 +441,7 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	var specs []goalSpec
 	var as *db.AssetStore
 	if s.m != nil {
-		as = s.m.Assets()
+		as = s.m.assetsForTask(t)
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	s.engine.BeginLLMCall(t.ID)

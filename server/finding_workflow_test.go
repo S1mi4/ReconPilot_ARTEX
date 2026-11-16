@@ -149,7 +149,8 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	if notices != 1 {
 		t.Fatal("failed handoff notified before commit")
 	}
-	child, err := s.m.CreateTaskWithOptions("inherited handoff", "fixture", db.TaskCreateOptions{SourceTaskIDs: []int64{*f.TaskID}})
+	child, err := s.m.CreateTaskWithOptions("inherited handoff", "fixture", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, s.m), SourceTaskIDs: []int64{*f.TaskID}})
 	if err != nil {
 		t.Fatal(err)
 	}

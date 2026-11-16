@@ -14,7 +14,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("manual scope registration", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "manual scope registration", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,14 +30,14 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 		{Kind: "keyword", Value: " Acme   Security "},
 	}
 
-	first, err := d.Assets().RegisterTaskAssetScopes(task.ID, inputs)
+	first, err := d.Assets(testProjectID(t, d)).RegisterTaskAssetScopes(task.ID, inputs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.Requested != 5 || first.AssetsLinked != 2 || first.AssetsExisting != 0 || first.ScopesAdded != 5 || first.ScopesExisting != 0 {
 		t.Fatalf("unexpected first mutation: %+v", first)
 	}
-	assets, err := d.Assets().QueryByTask(task.ID, "", 10, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "", 10, 0)
 	if err != nil || len(assets) != 2 {
 		t.Fatalf("task assets=%+v err=%v", assets, err)
 	}
@@ -48,8 +48,8 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 			t.Fatalf("unexpected task asset provenance: %+v", asset)
 		}
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs(assetIDs) })
-	scopes, err := d.Assets().ListTaskScope(task.ID)
+	t.Cleanup(func() { _, _ = d.Assets(testProjectID(t, d)).DeleteByIDs(assetIDs) })
+	scopes, err := d.Assets(testProjectID(t, d)).ListTaskScope(task.ID)
 	if err != nil || len(scopes) != 5 {
 		t.Fatalf("task scope=%+v err=%v", scopes, err)
 	}
@@ -61,7 +61,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 		t.Fatalf("text scope not normalized: %+v", values)
 	}
 
-	second, err := d.Assets().RegisterTaskAssetScopes(task.ID, inputs)
+	second, err := d.Assets(testProjectID(t, d)).RegisterTaskAssetScopes(task.ID, inputs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 	}
 
 	rollbackDomain := fmt.Sprintf("rollback-%d.example.test", suffix)
-	_, err = d.Assets().RegisterTaskAssetScopes(task.ID, []ScopeInput{
+	_, err = d.Assets(testProjectID(t, d)).RegisterTaskAssetScopes(task.ID, []ScopeInput{
 		{Kind: "domain", Value: rollbackDomain},
 		{Kind: "cidr", Value: "10.0.0.0/8"},
 	})
@@ -93,25 +93,25 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("asset editing", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "asset editing", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("manual-%d.example.test", time.Now().UnixNano())})
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("manual-%d.example.test", time.Now().UnixNano())})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() { _, _ = d.Assets(testProjectID(t, d)).DeleteByIDs([]int64{assetID}) })
 
-	mutation, err := d.Assets().AttachAssetsToTask(task.ID, []int64{assetID, assetID}, "授权资产清单第 3 项")
+	mutation, err := d.Assets(testProjectID(t, d)).AttachAssetsToTask(task.ID, []int64{assetID, assetID}, "授权资产清单第 3 项")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if mutation.Requested != 1 || mutation.Attached != 1 || mutation.Existing != 0 {
 		t.Fatalf("unexpected first mutation: %+v", mutation)
 	}
-	assets, err := d.Assets().QueryByTask(task.ID, "", 10, 0)
+	assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "", 10, 0)
 	if err != nil || len(assets) != 1 {
 		t.Fatalf("task assets=%+v err=%v", assets, err)
 	}
@@ -123,11 +123,11 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	detached, err := d.Assets().DetachAssetFromTask(task.ID, assetID)
+	detached, err := d.Assets(testProjectID(t, d)).DetachAssetFromTask(task.ID, assetID)
 	if err != nil || !detached {
 		t.Fatalf("detach=%v err=%v", detached, err)
 	}
-	if assets, err := d.Assets().QueryByTask(task.ID, "", 10, 0); err != nil || len(assets) != 0 {
+	if assets, err := d.Assets(testProjectID(t, d)).QueryByTask(task.ID, "", 10, 0); err != nil || len(assets) != 0 {
 		t.Fatalf("detached task assets=%+v err=%v", assets, err)
 	}
 	var global, anchors, links int
@@ -146,23 +146,24 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	}
 	defer d.Close()
 
-	source, err := d.CreateTask("source assets", "goal", nil, 0, 0)
+	source, err := d.CreateTask(testProjectID(t, d), "source assets", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := d.CreateTaskWithOptions("current assets", "goal", TaskCreateOptions{SourceTaskIDs: []int64{source.ID}})
+	current, err := d.CreateTaskWithOptions("current assets", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{source.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(current.ID); _ = d.DeleteTask(source.ID) })
 
-	assetID, err := d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertHTTPService(UpsertHTTPServiceReq{
 		URL: fmt.Sprintf("https://intent-%d.example.test", time.Now().UnixNano()), TaskID: source.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() { _, _ = d.Assets(testProjectID(t, d)).DeleteByIDs([]int64{assetID}) })
 	intentID, err := d.Exploration(source.ExplorationID).AddIntent(map[string]any{"summary": "source worker"}, 5, []int64{assetID}, "planner")
 	if err != nil {
 		t.Fatal(err)
@@ -171,11 +172,11 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeID := intentID
-	if err := d.Assets().SetTaskAssetSource(source.ID, assetID, "agent", "Worker 通过 insert_assets 登记", &nodeID); err != nil {
+	if err := d.Assets(testProjectID(t, d)).SetTaskAssetSource(source.ID, assetID, "agent", "Worker 通过 insert_assets 登记", &nodeID); err != nil {
 		t.Fatal(err)
 	}
 
-	assets, err := d.Assets().IntentAssets(current.ID)
+	assets, err := d.Assets(testProjectID(t, d)).IntentAssets(current.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -128,8 +128,8 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	// A pre-existing row with company_id and no provenance value represents old
 	// installations. The schema default conservatively treats it as explicit.
 	var assetID int64
-	if err := d.QueryRow(`INSERT INTO assets(type,domain,root_domain,company_id)
-		VALUES ('root_domain',$1,$1,$2) RETURNING id`, domain, explicitCompany).Scan(&assetID); err != nil {
+	if err := d.QueryRow(`INSERT INTO assets(project_id,type,domain,root_domain,company_id)
+		VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'root_domain',$1,$1,$2) RETURNING id`, domain, explicitCompany).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	defer deleteAsset(d, assetID)
@@ -247,8 +247,8 @@ func TestCompanyICPAttribution(t *testing.T) {
 	if err := d.QueryRow(`SELECT COALESCE(MAX(id),0)+1 FROM companies`).Scan(&suffix); err != nil {
 		t.Fatal(err)
 	}
-	cs := d.Companies()
-	as := d.Assets()
+	cs := d.Companies(testProjectID(t, d))
+	as := d.Assets(testProjectID(t, d))
 	companyID, _, err := cs.UpsertCompany(fmt.Sprintf("ICP Scope Co %d", suffix), "")
 	if err != nil {
 		t.Fatal(err)
@@ -318,8 +318,8 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	as := d.Assets()
-	cs := d.Companies()
+	as := d.Assets(testProjectID(t, d))
+	cs := d.Companies(testProjectID(t, d))
 
 	var startMax int64
 	if err := d.QueryRow(`SELECT COALESCE(MAX(id),0) FROM assets`).Scan(&startMax); err != nil {

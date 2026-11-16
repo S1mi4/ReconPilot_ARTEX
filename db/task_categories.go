@@ -60,20 +60,23 @@ func taskCategoryUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-func (d *DB) CreateTaskCategory(name string) (*TaskCategory, error) {
+func (d *DB) CreateTaskCategory(projectID int64, name string) (*TaskCategory, error) {
+	if projectID <= 0 {
+		return nil, ErrProjectRequired
+	}
 	name, nkey, err := normalizeTaskCategoryName(name)
 	if err != nil {
 		return nil, err
 	}
 	category, err := scanTaskCategory(d.QueryRow(`
 WITH inserted AS (
-    INSERT INTO task_categories(name, nkey)
-    VALUES ($1,$2)
-    ON CONFLICT (nkey) DO NOTHING
+    INSERT INTO task_categories(project_id, name, nkey)
+    VALUES ($1,$2,$3)
+    ON CONFLICT (project_id, nkey) DO NOTHING
     RETURNING *
 )
 SELECT inserted.id, inserted.name, inserted.nkey, 0, inserted.created_at, inserted.updated_at
-FROM inserted`, name, nkey))
+FROM inserted`, projectID, name, nkey))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskCategoryNameConflict
 	}
@@ -83,13 +86,14 @@ FROM inserted`, name, nkey))
 	return &category, nil
 }
 
-func (d *DB) ListTaskCategories() ([]*TaskCategory, error) {
+func (d *DB) ListTaskCategories(projectID int64) ([]*TaskCategory, error) {
 	rows, err := d.Query(`
 SELECT ` + taskCategoryCols + `
 FROM task_categories category
-LEFT JOIN tasks task ON task.category_id=category.id
+LEFT JOIN tasks task ON task.category_id=category.id AND task.project_id=category.project_id
+WHERE category.project_id = $1
 GROUP BY category.id
-ORDER BY category.name, category.id`)
+ORDER BY category.name, category.id`, projectID)
 	if err != nil {
 		return nil, err
 	}

@@ -19,7 +19,7 @@ func ArchiveEvidenceSnapshots(snapshot *TaskArchiveSnapshot) ([]TrafficEvidenceS
 	return out, err
 }
 
-func restoreFindingTrafficTx(tx *sql.Tx, snapshot *TaskArchiveSnapshot) error {
+func restoreFindingTrafficTx(tx *sql.Tx, snapshot *TaskArchiveSnapshot, projectID int64) error {
 	snapshots, err := ArchiveEvidenceSnapshots(snapshot)
 	if err != nil {
 		return err
@@ -30,6 +30,7 @@ func restoreFindingTrafficTx(tx *sql.Tx, snapshot *TaskArchiveSnapshot) error {
 			return errors.New("duplicate archived evidence snapshot")
 		}
 		allowed[v.ID] = true
+		v.ProjectID = projectID
 		if err = InsertEvidenceSnapshotTx(tx, v); err != nil {
 			return err
 		}

@@ -17,7 +17,7 @@ func caseTestDB(t *testing.T) (*DB, *Task, []int64) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	task, err := d.CreateTask("case integration", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "case integration", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestFindingCaseMergePreservesRecordsAndVersions(t *testing.T) {
 	if c.Count != 3 || c.High != 1 || c.Medium != 1 || c.Low != 1 {
 		t.Fatalf("counts %+v", c)
 	}
-	stats, err := d.DistinctFindingStats(fmt.Sprint(task.ID))
+	stats, err := d.DistinctFindingStats(testProjectID(t, d), fmt.Sprint(task.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestFindingCaseMergePreservesRecordsAndVersions(t *testing.T) {
 func TestFindingCaseScopeSuggestionsAndDeletion(t *testing.T) {
 	d, task, ids := caseTestDB(t)
 	ctx := context.Background()
-	other, err := d.CreateTask("other", "goal", nil, 0, 0)
+	other, err := d.CreateTask(testProjectID(t, d), "other", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

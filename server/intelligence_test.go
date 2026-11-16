@@ -53,7 +53,7 @@ func TestIntelligenceHTTPSettingsAndScope(t *testing.T) {
 	if r = request("PATCH", fmt.Sprintf("%s/%d", base, item.ID), `{"status":"verified"}`); r.Code != 200 {
 		t.Fatal(r.Code, r.Body)
 	}
-	other, err := s.m.pg.CreateTask("unrelated intel API", "test", nil, 0, 0)
+	other, err := s.m.pg.CreateTask(testProjectID(t, s.m.pg), "unrelated intel API", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

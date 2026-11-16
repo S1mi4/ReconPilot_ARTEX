@@ -42,7 +42,7 @@ func taskFilesFixture(t *testing.T) (*Server, string, func(string, string, strin
 			target += "/" + action
 		}
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest("GET", target+"?path="+url.QueryEscape(path), nil))
+		mux.ServeHTTP(rec, newReqWithProject("GET", target+"?path="+url.QueryEscape(path), nil))
 		return rec
 	}
 	return s, run, request
@@ -270,7 +270,7 @@ func TestTaskFilesRecentTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	if _, err := scanTaskFiles(httptest.NewRequest("GET", "/", nil).WithContext(ctx), root); err == nil {
+	if _, err := scanTaskFiles(newReqWithProject("GET", "/", nil).WithContext(ctx), root); err == nil {
 		t.Fatal("ignored cancellation")
 	}
 }
@@ -288,7 +288,7 @@ func TestTaskFilesAuthAndHead(t *testing.T) {
 	mux.HandleFunc("GET /api/tasks/{id}/files/archive", s.taskFilesArchive)
 	handler := s.requireAuth(mux)
 	for _, action := range []string{"", "/all", "/read", "/download", "/preview", "/archive"} {
-		req := httptest.NewRequest("GET", "/api/tasks/313/files"+action+"?path=readme.txt", nil)
+		req := newReqWithProject("GET", "/api/tasks/313/files"+action+"?path=readme.txt", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != 401 {
@@ -304,7 +304,7 @@ func TestTaskFilesAuthAndHead(t *testing.T) {
 		if action == "archive" {
 			path = ""
 		}
-		req := httptest.NewRequest("HEAD", "/api/tasks/313/files/"+action+"?path="+path, nil)
+		req := newReqWithProject("HEAD", "/api/tasks/313/files/"+action+"?path="+path, nil)
 		req.AddCookie(&http.Cookie{Name: "artex_token", Value: token})
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -335,7 +335,7 @@ func TestTaskFilesRealDirectory(t *testing.T) {
 			target += "/" + action
 		}
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest("GET", target+"?path="+url.QueryEscape(path), nil))
+		mux.ServeHTTP(rec, newReqWithProject("GET", target+"?path="+url.QueryEscape(path), nil))
 		return rec
 	}
 	root := taskFileListingResult(t, get("", ""))
@@ -401,7 +401,7 @@ func TestTaskFilesIntentMetadata(t *testing.T) {
 		t.Skipf("isolated PostgreSQL required: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("task files metadata", "", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "task files metadata", "", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestTaskFilesIntentMetadata(t *testing.T) {
 	}
 	run := filepath.Join(m.dir, "tasks", task.ID)
 	taskFileWrite(t, run, fmt.Sprintf("i%d/output.txt", id), []byte("result"))
-	req := httptest.NewRequest("GET", "/api/tasks/"+task.ID+"/files", nil)
+	req := newReqWithProject("GET", "/api/tasks/"+task.ID+"/files", nil)
 	req.SetPathValue("id", task.ID)
 	rec := httptest.NewRecorder()
 	(&Server{m: m}).taskFilesList(rec, req)

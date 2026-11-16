@@ -63,8 +63,11 @@ func (d *DB) CreateFindingCaseReviews(ctx context.Context, batches map[int64][]i
 			if err != nil {
 				return err
 			}
-			var conv int64
-			if err := tx.QueryRow(`INSERT INTO conversations(agent_key,title) VALUES('reporter',$1) RETURNING id`, fmt.Sprintf("漏洞整理 · task#%d", task)).Scan(&conv); err != nil {
+			var conv, reviewProject int64
+			if err := tx.QueryRow(`SELECT project_id FROM tasks WHERE id=$1`, task).Scan(&reviewProject); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(`INSERT INTO conversations(project_id,agent_key,title) VALUES($2,'reporter',$1) RETURNING id`, fmt.Sprintf("漏洞整理 · task#%d", task), reviewProject).Scan(&conv); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(`INSERT INTO finding_case_review_runs(conversation_id,task_id,finding_ids) VALUES($1,$2,$3)`, conv, task, string(raw)); err != nil {

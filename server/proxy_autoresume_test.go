@@ -77,7 +77,7 @@ func TestProxyReconnectReasonGate(t *testing.T) {
 
 func TestProxyAdmissionRechecksReasonAfterSnapshot(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy gate", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy gate", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,11 +106,11 @@ func TestProxyQueuedAdmissionDoesNotResumeEngine(t *testing.T) {
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
 	}
-	holder, err := m.CreateTask("holder", "goal", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "holder", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxyTask, err := m.CreateTask("queued proxy", "goal", nil, 0, 0)
+	proxyTask, err := m.CreateTask(testProjectID(t, m), "queued proxy", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestProxyQueuedAdmissionDoesNotResumeEngine(t *testing.T) {
 
 func TestTerminalStatusClearsProxyReconnectState(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("terminal proxy", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "terminal proxy", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestTerminalStatusClearsProxyReconnectState(t *testing.T) {
 
 func TestProxyAdmissionPreservesCalendarOverride(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("calendar proxy", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "calendar proxy", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestProxyAdmissionPreservesCalendarOverride(t *testing.T) {
 
 func TestProxyReconnectSuccessKeepsCompetingUserPauseBarrier(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy success race", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy success race", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestProxyReconnectSuccessKeepsCompetingUserPauseBarrier(t *testing.T) {
 
 func TestProxyPauseBarrierInstalledBeforeControlUnlock(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy barrier", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy barrier", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,15 +267,15 @@ func TestProxyPauseBarrierInstalledBeforeControlUnlock(t *testing.T) {
 
 func TestProxyPauseDoesNotReviveExhaustedOrNonProxyTasks(t *testing.T) {
 	m := proxyTestManager(t)
-	exhausted, err := m.CreateTask("exhausted proxy", "goal", nil, 0, 0)
+	exhausted, err := m.CreateTask(testProjectID(t, m), "exhausted proxy", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	userPaused, err := m.CreateTask("user paused", "goal", nil, 0, 0)
+	userPaused, err := m.CreateTask(testProjectID(t, m), "user paused", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := m.CreateTask("new proxy failure", "goal", nil, 0, 0)
+	other, err := m.CreateTask(testProjectID(t, m), "new proxy failure", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestProxyPauseDoesNotReviveExhaustedOrNonProxyTasks(t *testing.T) {
 
 func TestProxyReconnectRoundResetsAfterManualResume(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy retry round", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy retry round", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestProxyReconnectRoundResetsAfterManualResume(t *testing.T) {
 
 func TestProxyReconnectDropsStaleProbeFailureAfterNewRound(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy stale probe", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy stale probe", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +435,7 @@ func TestProxyReconnectDropsStaleProbeFailureAfterNewRound(t *testing.T) {
 
 func TestProxyReconnectManualSuccessDoesNotAdmitNewRound(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy stale manual success", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy stale manual success", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestProxyReconnectManualSuccessDoesNotAdmitNewRound(t *testing.T) {
 
 func TestProxyReconnectSettingsSuccessGuardsGenerationZero(t *testing.T) {
 	m := proxyTestManager(t)
-	task, err := m.CreateTask("proxy generation zero", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "proxy generation zero", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

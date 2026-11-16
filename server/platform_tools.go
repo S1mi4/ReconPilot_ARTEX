@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -48,8 +49,8 @@ func (s *Server) toolDeleteAssetsByHost() actool.CoreTool {
 		objSchema(map[string]any{
 			"host": strParam("要删除的 host：域名/子域名/IP。完全匹配，如 example.com 或 a.example.com 或 1.2.3.4"),
 		}, "host"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			as := s.assetStore()
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			as := s.assetStore(s.projectOfTask(agent.RunInfoFrom(ctx).TaskID))
 			if as == nil {
 				return actool.Errorf("资产库未初始化"), nil
 			}

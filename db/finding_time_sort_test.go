@@ -10,7 +10,7 @@ import (
 
 func TestFindingGroupTimeSort(t *testing.T) {
 	d, task, ids := timeSortFixture(t)
-	other, err := d.CreateTask("newer low severity task", "goal", nil, 0, 0)
+	other, err := d.CreateTask(testProjectID(t, d), "newer low severity task", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

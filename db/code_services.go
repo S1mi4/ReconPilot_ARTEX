@@ -260,6 +260,10 @@ WHERE task_id=$1 AND version_id=$2`, taskID, version.ID, len(candidates), confir
 }
 
 func upsertCodeServiceAsset(tx *sql.Tx, taskID int64, service TaskCodeService) (int64, error) {
+	var projectID int64
+	if err := tx.QueryRow(`SELECT project_id FROM tasks WHERE id=$1`, taskID).Scan(&projectID); err != nil {
+		return 0, err
+	}
 	extra := map[string]any{
 		"task_id": taskID, "codebase_id": service.CodebaseID, "relative_path": service.RelativePath,
 		"latest_version_id": service.LatestVersionID, "present": service.LatestPresent,
@@ -270,9 +274,9 @@ func upsertCodeServiceAsset(tx *sql.Tx, taskID int64, service TaskCodeService) (
 		return 0, err
 	}
 	var id int64
-	err = tx.QueryRow(`SELECT id FROM assets WHERE type='code_service' AND extra->>'task_id'=$1
+	err = tx.QueryRow(`SELECT id FROM assets WHERE project_id=$4 AND type='code_service' AND extra->>'task_id'=$1
 AND extra->>'codebase_id'=$2 AND extra->>'relative_path'=$3 FOR UPDATE`,
-		fmt.Sprint(taskID), service.CodebaseID, service.RelativePath).Scan(&id)
+		fmt.Sprint(taskID), service.CodebaseID, service.RelativePath, projectID).Scan(&id)
 	if err == nil {
 		_, err = tx.Exec(`UPDATE assets SET service_name=$2,extra=$3,last_seen=CASE WHEN $4 THEN now() ELSE last_seen END,
 updated_at=now(),task_ids=CASE WHEN $1=ANY(task_ids) THEN task_ids ELSE array_append(task_ids,$1) END WHERE id=$5`,
@@ -285,8 +289,8 @@ updated_at=now(),task_ids=CASE WHEN $1=ANY(task_ids) THEN task_ids ELSE array_ap
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	err = tx.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],$2,$3) RETURNING id`, taskID, service.Name, string(encoded)).Scan(&id)
+	err = tx.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES($4,'code_service',ARRAY[$1]::bigint[],$2,$3) RETURNING id`, taskID, service.Name, string(encoded), projectID).Scan(&id)
 	if err != nil {
 		return 0, err
 	}

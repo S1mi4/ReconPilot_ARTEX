@@ -52,7 +52,7 @@ func TestJudgeConfigIncompleteScriptDefaultAndOverride(t *testing.T) {
 		{`,"incomplete_script_action":"model"`, "model", 200},
 		{`,"incomplete_script_action":"invalid"`, "model", 400},
 	} {
-		req := httptest.NewRequest("PUT", "/api/intercept/judge-config", strings.NewReader(`{"fail_action":"allow","ask_timeout_action":"deny","retry_count":2,"retry_interval_ms":17`+tc.option+`}`))
+		req := newReqWithProject("PUT", "/api/intercept/judge-config", strings.NewReader(`{"fail_action":"allow","ask_timeout_action":"deny","retry_count":2,"retry_interval_ms":17`+tc.option+`}`))
 		w := httptest.NewRecorder()
 		s.interceptSetJudgeConfig(w, req)
 		if w.Code != tc.code {
@@ -75,7 +75,7 @@ func TestJudgeConfigRejectsInvalidRetryBeforeSaving(t *testing.T) {
 		`"retry_interval_ms":-1`, `"retry_interval_ms":3600001`, `"retry_interval_ms":1.5`,
 	} {
 		t.Run(fields, func(t *testing.T) {
-			req := httptest.NewRequest("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"allow","ask_timeout_action":"deny",`+fields+`}`))
+			req := newReqWithProject("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"allow","ask_timeout_action":"deny",`+fields+`}`))
 			w := httptest.NewRecorder()
 			s.interceptSetJudgeConfig(w, req)
 			if w.Code != 400 {
@@ -112,14 +112,14 @@ func TestJudgeConfigRetryRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		w := httptest.NewRecorder()
-		s.interceptSetJudgeConfig(w, httptest.NewRequest("PUT", "/api/intercept/judge", strings.NewReader(string(body))))
+		s.interceptSetJudgeConfig(w, newReqWithProject("PUT", "/api/intercept/judge", strings.NewReader(string(body))))
 		if w.Code != 200 {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 		}
 		// Construct a fresh interceptor to prove persistence, rather than cache reuse.
 		s.m.interceptor = intercept.New(pg)
 		w = httptest.NewRecorder()
-		s.interceptGetJudgeConfig(w, httptest.NewRequest("GET", "/api/intercept/judge", nil))
+		s.interceptGetJudgeConfig(w, newReqWithProject("GET", "/api/intercept/judge", nil))
 		var got intercept.JudgeConfig
 		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 			t.Fatal(err)
@@ -150,18 +150,18 @@ func TestJudgeConfidenceThresholdKeepsExplicitZeroAndRejectsOutOfRange(t *testin
 	cfg.ConfidenceThreshold = 0
 	body, _ := json.Marshal(cfg)
 	w := httptest.NewRecorder()
-	s.interceptSetJudgeConfig(w, httptest.NewRequest("PUT", "/api/intercept/judge", strings.NewReader(string(body))))
+	s.interceptSetJudgeConfig(w, newReqWithProject("PUT", "/api/intercept/judge", strings.NewReader(string(body))))
 	if w.Code != 200 || s.m.interceptor.GetJudgeConfig().ConfidenceThreshold != 0 {
 		t.Fatalf("explicit zero status=%d cfg=%+v body=%s", w.Code, s.m.interceptor.GetJudgeConfig(), w.Body.String())
 	}
 	w = httptest.NewRecorder()
-	s.interceptSetJudgeConfig(w, httptest.NewRequest("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"ask","ask_timeout_action":"deny"}`)))
+	s.interceptSetJudgeConfig(w, newReqWithProject("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"ask","ask_timeout_action":"deny"}`)))
 	if w.Code != 200 || s.m.interceptor.GetJudgeConfig().ConfidenceThreshold != 0.55 {
 		t.Fatalf("missing threshold status=%d cfg=%+v body=%s", w.Code, s.m.interceptor.GetJudgeConfig(), w.Body.String())
 	}
 	for _, value := range []string{"-0.01", "1.01"} {
 		w = httptest.NewRecorder()
-		s.interceptSetJudgeConfig(w, httptest.NewRequest("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"ask","ask_timeout_action":"deny","confidence_threshold":`+value+`}`)))
+		s.interceptSetJudgeConfig(w, newReqWithProject("PUT", "/api/intercept/judge", strings.NewReader(`{"fail_action":"ask","ask_timeout_action":"deny","confidence_threshold":`+value+`}`)))
 		if w.Code != 400 {
 			t.Fatalf("threshold=%s status=%d body=%s", value, w.Code, w.Body.String())
 		}

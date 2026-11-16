@@ -17,7 +17,7 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("archive api", "verify 202", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "archive api", "verify 202", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := func(method, path, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req := newReqWithProject(method, path, strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		recorder := httptest.NewRecorder()

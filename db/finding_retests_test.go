@@ -15,7 +15,7 @@ func retestDB(t *testing.T) (*DB, int64) {
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
 	}
-	fid, err := d.AddFinding(0, 0, "retest-test", "测试漏洞", "high", "original summary", "original evidence", "worker", nil)
+	fid, err := d.AddFindingForProject(testProjectID(t, d), 0, 0, "retest-test", "测试漏洞", "high", "original summary", "original evidence", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestRetestAtomicDeduplicationAndHistory(t *testing.T) {
 	ids := make([]int64, 0, 8)
 	for range 8 {
 		wg.Go(func() {
-			r, c, created, err := d.CreateFindingRetest(t.Context(), fid, "  修复版本 v2  ")
+			r, c, created, err := d.CreateFindingRetest(t.Context(), testProjectID(t, d), fid, "  修复版本 v2  ")
 			if err != nil {
 				t.Error(err)
 				return
@@ -109,7 +109,7 @@ func TestRetestAtomicDeduplicationAndHistory(t *testing.T) {
 	if f.Status != FindingFixed || f.Evidence != "changed evidence" || f.Report != "" {
 		t.Fatal("fixed retest did not update only triage", f)
 	}
-	next, _, created, err := d.CreateFindingRetest(ctx, fid, "second")
+	next, _, created, err := d.CreateFindingRetest(ctx, testProjectID(t, d), fid, "second")
 	if err != nil || !created || next.ID == r.ID {
 		t.Fatalf("new history=%+v created=%t err=%v", next, created, err)
 	}
@@ -124,7 +124,7 @@ func TestRetestAtomicDeduplicationAndHistory(t *testing.T) {
 
 func TestRetestDeletionAndRestart(t *testing.T) {
 	d, fid := retestDB(t)
-	r, c, _, err := d.CreateFindingRetest(t.Context(), fid, "delete")
+	r, c, _, err := d.CreateFindingRetest(t.Context(), testProjectID(t, d), fid, "delete")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestRetestDeletionAndRestart(t *testing.T) {
 	if len(rows) != 1 || rows[0].ConversationID != nil || rows[0].Status != "stopped" {
 		t.Fatal(rows)
 	}
-	next, c2, created, err := d.CreateFindingRetest(t.Context(), fid, "restart")
+	next, c2, created, err := d.CreateFindingRetest(t.Context(), testProjectID(t, d), fid, "restart")
 	if err != nil || !created {
 		t.Fatal("deleted session blocks retry", err)
 	}
@@ -167,7 +167,7 @@ func TestRetestValidationAndRollback(t *testing.T) {
 	d, fid := retestDB(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, _, _, err := d.CreateFindingRetest(ctx, fid, ""); err == nil {
+	if _, _, _, err := d.CreateFindingRetest(ctx, testProjectID(t, d), fid, ""); err == nil {
 		t.Fatal("cancelled creation succeeded")
 	}
 	for _, args := range [][3]string{{"unknown", "summary", "proof"}, {"fixed", " ", "proof"}, {"fixed", "summary", ""}, {"fixed", strings.Repeat("x", 16001), "proof"}} {
@@ -175,7 +175,7 @@ func TestRetestValidationAndRollback(t *testing.T) {
 			t.Fatal("bad result accepted", args[0])
 		}
 	}
-	r, c, _, err := d.CreateFindingRetest(t.Context(), fid, "snapshot")
+	r, c, _, err := d.CreateFindingRetest(t.Context(), testProjectID(t, d), fid, "snapshot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 			if _, err := d.SetFindingStatus(fid, FindingInProgress); err != nil {
 				t.Fatal(err)
 			}
-			r, c, _, err := d.CreateFindingRetest(t.Context(), fid, "check triage")
+			r, c, _, err := d.CreateFindingRetest(t.Context(), testProjectID(t, d), fid, "check triage")
 			if err != nil {
 				t.Fatal(err)
 			}

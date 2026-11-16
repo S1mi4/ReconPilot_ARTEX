@@ -259,8 +259,12 @@ func (s *Server) syncSSRun(w http.ResponseWriter, r *http.Request) {
 	if s.pg(w) == nil {
 		return
 	}
-	as := s.assetStore()
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	as := s.assetStore(projectID)
+	cs := s.companyStore(projectID)
 	if as == nil || cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return

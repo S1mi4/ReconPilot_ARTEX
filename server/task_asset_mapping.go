@@ -46,7 +46,7 @@ func (s *Server) taskAssetMapping(w http.ResponseWriter, r *http.Request) {
 - 只展示有真实资产证据的连接；数据库节点标注可识别的数据库类型。
 
 两份结果都只能使用当前任务及其直接关联任务的真实资产数据；不要探测目标、不要修改资产库，也不要把没有证据的连接描述成已验证通路。`, taskID)
-	if as := s.m.Assets(); as != nil {
+	if as := s.m.assetsForTask(t); as != nil {
 		if graph, err := as.BuildCoverageGraph(taskID, t.ExpID); err == nil {
 			type nodeSample struct {
 				Key, Kind, Label, Domain, IP, Zone, ZoneReason string
@@ -79,7 +79,7 @@ func (s *Server) taskAssetMapping(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	title := fmt.Sprintf("资产与网络梳理 · 任务 #%d", taskID)
-	conversation, err := s.m.pg.CreateConversation("asset_mapper", title, nil)
+	conversation, err := s.m.pg.CreateConversation(t.ProjectID, "asset_mapper", title, nil)
 	if err != nil || conversation == nil {
 		writeErr(w, http.StatusInternalServerError, "创建拓扑梳理会话失败")
 		return
@@ -106,7 +106,7 @@ func (s *Server) taskAssetMappingStatus(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	conversations, err := s.m.pg.ListConversations()
+	conversations, err := s.m.pg.ListConversations(t.ProjectID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

@@ -18,7 +18,7 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	s := &Server{m: m}
 	s.seed(task, "https://"+host)
 	taskID := mustTaskID(t, task.ID)
-	assets, err := m.Assets().QueryByTask(taskID, "", 20, 0)
+	assets, err := m.Assets(testProjectID(t, m)).QueryByTask(taskID, "", 20, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestStageTaskFilesRollbackRestoresWorkspaceAndTranscripts(t *testing.T) {
 		createDeleteFixture(t, dataDir, path, false)
 	}
 
-	stage, err := stageTaskFiles(dataDir, "77", 12)
+	stage, err := stageTaskFiles(dataDir, "77", filepath.Join(dataDir, "tasks", "77"), filepath.Join(dataDir, "transcripts"), 12)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestStageTaskFilesRollbackReportsRestoreFailure(t *testing.T) {
 	workspace := filepath.Join(dataDir, "tasks", "77")
 	createDeleteFixture(t, dataDir, filepath.Join("tasks", "77"), true)
 
-	stage, err := stageTaskFiles(dataDir, "77", 12)
+	stage, err := stageTaskFiles(dataDir, "77", filepath.Join(dataDir, "tasks", "77"), filepath.Join(dataDir, "transcripts"), 12)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *test
 	}
 	t.Cleanup(func() { _ = m.Close() })
 
-	task, err := m.CreateTask("delete rollback", "delete rollback", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "delete rollback", "delete rollback", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,12 +193,15 @@ func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *test
 	t.Cleanup(cleanupDB)
 
 	host := fmt.Sprintf("delete-rollback-%d.example.test", taskID)
-	if _, err := m.Assets().UpsertHTTPService(pgdb.UpsertHTTPServiceReq{URL: "https://" + host, TaskID: taskID}); err != nil {
+	if _, err := m.Assets(testProjectID(t, m)).UpsertHTTPService(pgdb.UpsertHTTPServiceReq{URL: "https://" + host, TaskID: taskID}); err != nil {
 		t.Fatal(err)
 	}
-	createDeleteFixture(t, dataDir, filepath.Join("tasks", task.ID), true)
-	transcriptPath := filepath.Join(dataDir, "transcripts", fmt.Sprintf("exp%d-main.jsonl", task.ExpID))
-	createDeleteFixture(t, dataDir, filepath.Join("transcripts", filepath.Base(transcriptPath)), false)
+	// 任务文件与转录都在项目目录下（见 taskDataDir / transcriptDir）。
+	taskDir := m.taskDataDir(testProjectID(t, m), taskID)
+	createDeleteFixture(t, taskDir, "", true)
+	transcriptDir := filepath.Join(m.projectDataDir(testProjectID(t, m)), "transcripts")
+	transcriptPath := filepath.Join(transcriptDir, fmt.Sprintf("exp%d-main.jsonl", task.ExpID))
+	createDeleteFixture(t, transcriptDir, filepath.Base(transcriptPath), false)
 
 	tr, err := traffic.Open(filepath.Join(dataDir, "traffic"), "127.0.0.1:0")
 	if err != nil {
@@ -234,7 +237,7 @@ FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, fun
 	if got, err := m.pg.GetTask(taskID); err != nil || got == nil {
 		t.Fatalf("task row was lost after failed delete: task=%+v err=%v", got, err)
 	}
-	assertPathExists(t, filepath.Join(dataDir, "tasks", task.ID))
+	assertPathExists(t, taskDir)
 	assertPathExists(t, transcriptPath)
 	if got, err := os.ReadFile(trafficMarker); err != nil || string(got) != "original traffic" {
 		t.Fatalf("traffic tree was not restored: content=%q err=%v", got, err)

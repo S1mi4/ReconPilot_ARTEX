@@ -841,7 +841,7 @@ func (s *Server) loadTaskCodeAuditCodebase(ctx context.Context, taskID int64, se
 		TaskID: taskID, ScopePath: scope, ByPath: map[string]taskCodeAuditFile{},
 		ProvenanceByPath: map[string]taskCodeAuditProvenanceLocation{}, ArtifactName: version.Name, ArtifactFormat: version.Format,
 	}
-	contents := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), version.ID, "contents")
+	contents := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), version.ID, "contents")
 	serviceRel := service.RelativePath
 	if serviceRel != "." {
 		if _, err := safeTaskCodebasePath(serviceRel); err != nil {

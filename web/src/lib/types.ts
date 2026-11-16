@@ -618,6 +618,9 @@ export interface CodeAuditFindingEvidence {
   review: CodeAuditReviewEvidence;
 }
 
+export type VerifyLevel = "unknown" | "minimal" | "standard" | "theoretical";
+export type ImpactObserved = "none" | "read" | "write" | "exec";
+
 export interface Finding {
   case_id?: string;
   traffic_count?: number;
@@ -630,6 +633,10 @@ export interface Finding {
   name?: string; // 漏洞名称;为空时展示回退到 vulnclass
   severity: Severity;
   status: FindingStatus;
+  // verify_level 记录这条漏洞是怎么被证实的；impact_observed 记录验证过程对目标
+  // 实际做了什么。历史数据是 unknown/none，不代表"没有影响"，只代表"没有记录"。
+  verify_level?: VerifyLevel;
+  impact_observed?: ImpactObserved;
   summary: string;
   evidence: string;
   code_audit_evidence?: CodeAuditFindingEvidence;
@@ -643,6 +650,46 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
+}
+
+// 利用扩展提案（agent 提出、人审）。status 是状态机：
+// proposed → approved（带窗口）→ running → executed/failed；approved 可 cancel，
+// 过窗口自动 expired；rejected = 只保留理论，不执行。
+export type EscalationStatus =
+  | "proposed"
+  | "approved"
+  | "rejected"
+  | "running"
+  | "executed"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export interface FindingEscalation {
+  id: string;
+  project_id: string;
+  finding_id: string;
+  task_id?: string;
+  level: "L2" | "L3";
+  title: string;
+  objective: string;
+  preconditions: string[];
+  steps: string;
+  expected_impact: string;
+  blast_radius: string;
+  stop_conditions: string[];
+  rollback_plan: string;
+  alternative: string;
+  proposed_by: string;
+  status: EscalationStatus;
+  decided_by: string;
+  decided_at?: string;
+  decision_note: string;
+  expires_at?: string;
+  run_id?: string;
+  impact_observed: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -1363,6 +1410,27 @@ export interface PromptVar {
   description: string;
   example: string;
   source: "exploration" | "runtime" | "distilled";
+}
+
+/**
+ * 项目是最高级分层：项目 ⊃ 企业 ⊃ 任务。
+ * status=archived 时数据仍可读，但不能新建任务或启动工作。
+ */
+export interface Project {
+  id: number;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  archived_at?: string;
+  deleted_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectStats {
+  assets: number;
+  tasks: number;
+  findings: number;
 }
 
 export interface PromptVersion {

@@ -37,7 +37,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM intercept_pending WHERE id=$1`, id) })
 	do := func(method, path, body string, authenticated bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req := newReqWithProject(method, path, strings.NewReader(body))
 		if authenticated {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -65,7 +65,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 		}
 	}
 
-	conv, err := d.CreateConversation("test", "approval navigation", nil)
+	conv, err := d.CreateConversation(testProjectID(t, d), "test", "approval navigation", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

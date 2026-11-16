@@ -21,17 +21,18 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteProfile(profileID) })
-	source, err := d.CreateTask(fmt.Sprintf("bulk-list-source-%d", stamp), "goal", nil, 0, 0)
+	source, err := d.CreateTask(testProjectID(t, d), fmt.Sprintf("bulk-list-source-%d", stamp), "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(source.ID) })
-	companyID, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Bulk List Company %d", stamp), "")
+	companyID, _, err := d.Companies(testProjectID(t, d)).UpsertCompany(fmt.Sprintf("Bulk List Company %d", stamp), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.Companies().DeleteCompany(companyID) })
+	t.Cleanup(func() { _ = d.Companies(testProjectID(t, d)).DeleteCompany(companyID) })
 	child, err := d.CreateTaskWithOptions("bulk-list-child", "goal", TaskCreateOptions{
+		ProjectID:     testProjectID(t, d),
 		LLMProfileIDs: []int64{profileID},
 		SourceTaskIDs: []int64{source.ID},
 		CompanyIDs:    []int64{companyID},
@@ -74,7 +75,7 @@ func TestTaskListMetricsAll(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("task-list-metrics", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "task-list-metrics", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,6 +34,7 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	projectID   int64                  // 拦截规则是项目内配置，Guard 绑定到所属项目
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -42,6 +43,13 @@ func New() *Guard { return newGuard(nil) }
 
 // NewWithInterceptor creates a Guard with user-configured intercept rules.
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
+
+// WithProject binds the guard to one project. Without it the guard evaluates no
+// intercept rules at all — 项目是最高级分层，没有项目的调用没有规则可评。
+func (g *Guard) WithProject(projectID int64) *Guard {
+	g.projectID = projectID
+	return g
+}
 
 func newGuard(ic *intercept.Interceptor) *Guard {
 	g := &Guard{attrib: map[string]int{}, interceptor: ic}
@@ -84,11 +92,11 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
 	}
-	if !g.interceptor.IsToolEnabled(ev.ToolName) {
+	if g.projectID == 0 || !g.interceptor.IsToolEnabled(g.projectID, ev.ToolName) {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	dec, matched := g.interceptor.Match(g.projectID, ev.ToolName, ev.Input)
 	if !matched {
 		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
 		// or unwired, keep current behavior and allow.

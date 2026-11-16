@@ -18,12 +18,14 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 	}
 	defer m.Close()
 
-	source, err := m.CreateTaskWithOptions("detail source", "source goal", db.TaskCreateOptions{})
+	source, err := m.CreateTaskWithOptions("detail source", "source goal", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, m)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sourceID := mustTaskID(t, source.ID)
-	current, err := m.CreateTaskWithOptions("detail current", "current goal", db.TaskCreateOptions{SourceTaskIDs: []int64{sourceID}})
+	current, err := m.CreateTaskWithOptions("detail current", "current goal", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, m), SourceTaskIDs: []int64{sourceID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +60,7 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetchDetail := func(stepID int64) string {
-		req := httptest.NewRequest(http.MethodGet,
+		req := newReqWithProject(http.MethodGet,
 			fmt.Sprintf("/api/exploration/activity/%d?task=%s", stepID, current.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()

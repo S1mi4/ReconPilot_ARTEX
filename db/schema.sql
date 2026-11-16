@@ -27,7 +27,9 @@ $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 CREATE TABLE IF NOT EXISTS companies (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    nkey       TEXT NOT NULL UNIQUE,
+    -- 唯一性在「项目」内生效，见 §Z 的 uq_companies_project_nkey；存量库的全局
+    -- companies_nkey_key 约束在 §Z 里显式 drop。
+    nkey       TEXT NOT NULL,
     logo       TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -95,18 +97,9 @@ BEGIN
         ));
     END IF;
 END $$;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_root_domain  ON assets(domain) WHERE type = 'root_domain';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_ip           ON assets(ip)     WHERE type = 'ip';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_subdomain    ON assets(domain, COALESCE(record_type,'')) WHERE type = 'subdomain';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_app_bundle   ON assets(bundle_id) WHERE type = 'app' AND bundle_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_app_name     ON assets(app_name)  WHERE type = 'app' AND bundle_id IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_http ON assets(url) WHERE type = 'service' AND service_type = 'http';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_other
-    ON assets(COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE type = 'service' AND service_type = 'other';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_endpoint     ON assets(url, method) WHERE type = 'endpoint';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_code_service_identity
-    ON assets ((extra->>'task_id'), (extra->>'codebase_id'), (extra->>'relative_path'))
-    WHERE type = 'code_service';
+-- 资产身份在「项目」内唯一：同一域名/IP/URL 允许在不同项目各存一条。全部唯一
+-- 索引都下移到文件末尾的 §Z 项目层创建——那里 project_id 列刚加上且回填已完成。
+-- 此处只保留非唯一索引。
 CREATE INDEX IF NOT EXISTS idx_av2_company      ON assets(company_id)       WHERE company_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_av2_company_type ON assets(company_id, type) WHERE company_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_av2_task_ids     ON assets USING GIN(task_ids);
@@ -511,7 +504,8 @@ CREATE TABLE IF NOT EXISTS llm_profile_health (
 CREATE TABLE IF NOT EXISTS task_categories (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    nkey       TEXT NOT NULL UNIQUE,
+    -- 分类按项目隔离；唯一性在 (project_id, nkey)，见 §Z。
+    nkey       TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1313,6 +1307,12 @@ CREATE TABLE IF NOT EXISTS findings (
     code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
     worker      TEXT NOT NULL DEFAULT '',
     asset_ids   JSONB NOT NULL DEFAULT '[]',
+    -- 验证尺度：为了证明它存在花了多大力气（unknown=历史数据，未记录过）。
+    verify_level    TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (verify_level IN ('unknown','minimal','standard','theoretical')),
+    -- 验证过程实际对目标做了什么（none=只观察，没有造成任何变化）。
+    impact_observed TEXT NOT NULL DEFAULT 'none'
+                    CHECK (impact_observed IN ('none','read','write','exec')),
     -- 处置状态：pending 待处理 / in_progress 处理中 / confirmed 已确认 / resolved 已处理 / fixed 已修复 /
     -- false_positive 误报 / ignored 忽略 / duplicate 重复 / risk_accepted 风险接受。
     -- 取值不加 CHECK：旧库靠下面的 ALTER 补列,CHECK 无法回填,统一由 server 侧白名单校验。
@@ -1327,6 +1327,9 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_audit_evidence JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- 补旧库:验证尺度/实际影响。老行没有记录过,默认 unknown/none(不臆测成 minimal)。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verify_level    TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact_observed TEXT NOT NULL DEFAULT 'none';
 -- White-box findings are deduplicated by a stable service/source/sink identity in
 -- the application. A candidate key includes line coordinates and changes across
 -- versions, so it must not be a uniqueness constraint on the long-lived Finding.
@@ -1798,3 +1801,296 @@ CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USI
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.
 ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
+
+-- =====================================================================
+-- §Z. 项目层（最高级分层）
+-- ---------------------------------------------------------------------
+-- 「项目」是最高级隔离边界：项目 ⊃ 企业 ⊃ 任务。所有内容表通过 project_id
+-- 直接归属，或经由 tasks / explorations / conversations 的既有外键传递归属。
+--
+-- 本节放在文件末尾，原因是它必须 ALTER 前面已经建好的表。schema.sql 每次启动
+-- 整体重放，所以这里的每条语句都必须幂等：
+--   · 建表/加列/建索引  → IF NOT EXISTS
+--   · 唯一索引迁移      → DROP IF EXISTS 旧索引 + CREATE 新索引
+--   · 一次性数据回填    → 由 schema_state.backfill_done_at 闸门保护
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS projects (
+    id              BIGSERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    -- 展示名允许重复，nkey 在项目内唯一（实际上 nkey 全局唯一，见下方索引）。
+    nkey            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active','archived')),
+    archived_at     TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    -- 内置拦截/资产拦截规则是否已灌入本项目。每个项目一份可编辑副本，
+    -- 不再有「全局规则」这种跨项目共享，详见 db/project_rules.go。
+    rules_seeded_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS rules_seeded_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_projects_nkey ON projects(nkey);
+CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE deleted_at IS NULL;
+DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
+CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 利用扩展提案：agent 想「扩大影响」时只产出提案，绝不自己执行。人工在漏洞详情页
+-- 审核批准后，才由受控执行器单独跑一次（见 docs/利用安全整改方案.md §5/§6）。
+-- 刻意把"理论步骤"和"审批结论"分开存：步骤是 agent 写的，status/decided_by 只有人能写。
+CREATE TABLE IF NOT EXISTS finding_escalations (
+    id                BIGSERIAL PRIMARY KEY,
+    project_id        BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    finding_id        BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    task_id           BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    -- L2=受限读取(批量/非最小), L3=写目标/命令执行/持久化/提权/横向/删数据。
+    -- L1 只影响自建对象，允许自动执行，不需要提案。
+    level             TEXT NOT NULL CHECK (level IN ('L2','L3')),
+    title             TEXT NOT NULL,
+    objective         TEXT NOT NULL DEFAULT '',
+    preconditions     TEXT[] NOT NULL DEFAULT '{}',
+    -- 理论操作步骤(Markdown)。只描述、不执行。
+    steps             TEXT NOT NULL,
+    expected_impact   TEXT NOT NULL DEFAULT '',
+    blast_radius      TEXT NOT NULL DEFAULT '',
+    stop_conditions   TEXT[] NOT NULL DEFAULT '{}',
+    rollback_plan     TEXT NOT NULL DEFAULT '',
+    alternative       TEXT NOT NULL DEFAULT '',
+    proposed_by       TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('proposed','approved','rejected','running','executed','failed','cancelled','expired')),
+    decided_by        TEXT NOT NULL DEFAULT '',
+    decided_at        TIMESTAMPTZ,
+    decision_note     TEXT NOT NULL DEFAULT '',
+    -- 批准时写下的执行窗口终点；过期的批准既不能再执行，也不该继续假装有效。
+    expires_at        TIMESTAMPTZ,
+    run_id            BIGINT,
+    impact_observed   TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_escalations_finding ON finding_escalations(finding_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_finding_escalations_project ON finding_escalations(project_id, status, created_at DESC);
+-- 同一漏洞同一等级只允许一条待审提案：避免 agent 反复提同一件事把审批列表刷满。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_finding_escalations_pending
+    ON finding_escalations(finding_id, level) WHERE status = 'proposed';
+
+-- 项目级 LLM 白名单：空集合 = 全部 LLM 配置可用（向后兼容）。
+CREATE TABLE IF NOT EXISTS project_llm_profiles (
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    profile_id BIGINT NOT NULL REFERENCES llm_profiles(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (project_id, profile_id)
+);
+
+-- 迁移状态。DDL 仍靠幂等重放，这张表只记录「一次性回填已完成」这一事实，
+-- 避免每次启动重复扫全库。单行约束由 CHECK(id=1) 保证。
+CREATE TABLE IF NOT EXISTS schema_state (
+    id               INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    build            TEXT NOT NULL DEFAULT '',
+    backfill_done_at TIMESTAMPTZ,
+    notes            TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO schema_state(id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- 顶层内容表：先加可空列，回填完成后再置 NOT NULL（见下方 DO 块）。
+ALTER TABLE companies                 ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE assets                    ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE company_scope             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE tasks                     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_categories           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE conversations             ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_schedules            ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE intercept_rules           ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE asset_intercept_rules     ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE traffic_evidence_snapshots ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+-- 发现也直接带项目：发现通常来自任务（→ 任务的项目），但任务被物理删除后任务
+-- 关系会置空，发现本身仍要留在它原来的项目里。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id, created_at DESC);
+-- 项目删除=保留期到点后的物理清理，所以项目外键按 CASCADE 建；存量库在这里重建约束。
+ALTER TABLE companies DROP CONSTRAINT IF EXISTS companies_project_id_fkey;
+ALTER TABLE companies ADD CONSTRAINT companies_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_project_id_fkey;
+ALTER TABLE assets ADD CONSTRAINT assets_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS company_scope_project_id_fkey;
+ALTER TABLE company_scope ADD CONSTRAINT company_scope_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
+ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_categories DROP CONSTRAINT IF EXISTS task_categories_project_id_fkey;
+ALTER TABLE task_categories ADD CONSTRAINT task_categories_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_project_id_fkey;
+ALTER TABLE conversations ADD CONSTRAINT conversations_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE task_schedules DROP CONSTRAINT IF EXISTS task_schedules_project_id_fkey;
+ALTER TABLE task_schedules ADD CONSTRAINT task_schedules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_project_id_fkey;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE asset_intercept_rules DROP CONSTRAINT IF EXISTS asset_intercept_rules_project_id_fkey;
+ALTER TABLE asset_intercept_rules ADD CONSTRAINT asset_intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE traffic_evidence_snapshots DROP CONSTRAINT IF EXISTS traffic_evidence_snapshots_project_id_fkey;
+ALTER TABLE traffic_evidence_snapshots ADD CONSTRAINT traffic_evidence_snapshots_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+
+-- share_global_assets 在项目模型下语义变为「项目内共享」，见 db/task_assets_context.go。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS share_project_assets BOOLEAN NOT NULL DEFAULT false;
+
+-- 一次性回填：把升级前的全部存量数据收进「默认项目」。
+-- 新装库没有存量数据时不建默认项目，由 UI 引导用户创建第一个项目。
+DO $$
+DECLARE
+    pid      BIGINT;
+    has_data BOOLEAN;
+BEGIN
+    IF (SELECT backfill_done_at FROM schema_state WHERE id = 1) IS NULL THEN
+        SELECT EXISTS (
+            SELECT 1 FROM companies
+            UNION ALL SELECT 1 FROM assets
+            UNION ALL SELECT 1 FROM company_scope
+            UNION ALL SELECT 1 FROM tasks
+            UNION ALL SELECT 1 FROM task_categories
+            UNION ALL SELECT 1 FROM conversations
+            UNION ALL SELECT 1 FROM task_schedules
+            UNION ALL SELECT 1 FROM intercept_rules
+            UNION ALL SELECT 1 FROM asset_intercept_rules
+            UNION ALL SELECT 1 FROM traffic_evidence_snapshots
+        ) INTO has_data;
+
+        IF has_data THEN
+            INSERT INTO projects(name, nkey, description)
+            VALUES ('默认项目', 'default', '首次升级时自动创建，收纳升级前的全部数据')
+            ON CONFLICT (nkey) DO NOTHING;
+            SELECT id INTO pid FROM projects WHERE nkey = 'default';
+
+            UPDATE companies                  SET project_id = pid WHERE project_id IS NULL;
+            UPDATE assets                     SET project_id = pid WHERE project_id IS NULL;
+            UPDATE company_scope              SET project_id = pid WHERE project_id IS NULL;
+            UPDATE tasks                      SET project_id = pid WHERE project_id IS NULL;
+            UPDATE task_categories            SET project_id = pid WHERE project_id IS NULL;
+            UPDATE conversations              SET project_id = pid WHERE project_id IS NULL;
+            UPDATE task_schedules             SET project_id = pid WHERE project_id IS NULL;
+            UPDATE intercept_rules            SET project_id = pid WHERE project_id IS NULL;
+            UPDATE asset_intercept_rules      SET project_id = pid WHERE project_id IS NULL;
+            UPDATE traffic_evidence_snapshots SET project_id = pid WHERE project_id IS NULL;
+            -- 升级前的任务共享开关即「跨任务共享」，迁移后等价于项目内共享。
+            UPDATE tasks SET share_project_assets = share_global_assets;
+        END IF;
+
+        UPDATE schema_state
+           SET backfill_done_at = now(),
+               build = 'project-isolation-1',
+               notes = CASE WHEN has_data THEN '存量数据已归入默认项目' ELSE '空库，未创建默认项目' END
+         WHERE id = 1;
+    END IF;
+END $$;
+
+-- 回填完成后收紧为 NOT NULL。任何一行没有归属都直接拒绝启动，而不是静默留 NULL。
+DO $$
+DECLARE
+    tbl       TEXT;
+    remaining BIGINT;
+BEGIN
+    FOREACH tbl IN ARRAY ARRAY[
+        'companies','assets','company_scope','tasks','task_categories',
+        'conversations','task_schedules','intercept_rules',
+        'asset_intercept_rules','traffic_evidence_snapshots'
+    ] LOOP
+        EXECUTE format('SELECT count(*) FROM %I WHERE project_id IS NULL', tbl) INTO remaining;
+        IF remaining > 0 THEN
+            RAISE EXCEPTION '项目隔离迁移未完成：% 仍有 % 行 project_id 为空，拒绝置 NOT NULL', tbl, remaining;
+        END IF;
+        EXECUTE format('ALTER TABLE %I ALTER COLUMN project_id SET NOT NULL', tbl);
+    END LOOP;
+END $$;
+
+-- 发现的归属从任务继承。必须放在上面「存量数据归入默认项目」之后：任务一旦有了
+-- 项目，发现才有可继承的项目。
+UPDATE findings f SET project_id = t.project_id
+  FROM tasks t
+ WHERE t.id = f.task_id AND f.project_id IS NULL AND t.project_id IS NOT NULL;
+-- 任务早已被物理删除的老发现没有可继承的项目，作为升级前的存量归入默认项目，
+-- 而不是让它们从所有视图里悄悄消失（默认项目本来就收纳升级前的全部数据）。
+UPDATE findings SET project_id = (SELECT id FROM projects WHERE nkey = 'default')
+ WHERE project_id IS NULL
+   AND EXISTS (SELECT 1 FROM projects WHERE nkey = 'default');
+
+-- 唯一性迁移：全局唯一 → 项目内唯一。
+-- 同一域名/企业名/分类名允许在不同项目各存一份。先 DROP 旧索引（存量库存在），
+-- 再建带 project_id 的新索引；DROP IF EXISTS 在索引已不存在时是空操作。
+ALTER TABLE companies       DROP CONSTRAINT IF EXISTS companies_nkey_key;
+ALTER TABLE task_categories DROP CONSTRAINT IF EXISTS task_categories_nkey_key;
+
+DROP INDEX IF EXISTS uq_av2_root_domain;
+DROP INDEX IF EXISTS uq_av2_ip;
+DROP INDEX IF EXISTS uq_av2_subdomain;
+DROP INDEX IF EXISTS uq_av2_app_bundle;
+DROP INDEX IF EXISTS uq_av2_app_name;
+DROP INDEX IF EXISTS uq_av2_service_http;
+DROP INDEX IF EXISTS uq_av2_service_other;
+DROP INDEX IF EXISTS uq_av2_endpoint;
+DROP INDEX IF EXISTS uq_av2_code_service_identity;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_root_domain
+    ON assets(project_id, domain) WHERE type = 'root_domain';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_ip
+    ON assets(project_id, ip) WHERE type = 'ip';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_subdomain
+    ON assets(project_id, domain, COALESCE(record_type,'')) WHERE type = 'subdomain';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_app_bundle
+    ON assets(project_id, bundle_id) WHERE type = 'app' AND bundle_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_app_name
+    ON assets(project_id, app_name) WHERE type = 'app' AND bundle_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_http
+    ON assets(project_id, url) WHERE type = 'service' AND service_type = 'http';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_other
+    ON assets(project_id, COALESCE(domain,''), COALESCE(ip,''), port, service_name)
+    WHERE type = 'service' AND service_type = 'other';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_endpoint
+    ON assets(project_id, url, method) WHERE type = 'endpoint';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_code_service_identity
+    ON assets(project_id, (extra->>'task_id'), (extra->>'codebase_id'), (extra->>'relative_path'))
+    WHERE type = 'code_service';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_project_nkey ON companies(project_id, nkey);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_categories_project_nkey ON task_categories(project_id, nkey);
+
+-- 项目维度的常用检索索引。
+CREATE INDEX IF NOT EXISTS idx_assets_project             ON assets(project_id, type, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_project              ON tasks(project_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_project      ON conversations(project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_companies_project          ON companies(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_categories_project    ON task_categories(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_schedules_project     ON task_schedules(project_id);
+CREATE INDEX IF NOT EXISTS idx_intercept_rules_project    ON intercept_rules(project_id, priority DESC, id);
+CREATE INDEX IF NOT EXISTS idx_asset_intercept_project    ON asset_intercept_rules(project_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_av2_snapshots_project      ON traffic_evidence_snapshots(project_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_company_scope_project      ON company_scope(project_id);
+
+-- 资产↔任务关联的项目一致性兜底：一次 UPDATE assets SET task_ids=... 不得把资产
+-- 关联到别的项目的任务。越界关联直接丢弃并告警（而不是让整条语句失败把引擎打断）。
+CREATE OR REPLACE FUNCTION sync_task_asset_links() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)
+    SELECT task.id, NEW.id, 'system', '任务执行期间自动关联'
+    FROM unnest(NEW.task_ids) AS requested(task_id)
+    JOIN tasks task ON task.id = requested.task_id AND task.deleted_at IS NULL
+    WHERE task.project_id = NEW.project_id
+    ON CONFLICT (task_id, asset_id) DO NOTHING;
+
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(NEW.task_ids) AS requested(task_id)
+        JOIN tasks task ON task.id = requested.task_id
+        WHERE task.project_id <> NEW.project_id
+    ) THEN
+        RAISE WARNING '项目隔离：资产 % 属于项目 %，task_ids 中出现其他项目的任务，已忽略',
+            NEW.id, NEW.project_id;
+    END IF;
+
+    DELETE FROM task_asset_links link
+    WHERE link.asset_id = NEW.id
+      AND NOT (link.task_id = ANY(NEW.task_ids));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;

@@ -27,7 +27,7 @@ func repeaterTestSend(t *testing.T, s *Server, payload any) (int, repeaterSendRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := httptest.NewRequest(http.MethodPost, "/api/repeater/send", bytes.NewReader(raw))
+	r := newReqWithProject(http.MethodPost, "/api/repeater/send", bytes.NewReader(raw))
 	w := httptest.NewRecorder()
 	s.sendRepeater(w, r)
 	var out repeaterSendResponse
@@ -49,7 +49,7 @@ func TestRepeaterRejectsInvalidInput(t *testing.T) {
 		{"unknown method", `{"method":"TRACE","url":"http://example.test/"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, "/api/repeater/send", strings.NewReader(tc.body))
+			r := newReqWithProject(http.MethodPost, "/api/repeater/send", strings.NewReader(tc.body))
 			w := httptest.NewRecorder()
 			s.sendRepeater(w, r)
 			if w.Code != http.StatusBadRequest {
@@ -320,7 +320,7 @@ func TestRepeaterProxyTransportConstruction(t *testing.T) {
 		if tr == nil || tr.Proxy == nil {
 			t.Fatalf("%s proxy transport not configured: %#v", scheme, tr)
 		}
-		proxyURL, err := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://target.example/", nil))
+		proxyURL, err := tr.Proxy(newReqWithProject(http.MethodGet, "https://target.example/", nil))
 		if err != nil || proxyURL == nil || proxyURL.Scheme != scheme || proxyURL.Host != "127.0.0.1:1080" {
 			t.Fatalf("%s proxy URL = %#v, err=%v", scheme, proxyURL, err)
 		}
@@ -340,7 +340,7 @@ func TestRepeaterProxyTransportConstruction(t *testing.T) {
 	if tr == nil || tr.Proxy == nil {
 		t.Fatal("global SOCKS5 proxy was not configured")
 	}
-	proxyURL, err := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://target.example/", nil))
+	proxyURL, err := tr.Proxy(newReqWithProject(http.MethodGet, "https://target.example/", nil))
 	if err != nil || proxyURL == nil || proxyURL.Scheme != "socks5" {
 		t.Fatalf("global proxy URL = %#v, err=%v", proxyURL, err)
 	}
@@ -359,7 +359,7 @@ func TestRepeaterProxyTransportConstruction(t *testing.T) {
 	if tr == nil || tr.Proxy == nil {
 		t.Fatal("recording proxy was not configured")
 	}
-	proxyURL, err = tr.Proxy(httptest.NewRequest(http.MethodGet, "https://target.example/", nil))
+	proxyURL, err = tr.Proxy(newReqWithProject(http.MethodGet, "https://target.example/", nil))
 	if err != nil || proxyURL == nil || proxyURL.Scheme != "http" || proxyURL.Host != "127.0.0.1:18788" {
 		t.Fatalf("recording proxy URL = %#v, err=%v", proxyURL, err)
 	}

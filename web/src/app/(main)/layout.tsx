@@ -17,6 +17,8 @@ import { PREFERENCE_DEFAULTS } from "@/lib/preferences/preferences-config";
 import { cn } from "@/lib/utils";
 
 import { MainContent } from "./_components/main-content";
+import { ProjectGate } from "./_components/project-gate";
+import { ProjectProvider } from "./_components/project-provider";
 
 // Reads a layout-critical preference from the browser cookie (falls back to the
 // default during static-export prerender where document is unavailable). Kept
@@ -60,27 +62,31 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
   if (!authed) return null;
 
   return (
-    <SidebarProvider
-      defaultOpen={defaultOpen}
-      style={
-        {
-          "--sidebar-width": "calc(var(--spacing) * 68)",
-        } as React.CSSProperties
-      }
-    >
-      <AppSidebar variant={variant} collapsible={collapsible} />
-      <SidebarInset
-        className={cn(
-          "[html[data-content-layout=centered]_&>*]:mx-auto",
-          "[html[data-content-layout=centered]_&>*]:w-full",
-          "[html[data-content-layout=centered]_&>*]:max-w-screen-2xl",
-          "peer-data-[variant=inset]:border",
-          "[--dashboard-header-height:--spacing(12)]",
-          "min-w-0 overflow-x-hidden",
-        )}
-      >
-        <MainContent>{children}</MainContent>
-      </SidebarInset>
-    </SidebarProvider>
+    <ProjectProvider>
+      <ProjectGate>
+        <SidebarProvider
+          defaultOpen={defaultOpen}
+          style={
+            {
+              "--sidebar-width": "calc(var(--spacing) * 68)",
+            } as React.CSSProperties
+          }
+        >
+          <AppSidebar variant={variant} collapsible={collapsible} />
+          <SidebarInset
+            className={cn(
+              "[html[data-content-layout=centered]_&>*]:mx-auto",
+              "[html[data-content-layout=centered]_&>*]:w-full",
+              "[html[data-content-layout=centered]_&>*]:max-w-screen-2xl",
+              "peer-data-[variant=inset]:border",
+              "[--dashboard-header-height:--spacing(12)]",
+              "min-w-0 overflow-x-hidden",
+            )}
+          >
+            <MainContent>{children}</MainContent>
+          </SidebarInset>
+        </SidebarProvider>
+      </ProjectGate>
+    </ProjectProvider>
   );
 }

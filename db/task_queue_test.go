@@ -12,7 +12,7 @@ func TestTaskQueuePreservesBootstrapAndFIFOPosition(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("queue metadata", "keep first-run mode", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "queue metadata", "keep first-run mode", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

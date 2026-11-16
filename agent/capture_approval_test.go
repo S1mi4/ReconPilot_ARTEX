@@ -55,7 +55,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 			ic.SetReviewer(func(context.Context, int64, string, intercept.ReviewInput) (intercept.Decision, error) {
 				return intercept.Decision{Action: tc.action, Message: "probe review", ProfileID: 7}, nil
 			})
-			g := guard.NewWithInterceptor(ic)
+			g := guard.NewWithInterceptor(ic).WithProject(testProjectID(t, d))
 			taskID := "approval-lifecycle-" + tc.name
 			t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id=$1`, taskID) })
 			ctx := intercept.WithTaskContext(t.Context(), taskID, "test-agent", func(a db.Activity) {

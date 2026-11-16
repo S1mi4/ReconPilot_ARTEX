@@ -9,7 +9,7 @@ import (
 
 func TestSystemMetricsReturnsContainerAndDiskValues(t *testing.T) {
 	s := &Server{dataDir: t.TempDir()}
-	r := httptest.NewRequest("GET", "/api/system/metrics", nil)
+	r := newReqWithProject("GET", "/api/system/metrics", nil)
 	w := httptest.NewRecorder()
 	s.systemMetrics(w, r)
 	if w.Code != 200 {

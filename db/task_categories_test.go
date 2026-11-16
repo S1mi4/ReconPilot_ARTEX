@@ -16,18 +16,19 @@ func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 	defer d.Close()
 
 	name := fmt.Sprintf("Category %d", time.Now().UnixNano())
-	category, err := d.CreateTaskCategory("  " + strings.ReplaceAll(name, " ", "   ") + "  ")
+	category, err := d.CreateTaskCategory(testProjectID(t, d), "  " + strings.ReplaceAll(name, " ", "   ") + "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if category.Name != name {
 		t.Fatalf("category name=%q, want %q", category.Name, name)
 	}
-	if _, err := d.CreateTaskCategory(strings.ToUpper(name)); !errors.Is(err, ErrTaskCategoryNameConflict) {
+	if _, err := d.CreateTaskCategory(testProjectID(t, d), strings.ToUpper(name)); !errors.Is(err, ErrTaskCategoryNameConflict) {
 		t.Fatalf("duplicate error=%v, want %v", err, ErrTaskCategoryNameConflict)
 	}
 
-	task, err := d.CreateTaskWithOptions("categorized task", "goal", TaskCreateOptions{CategoryID: &category.ID})
+	task, err := d.CreateTaskWithOptions("categorized task", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), CategoryID: &category.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,8 @@ func TestCreateTaskRejectsMissingCategoryAtomically(t *testing.T) {
 
 	missing := int64(1 << 62)
 	description := fmt.Sprintf("missing-category-%d", time.Now().UnixNano())
-	if _, err := d.CreateTaskWithOptions(description, "goal", TaskCreateOptions{CategoryID: &missing}); !errors.Is(err, ErrTaskCategoryNotFound) {
+	if _, err := d.CreateTaskWithOptions(description, "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), CategoryID: &missing}); !errors.Is(err, ErrTaskCategoryNotFound) {
 		t.Fatalf("create error=%v, want %v", err, ErrTaskCategoryNotFound)
 	}
 	var count int
@@ -98,7 +100,7 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 	defer d.Close()
 
 	stamp := time.Now().UnixNano()
-	category, err := d.CreateTaskCategory(fmt.Sprintf("Batch %d", stamp))
+	category, err := d.CreateTaskCategory(testProjectID(t, d), fmt.Sprintf("Batch %d", stamp))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +108,8 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 
 	ids := make([]int64, 0, 3)
 	for i := range 3 {
-		task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-move-%d-%d", stamp, i), "goal", TaskCreateOptions{})
+		task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-move-%d-%d", stamp, i), "goal", TaskCreateOptions{
+			ProjectID: testProjectID(t, d)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +158,8 @@ func TestSetTasksCategoryRejectsBadInputAtomically(t *testing.T) {
 	defer d.Close()
 
 	stamp := time.Now().UnixNano()
-	task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-reject-%d", stamp), "goal", TaskCreateOptions{})
+	task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-reject-%d", stamp), "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d)})
 	if err != nil {
 		t.Fatal(err)
 	}

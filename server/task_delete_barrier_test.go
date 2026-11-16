@@ -150,7 +150,7 @@ func TestAbortTaskDeleteUsesPersistedPauseAndQueueState(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("delete abort state", "restore persisted barrier", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "delete abort state", "restore persisted barrier", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestTaskChatStatusUsesAuthoritativeBusyState(t *testing.T) {
 		chatBusy:   map[string]bool{"7": true},
 		chatCancel: map[string]context.CancelCauseFunc{},
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/tasks/7/chat/status", nil)
+	req := newReqWithProject(http.MethodGet, "/api/tasks/7/chat/status", nil)
 	req.SetPathValue("id", "7")
 	rec := httptest.NewRecorder()
 
@@ -334,7 +334,7 @@ func TestTaskChatUploadRejectsDeleteBarrierBeforeCreatingDirectory(t *testing.T)
 		t.Fatal("delete barrier should be installed")
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/upload?scope=task&id=7", nil)
+	req := newReqWithProject(http.MethodPost, "/api/chat/upload?scope=task&id=7", nil)
 	rec := httptest.NewRecorder()
 	s.chatUpload(rec, req)
 	if rec.Code != http.StatusConflict {

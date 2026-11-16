@@ -19,7 +19,7 @@ func TestDeleteFinding(t *testing.T) {
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("删除漏洞测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask(testProjectID(t, d), "删除漏洞测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 	}
 	var ids []int64
 	for i, s := range seed {
-		id, err := d.AddFinding(0, 0, vc, s.name, s.sev, "summary", "poc", "tester", nil)
+		id, err := d.AddFindingForProject(testProjectID(t, d), 0, 0, vc, s.name, s.sev, "summary", "poc", "tester", nil)
 		if err != nil {
 			t.Fatalf("AddFinding[%d]: %v", i, err)
 		}
@@ -227,7 +227,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 	defer d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc)
 	ids := make([]int64, 0, 7)
 	for i := 0; i < 7; i++ {
-		id, addErr := d.AddFinding(0, 0, vc, "", SeverityHigh, fmt.Sprintf("finding %d", i), "", "test", nil)
+		id, addErr := d.AddFindingForProject(testProjectID(t, d), 0, 0, vc, "", SeverityHigh, fmt.Sprintf("finding %d", i), "", "test", nil)
 		if addErr != nil {
 			t.Fatalf("AddFinding[%d]: %v", i, addErr)
 		}
@@ -275,12 +275,12 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	cleanupFindings := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }
 	defer cleanupFindings()
 
-	taskA, err := d.CreateTask("group A", "goal", nil, 0, 0)
+	taskA, err := d.CreateTask(testProjectID(t, d), "group A", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(taskA.ID)
-	taskB, err := d.CreateTask("group B", "goal", nil, 0, 0)
+	taskB, err := d.CreateTask(testProjectID(t, d), "group B", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,12 +415,12 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 	defer d.Close()
 
-	task, err := d.CreateTask("finding follow-up", "goal", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "finding follow-up", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.DeleteTask(task.ID)
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{
+	assetID, err := d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{
 		Domain: fmt.Sprintf("follow-up-%d.example.test", time.Now().UnixNano()),
 		TaskID: task.ID,
 	})

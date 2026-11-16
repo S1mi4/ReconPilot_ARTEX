@@ -18,6 +18,9 @@ func (s *Server) generateFindingReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad finding id")
 		return
 	}
+	if !s.requireFindingInProject(w, r, id) {
+		return
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -58,7 +61,12 @@ func (s *Server) generateFindingReport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	message := manualFindingReportMessage(f, taskID)
-	conversation, err := s.m.pg.CreateConversation("reporter", fmt.Sprintf("漏洞报告 · finding#%d", f.ID), nil)
+	reportProject := s.projectOfTask(taskID)
+	if reportProject == 0 {
+		writeErr(w, http.StatusConflict, "无法确定所属项目：漏洞报告对话必须归属于某个任务")
+		return
+	}
+	conversation, err := s.m.pg.CreateConversation(reportProject, "reporter", fmt.Sprintf("漏洞报告 · finding#%d", f.ID), nil)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "创建报告对话失败: "+err.Error())
 		return

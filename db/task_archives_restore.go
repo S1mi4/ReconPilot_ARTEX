@@ -127,7 +127,7 @@ AND NOT EXISTS (
 	if _, err := tx.Exec(`UPDATE tasks SET
  name='',remark='',category_id=NULL,description='',goal='',paused=true,queued=false,queued_at=NULL,queue_mode='',
  llm_profile_id=NULL,active_llm_profile_id=NULL,llm_chain_revision=llm_chain_revision+1,
- company_id=NULL,parent_ref=NULL,timeout_seconds=0,coverage_enabled=true,share_global_assets=false,worker_count=0,pinned_at=NULL,
+ company_id=NULL,parent_ref=NULL,timeout_seconds=0,coverage_enabled=true,share_project_assets=false,worker_count=0,pinned_at=NULL,
  no_result_seconds=0,no_result_min_findings=1,no_result_min_severity='',no_result_base_seconds=0,no_result_checked_at=NULL,stop_reason='',
  first_run_at=NULL,deadline_at=NULL,archived_at=now(),deleted_at=now()
 WHERE id=$1`, taskID); err != nil {
@@ -191,18 +191,18 @@ func (d *DB) restoreTaskArchive(
 	if err := coordinateWithSchemaMigration(tx); err != nil {
 		return nil, err
 	}
-	var taskID, expID int64
+	var taskID, expID, projectID int64
 	var state string
-	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
+	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,task.project_id,archive.state
 FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
-WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state); err != nil {
+WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &projectID, &state); err != nil {
 		return nil, err
 	}
 	if state != Restoring || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return nil, fmt.Errorf("%w: restore snapshot identity/state mismatch", ErrTaskArchiveState)
 	}
 	warnings := []string{}
-	assetMap, assetWarnings, err := restoreArchiveAssets(tx, taskID, snapshot.Tables["assets"])
+	assetMap, assetWarnings, err := restoreArchiveAssets(tx, taskID, projectID, snapshot.Tables["assets"])
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +289,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	if err := restoreTaskCodeAudits(tx, remappedTables["task_code_audit_runs"], remappedTables["task_code_audit_candidates"], serviceIDs); err != nil {
 		return nil, fmt.Errorf("restore task code audits: %w", err)
 	}
-	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
+	if err := restoreFindingTrafficTx(tx, snapshot, projectID); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
 	if streamedLLMRecords != "" {
@@ -343,7 +343,7 @@ func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) er
  no_result_min_severity=COALESCE(archived.no_result_min_severity,''),
  no_result_base_seconds=COALESCE(archived.no_result_base_seconds,0),
  no_result_checked_at=archived.no_result_checked_at,stop_reason=COALESCE(archived.stop_reason,''),
- coverage_enabled=archived.coverage_enabled,share_global_assets=COALESCE(archived.share_global_assets,false),worker_count=COALESCE(archived.worker_count,0),pinned_at=archived.pinned_at,first_run_at=archived.first_run_at,
+ coverage_enabled=archived.coverage_enabled,share_project_assets=COALESCE(archived.share_project_assets,false),worker_count=COALESCE(archived.worker_count,0),pinned_at=archived.pinned_at,first_run_at=archived.first_run_at,
  deadline_at=CASE WHEN archived.paused AND $3>0 THEN now()+make_interval(secs=>$3::double precision)
                   ELSE archived.deadline_at END,
  deleted_at=NULL,archived_at=NULL,completed_at=archived.completed_at,
@@ -569,7 +569,7 @@ func insertArchiveJSONSequenceRows(tx *sql.Tx, table string, reader io.Reader) (
 	return count, nil
 }
 
-func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[int64]int64, []string, error) {
+func restoreArchiveAssets(tx *sql.Tx, taskID, projectID int64, raw json.RawMessage) (map[int64]int64, []string, error) {
 	rows, err := decodeArchiveRows(raw)
 	if err != nil {
 		return nil, nil, err
@@ -604,6 +604,8 @@ func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[in
 			warnings = append(warnings, fmt.Sprintf("资产 ID %d 已被占用，恢复为 %d", oldID, candidate))
 		}
 		row["task_ids"] = mergeJSONTaskID(row["task_ids"], taskID)
+		// 老归档（项目层之前）没有 project_id：恢复时归入归档任务所属项目。
+		row["project_id"] = projectID
 		assetRaw, _ := json.Marshal(row)
 		res, err := tx.Exec(`INSERT INTO assets SELECT * FROM json_populate_record(NULL::assets,$1::json) ON CONFLICT DO NOTHING`, string(assetRaw))
 		if err != nil {

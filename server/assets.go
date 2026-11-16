@@ -54,20 +54,27 @@ func (items *companyScopeInputs) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// assetStore returns the asset store.
-func (s *Server) assetStore() *db.AssetStore {
+// assetStore returns the asset store for one project. 项目是最高级分层：
+// 没有项目上下文的资产调用根本不存在，所以这里必须带 projectID。
+func (s *Server) assetStore(projectID int64) *db.AssetStore {
 	if s.m.pg == nil {
 		return nil
 	}
-	return s.m.pg.Assets()
+	return s.m.pg.Assets(projectID)
 }
 
-// companyStore returns the company store.
-func (s *Server) companyStore() *db.CompanyStore {
+// companyStore returns the company store for one project.
+func (s *Server) companyStore(projectID int64) *db.CompanyStore {
 	if s.m.pg == nil {
 		return nil
 	}
-	return s.m.pg.Companies()
+	return s.m.pg.Companies(projectID)
+}
+
+// readStores resolves the project for a read-only handler. 归档项目仍然可读，
+// 只是不能再写入，所以读路径允许 archived。
+func (s *Server) readStores(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	return s.requireProject(w, r, true)
 }
 
 // =====================================================================
@@ -75,7 +82,11 @@ func (s *Server) companyStore() *db.CompanyStore {
 // =====================================================================
 
 func (s *Server) listCompanies(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -93,7 +104,11 @@ func (s *Server) listCompanies(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -147,7 +162,11 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) getCompany(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -179,7 +198,11 @@ func (s *Server) getCompany(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -245,7 +268,11 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) deleteCompany(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -278,7 +305,7 @@ func (s *Server) deleteCompany(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	assetsDeleted, err := s.m.DeleteCompanyWithAssets(id, req.DeleteAssets)
+	assetsDeleted, err := s.m.DeleteCompanyWithAssets(projectID, id, req.DeleteAssets)
 	if err != nil {
 		if errors.Is(err, db.ErrCompanyNotFound) {
 			writeErr(w, http.StatusNotFound, "company not found")
@@ -295,7 +322,11 @@ func (s *Server) deleteCompany(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) reattribute(w http.ResponseWriter, r *http.Request) {
-	cs := s.companyStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	cs := s.companyStore(projectID)
 	if cs == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -317,7 +348,11 @@ const (
 )
 
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
-	as := s.assetStore()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	as := s.assetStore(projectID)
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -394,7 +429,11 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
-	as := s.assetStore()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	as := s.assetStore(projectID)
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -418,7 +457,11 @@ func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
-	as := s.assetStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	as := s.assetStore(projectID)
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
@@ -447,7 +490,11 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 // =====================================================================
 
 func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
-	as := s.assetStore()
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	as := s.assetStore(projectID)
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return

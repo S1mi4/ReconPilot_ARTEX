@@ -19,11 +19,15 @@ import (
 )
 
 func (s *Server) listActiveFindingRetests(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	items, err := pg.ListActiveFindingRetests(r.Context())
+	items, err := pg.ListActiveFindingRetests(r.Context(), projectID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -39,6 +43,9 @@ func (s *Server) listFindingRetests(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok || id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	f, err := pg.GetFinding(id)
@@ -66,6 +73,9 @@ func (s *Server) startFindingRetest(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok || id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	var req struct {
@@ -116,7 +126,11 @@ func (s *Server) startFindingRetest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "服务正在停止")
 		return
 	}
-	retest, conv, created, err := pg.CreateFindingRetest(r.Context(), id, req.Notes)
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
+	retest, conv, created, err := pg.CreateFindingRetest(r.Context(), projectID, id, req.Notes)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeErr(w, 404, "finding not found")
 		return

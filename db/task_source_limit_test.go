@@ -15,7 +15,8 @@ func TestCreateTaskRejectsTooManySourcesBeforeOpeningTransaction(t *testing.T) {
 
 	// No database handle is needed: validation must run before Begin so an
 	// oversized request cannot consume a connection or create partial rows.
-	_, err := (&DB{}).CreateTaskWithOptions("child", "goal", TaskCreateOptions{SourceTaskIDs: sourceIDs})
+	_, err := (&DB{}).CreateTaskWithOptions("child", "goal", TaskCreateOptions{
+		ProjectID: 1, SourceTaskIDs: sourceIDs})
 	if err == nil || !strings.Contains(err.Error(), "too many source tasks") {
 		t.Fatalf("expected source-count validation error, got %v", err)
 	}
@@ -40,7 +41,8 @@ func TestCreateTaskRejectsTooManyCompaniesBeforeOpeningTransaction(t *testing.T)
 		companyIDs[i] = int64(i + 1)
 	}
 
-	_, err := (&DB{}).CreateTaskWithOptions("child", "goal", TaskCreateOptions{CompanyIDs: companyIDs})
+	_, err := (&DB{}).CreateTaskWithOptions("child", "goal", TaskCreateOptions{
+		ProjectID: 1, CompanyIDs: companyIDs})
 	if !errors.Is(err, ErrTaskCompanyIDsInvalid) {
 		t.Fatalf("expected company-count validation error, got %v", err)
 	}

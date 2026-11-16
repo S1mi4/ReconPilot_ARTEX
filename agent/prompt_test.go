@@ -80,3 +80,29 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 		t.Fatalf("worker without proxy must NOT inject trafficTool: %q", noProxy)
 	}
 }
+
+// 最小化利用策略是代码固定的：DB 覆盖掉整段提示词也丢不掉它，而没有执行能力的
+// 角色（planner/goals）不该背上这段策略。
+func TestMinimalExploitBlockIsCodeOwned(t *testing.T) {
+	old := PromptOverride
+	PromptOverride = func(key string) (string, bool) {
+		if key == "worker" {
+			return "只有这一句", true
+		}
+		return "", false
+	}
+	defer func() { PromptOverride = old }()
+
+	got := renderSystem("worker", workerDefaultTmpl, WorkerVars{})
+	if !strings.Contains(got, "【最小化利用") {
+		t.Fatalf("worker prompt lost the minimal-proof block:\n%s", got)
+	}
+	if !strings.Contains(got, "只有这一句") {
+		t.Fatal("override body should still win for the role body")
+	}
+	for _, k := range []string{"planner", "goals", "asset_mapper"} {
+		if out := renderSystem(k, "body", nil); strings.Contains(out, "【最小化利用") {
+			t.Fatalf("%s must not carry the exploitation policy", k)
+		}
+	}
+}

@@ -1,13 +1,13 @@
 package server
 
 import (
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,19 +26,47 @@ const (
 // dir. It returns ok=false if the path would escape the root. filepath.Clean on a
 // rooted copy collapses any ".." so nothing can climb above the root.
 func (s *Server) wsResolve(rel string) (string, bool) {
-	base := filepath.Clean(s.m.dir)
+	return s.wsResolveIn(0, rel)
+}
+
+// wsResolveIn confines a user-supplied path to one project's subtree. A non-zero
+// projectID additionally refuses paths that address another project's task, so
+// browsing cannot cross the project boundary even though tasks are addressed by id.
+func (s *Server) wsResolveIn(projectID int64, rel string) (string, bool) {
+	// 没有数据库的裸测试进程没有项目归属，退回单项目布局。
+	if s.m.pg == nil {
+		projectID = 0
+	}
+	base := filepath.Clean(s.m.projectDataDir(projectID))
 	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
 	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
 	abs := filepath.Clean(filepath.Join(base, clean))
 	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
 		return "", false
 	}
+	if projectID > 0 && s.m.pg != nil {
+		// tasks/<id>/... 必须属于本项目（没有数据库的裸测试进程无从判断，跳过）。
+		if parts := strings.Split(strings.TrimPrefix(filepath.ToSlash(clean), "/"), "/"); len(parts) >= 2 && parts[0] == "tasks" {
+			if id, err := strconv.ParseInt(parts[1], 10, 64); err == nil && id > 0 {
+				if s.m.taskProjectID(id) != projectID {
+					return "", false
+				}
+			}
+		}
+	}
 	return abs, true
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
 func (s *Server) wsRel(abs string) string {
-	base := filepath.Clean(s.m.dir)
+	return s.wsRelIn(0, abs)
+}
+
+func (s *Server) wsRelIn(projectID int64, abs string) string {
+	if s.m.pg == nil {
+		projectID = 0
+	}
+	base := filepath.Clean(s.m.projectDataDir(projectID))
 	rel, err := filepath.Rel(base, abs)
 	if err != nil || rel == "." {
 		return ""
@@ -69,8 +97,8 @@ func taskCodebaseMutationForbidden(rel string, deleting bool) bool {
 	return len(parts) >= 3 && parts[2] == "codebases"
 }
 
-func (s *Server) rejectTaskCodebaseMutation(w http.ResponseWriter, abs string, deleting bool) bool {
-	if !taskCodebaseMutationForbidden(s.wsRel(abs), deleting) {
+func (s *Server) rejectTaskCodebaseMutation(w http.ResponseWriter, projectID int64, abs string, deleting bool) bool {
+	if !taskCodebaseMutationForbidden(s.wsRelIn(projectID, abs), deleting) {
 		return false
 	}
 	writeErr(w, http.StatusForbidden, "代码库快照为只读")
@@ -87,7 +115,11 @@ type wsEntry struct {
 
 // GET /api/workspace/list?path=<rel>
 func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	abs, ok := s.wsResolveIn(projectID, r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
 		return
@@ -114,7 +146,7 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, wsEntry{
 			Name:  e.Name(),
-			Path:  s.wsRel(filepath.Join(abs, e.Name())),
+			Path:  s.wsRelIn(projectID, filepath.Join(abs, e.Name())),
 			Dir:   e.IsDir(),
 			Size:  info.Size(),
 			MTime: info.ModTime().UnixMilli(),
@@ -127,13 +159,17 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		}
 		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
 	})
-	writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "entries": out})
+	writeJSON(w, 200, map[string]any{"path": s.wsRelIn(projectID, abs), "entries": out})
 }
 
 // GET /api/workspace/read?path=<rel> — inline text for view/edit. Binary or oversize
 // files return {binary:true}/{too_large:true} with no content (use download instead).
 func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	abs, ok := s.wsResolveIn(projectID, r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
 		return
@@ -153,11 +189,15 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	writeTextFile(w, s.wsRel(abs), f, fi.Size())
+	writeTextFile(w, s.wsRelIn(projectID, abs), f, fi.Size())
 }
 
 // POST /api/workspace/write  {path, content} — create/overwrite a text file.
 func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	var req struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -166,12 +206,12 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	abs, ok := s.wsResolve(req.Path)
+	abs, ok := s.wsResolveIn(projectID, req.Path)
 	if !ok || abs == filepath.Clean(s.m.dir) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if s.rejectTaskCodebaseMutation(w, abs, false) {
+	if s.rejectTaskCodebaseMutation(w, projectID, abs, false) {
 		return
 	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
@@ -186,11 +226,15 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
+	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRelIn(projectID, abs)})
 }
 
 // POST /api/workspace/mkdir  {path}
 func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	var req struct {
 		Path string `json:"path"`
 	}
@@ -198,25 +242,29 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	abs, ok := s.wsResolve(req.Path)
+	abs, ok := s.wsResolveIn(projectID, req.Path)
 	if !ok || abs == filepath.Clean(s.m.dir) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if s.rejectTaskCodebaseMutation(w, abs, false) {
+	if s.rejectTaskCodebaseMutation(w, projectID, abs, false) {
 		return
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
+	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRelIn(projectID, abs)})
 }
 
 // DELETE /api/workspace/delete?path=<rel> — removes a file or a directory tree
 // (confined to the work dir; the root itself can't be deleted).
 func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	abs, ok := s.wsResolveIn(projectID, r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
 		return
@@ -225,7 +273,7 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "不能删除工作区根目录")
 		return
 	}
-	if s.rejectTaskCodebaseMutation(w, abs, true) {
+	if s.rejectTaskCodebaseMutation(w, projectID, abs, true) {
 		return
 	}
 	if _, err := os.Stat(abs); err != nil {
@@ -241,7 +289,11 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/workspace/download?path=<rel> — stream a file as an attachment.
 func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	abs, ok := s.wsResolveIn(projectID, r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
 		return
@@ -261,8 +313,12 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 // Markdown. Unlike download, this uses an inline content disposition so a
 // report can render a saved browser screenshot with a normal Markdown image URL.
 func (s *Server) wsPreview(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	rawPath := strings.TrimSpace(r.URL.Query().Get("path"))
-	abs, ok := s.wsResolve(rawPath)
+	abs, ok := s.wsResolveIn(projectID, rawPath)
 	if filepath.IsAbs(rawPath) {
 		base := filepath.Clean(s.m.dir)
 		candidate := filepath.Clean(rawPath)
@@ -297,7 +353,7 @@ func (s *Server) wsPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.m.pg.GetBool(settingScreenshotTimestamp, false) {
 		rawRel := filepath.ToSlash(strings.TrimPrefix(strings.TrimSpace(rawPath), "/"))
-		rel := filepath.ToSlash(s.wsRel(abs))
+		rel := filepath.ToSlash(s.wsRelIn(projectID, abs))
 		if strings.HasPrefix(rawRel, "findings/screenshots/") || strings.HasPrefix(rel, "findings/screenshots/") || strings.Contains(rel, "/findings/screenshots/") {
 			// The frontend renders this as a small top-right overlay. Use the
 			// file mtime so the label reflects capture/save time, not view time.
@@ -354,7 +410,7 @@ func (s *Server) archiveFindingScreenshots(taskID int64, markdown string) error 
 		if !strings.HasPrefix(rel, prefix) || strings.Contains(rel, ".."+string(os.PathSeparator)) {
 			continue
 		}
-		target := filepath.Join(s.m.dir, "tasks", fmt.Sprint(taskID), rel)
+		target := filepath.Join(s.m.taskDataDirFor(taskID), rel)
 		if info, err := os.Stat(target); err == nil && !info.IsDir() {
 			continue
 		}
@@ -403,7 +459,11 @@ func (s *Server) resolveSessionScreenshot(rel string) (string, bool) {
 
 // POST /api/workspace/upload?path=<dir> — multipart form field "file" (one or more).
 func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
-	dirAbs, ok := s.wsResolve(r.URL.Query().Get("path"))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	dirAbs, ok := s.wsResolveIn(projectID, r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
 		return
@@ -412,7 +472,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "目标目录不存在")
 		return
 	}
-	if s.rejectTaskCodebaseMutation(w, dirAbs, false) {
+	if s.rejectTaskCodebaseMutation(w, projectID, dirAbs, false) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWorkspaceUpload)
@@ -431,7 +491,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		if name == "" || name == "." || name == ".." {
 			continue
 		}
-		destAbs, okd := s.wsResolve(filepath.Join(s.wsRel(dirAbs), name))
+		destAbs, okd := s.wsResolveIn(projectID, filepath.Join(s.wsRelIn(projectID, dirAbs), name))
 		if !okd {
 			continue
 		}

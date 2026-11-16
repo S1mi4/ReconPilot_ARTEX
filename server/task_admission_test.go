@@ -58,11 +58,11 @@ func TestAdmitAlreadyRunningTaskDoesNotQueueAfterLimitDecrease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	running, err := m.CreateTask("already admitted", "accept follow-up", nil, 0, 0)
+	running, err := m.CreateTask(testProjectID(t, m), "already admitted", "accept follow-up", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	holder, err := m.CreateTask("other admitted task", "occupy lowered limit", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "other admitted task", "occupy lowered limit", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestAdmissionDoesNotOverwriteConcurrentTerminalStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	task, err := m.CreateTask("stale admission", "preserve terminal writer", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "stale admission", "preserve terminal writer", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +137,11 @@ func TestAdmitKeepsQueuedBootstrapMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	holder, err := m.CreateTask("queue holder", "occupy slot", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "queue holder", "occupy slot", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	queuedTask, err := m.CreateTask("queued bootstrap", "must decompose goals", nil, 0, 0)
+	queuedTask, err := m.CreateTask(testProjectID(t, m), "queued bootstrap", "must decompose goals", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +175,11 @@ func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	holder, err := m.CreateTask("slot holder", "hold", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "slot holder", "hold", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, err := m.CreateTask("terminal follow-up", "must wait", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "terminal follow-up", "must wait", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,11 +223,11 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	holder, err := m.CreateTask("timeout revival holder", "occupy slot", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "timeout revival holder", "occupy slot", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, err := m.CreateTask("timed out follow-up", "run with a fresh clock", nil, 120, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "timed out follow-up", "run with a fresh clock", nil, 120, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,11 +309,11 @@ func TestQueuedTaskCanPauseAndResumeAtFIFOTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	holder, err := m.CreateTask("slot holder", "hold", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "slot holder", "hold", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, err := m.CreateTask("pause queued", "resume later", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "pause queued", "resume later", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,15 +359,15 @@ func TestReadyFIFOIsAdmittedBeforeNewTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	holder, err := m.CreateTask("slot holder", "hold", nil, 0, 0)
+	holder, err := m.CreateTask(testProjectID(t, m), "slot holder", "hold", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	older, err := m.CreateTask("older queued", "first", nil, 0, 0)
+	older, err := m.CreateTask(testProjectID(t, m), "older queued", "first", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	incoming, err := m.CreateTask("new admission", "second", nil, 0, 0)
+	incoming, err := m.CreateTask(testProjectID(t, m), "new admission", "second", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,11 +406,11 @@ func TestUnavailableTaskReleasesSlotForReadyQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unavailable, err := m.CreateTask("unavailable llm", "park", nil, 0, 0)
+	unavailable, err := m.CreateTask(testProjectID(t, m), "unavailable llm", "park", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready, err := m.CreateTask("ready queued", "run", nil, 0, 0)
+	ready, err := m.CreateTask(testProjectID(t, m), "ready queued", "run", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,11 +445,11 @@ func TestUnavailableTaskWaitsForActiveLLMCallBeforeParking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	active, err := m.CreateTask("active profile edit", "finish current call", nil, 0, 0)
+	active, err := m.CreateTask(testProjectID(t, m), "active profile edit", "finish current call", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waiting, err := m.CreateTask("waiting task", "respect active call", nil, 0, 0)
+	waiting, err := m.CreateTask(testProjectID(t, m), "waiting task", "respect active call", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("failed rerun admission", "restore intent", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "failed rerun admission", "restore intent", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 	}
 
 	s := newAdmissionTestServer(m, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/tasks/1/intents/1/rerun", nil)
+	req := newReqWithProject(http.MethodPost, "/api/tasks/1/intents/1/rerun", nil)
 	req.SetPathValue("id", task.ID)
 	req.SetPathValue("iid", fmt.Sprintf("%d", intentID))
 	rec := httptest.NewRecorder()
@@ -550,6 +550,7 @@ func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, err := m.CreateTaskWithOptions("invalid resolution", "report unavailable", db.TaskCreateOptions{
+		ProjectID:     testProjectID(t, m),
 		LLMProfileIDs: []int64{profileID},
 	})
 	if err != nil {
@@ -597,6 +598,7 @@ func TestTaskLLMResolutionPrefersAgentBindingOverTaskChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, err := m.CreateTaskWithOptions("binding precedence", "prefer the bound profile", db.TaskCreateOptions{
+		ProjectID:     testProjectID(t, m),
 		LLMProfileIDs: []int64{chainID},
 	})
 	if err != nil {
@@ -646,7 +648,7 @@ func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("resolution storage failure", "return server error", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "resolution storage failure", "return server error", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +657,7 @@ func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
 	}
 
 	s := &Server{m: m}
-	req := httptest.NewRequest(http.MethodGet, "/api/tasks/1/llm/resolution", nil)
+	req := newReqWithProject(http.MethodGet, "/api/tasks/1/llm/resolution", nil)
 	req.SetPathValue("id", task.ID)
 	rec := httptest.NewRecorder()
 	s.taskLLMResolutionHandler(rec, req)
@@ -666,7 +668,7 @@ func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
 
 func TestTokenStatsWithoutTaskReturnsStableShape(t *testing.T) {
 	s := &Server{m: &Manager{tasks: map[string]*Task{}}}
-	req := httptest.NewRequest(http.MethodGet, "/api/exploration/tokens?task=missing", nil)
+	req := newReqWithProject(http.MethodGet, "/api/exploration/tokens?task=missing", nil)
 	rec := httptest.NewRecorder()
 	s.tokenStats(rec, req)
 	if rec.Code != http.StatusOK {
@@ -698,7 +700,7 @@ func TestBatchControlLimitCountsDeduplicatedIDs(t *testing.T) {
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
-		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		req := newReqWithProject(http.MethodPost, path, bytes.NewReader(body))
 		for key, value := range pathValues {
 			req.SetPathValue(key, value)
 		}
@@ -765,7 +767,7 @@ func TestPauseTaskToolPersistsAndDequeuesTask(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("orchestrated pause", "persist queued pause", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "orchestrated pause", "persist queued pause", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -801,7 +803,7 @@ func TestPauseTaskToolUsesOrchestratorCancellationCause(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("orchestrated pause cause", "keep audit reason", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "orchestrated pause cause", "keep audit reason", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

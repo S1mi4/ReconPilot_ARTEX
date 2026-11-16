@@ -32,7 +32,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 		}
 	}
 
-	stage, err := stageTaskArchiveFiles(dataDir, 1, taskID, explorationID)
+	stage, err := stageTaskArchiveFiles(dataDir, 1, taskID, filepath.Join(dataDir, "tasks", taskID), filepath.Join(dataDir, "transcripts"), explorationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(extracted, filepath.FromSlash(pgdb.TaskArchiveLLMRecordsPath))); err != nil || !bytes.Equal(got, streamBody) {
 		t.Fatalf("streamed LLM archive payload=%q err=%v", got, err)
 	}
-	installed, err := installTaskArchiveFiles(dataDir, extracted, taskID, 1)
+	installed, err := installTaskArchiveFiles(extracted, taskID, filepath.Join(dataDir, "tasks", taskID), 1, filepath.Join(dataDir, "transcripts"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	stage, err := stageTaskArchiveFiles(dataDir, 9, "42", 73)
+	stage, err := stageTaskArchiveFiles(dataDir, 9, "42", filepath.Join(dataDir, "tasks", "42"), filepath.Join(dataDir, "transcripts"), 73)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestTaskArchiveRestoreJournalRollsBackInterruptedInstall(t *testing.T) {
 	if err := os.WriteFile(source, []byte("evidence"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := installTaskArchiveFiles(dataDir, extracted, "42", 11)
+	_, err := installTaskArchiveFiles(extracted, "42", filepath.Join(dataDir, "tasks", "42"), 11, filepath.Join(dataDir, "transcripts"))
 	if err != nil {
 		t.Fatal(err)
 	}

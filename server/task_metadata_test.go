@@ -18,7 +18,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("metadata patch", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "metadata patch", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 	}
 
 	body, _ := json.Marshal(map[string]any{"name": "  renamed task  ", "pinned": true})
-	req := httptest.NewRequest(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
+	req := newReqWithProject(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -51,7 +51,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 	}
 
 	body, _ = json.Marshal(map[string]any{"name": strings.Repeat("任", maxTaskNameRunes+1)})
-	req = httptest.NewRequest(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
+	req = newReqWithProject(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -66,7 +66,7 @@ func TestTaskMetadataPatchGlobalAssetSharing(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("sharing patch", "goal", nil, 0, 0)
+	task, err := m.CreateTask(testProjectID(t, m), "sharing patch", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestTaskMetadataPatchGlobalAssetSharing(t *testing.T) {
 	}
 	for _, enabled := range []bool{true, false} {
 		body, _ := json.Marshal(map[string]any{"share_global_assets": enabled})
-		req := httptest.NewRequest(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
+		req := newReqWithProject(http.MethodPatch, "/api/tasks/"+task.ID, bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rec, req)
@@ -99,7 +99,7 @@ func TestTaskMetadataPatchGlobalAssetSharing(t *testing.T) {
 			t.Fatalf("sharing not propagated: %s %+v %v", rec.Body.String(), saved, err)
 		}
 	}
-	req := httptest.NewRequest(http.MethodPatch, "/api/tasks/"+task.ID, strings.NewReader(`{"share_global_assets":"true"}`))
+	req := newReqWithProject(http.MethodPatch, "/api/tasks/"+task.ID, strings.NewReader(`{"share_global_assets":"true"}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -115,11 +115,11 @@ func TestConversationBatchDeleteReportsMissing(t *testing.T) {
 	}
 	defer m.Close()
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
-	first, err := m.pg.CreateConversation("mainagent", "batch-http-first", nil)
+	first, err := m.pg.CreateConversation(testProjectID(t, m.pg), "mainagent", "batch-http-first", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := m.pg.CreateConversation("mainagent", "batch-http-second", nil)
+	second, err := m.pg.CreateConversation(testProjectID(t, m.pg), "mainagent", "batch-http-second", nil)
 	if err != nil {
 		_ = m.pg.DeleteConversation(first.ID)
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestConversationBatchDeleteReportsMissing(t *testing.T) {
 	}
 	missing := int64(1<<62 - 1)
 	body, _ := json.Marshal(map[string]any{"ids": []int64{first.ID, missing, second.ID}})
-	req := httptest.NewRequest(http.MethodPost, "/api/conversations/delete/batch", bytes.NewReader(body))
+	req := newReqWithProject(http.MethodPost, "/api/conversations/delete/batch", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)

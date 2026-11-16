@@ -14,7 +14,8 @@ import (
 // Task is a row in the task registry (1:1 with an exploration).
 type Task struct {
 	ID            int64      `json:"id"`
-	Name          string     `json:"name"` // 可选任务名称;空=未命名
+	ProjectID     int64      `json:"project_id"` // 所属项目（最高级分层，不可变）
+	Name          string     `json:"name"`       // 可选任务名称;空=未命名
 	Remark        string     `json:"remark"`
 	CategoryID    *int64     `json:"category_id,omitempty"`
 	CategoryName  string     `json:"category_name,omitempty"`
@@ -63,7 +64,7 @@ type Task struct {
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled   bool `json:"coverage_enabled"`
-	ShareGlobalAssets bool `json:"share_global_assets"`
+	ShareGlobalAssets bool `json:"share_project_assets"`
 	// WorkerCount is the per-task concurrent work-agent count. 0 means use the
 	// global settings.workers default when the engine starts this task.
 	WorkerCount int `json:"worker_count"`
@@ -171,12 +172,13 @@ func validateWorkerCount(n int) error {
 	return nil
 }
 
-func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {
+func (d *DB) CreateTask(projectID int64, description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {
 	var ids []int64
 	if llmProfileID != nil {
 		ids = []int64{*llmProfileID}
 	}
 	return d.CreateTaskWithOptions(description, goal, TaskCreateOptions{
+		ProjectID:     projectID,
 		LLMProfileIDs: ids, TimeoutSeconds: timeoutSeconds, PlanHeartbeatSeconds: planHeartbeatSeconds,
 	})
 }
@@ -184,6 +186,8 @@ func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSe
 // TaskCreateOptions contains the task data that must be committed atomically
 // with the task/exploration row.
 type TaskCreateOptions struct {
+	// ProjectID 是任务所属项目。项目是最高级分层，任务必须显式指定，不能靠上下文猜。
+	ProjectID            int64
 	Schedule             *TaskScheduleInput
 	Name                 string // 可选任务名称;空=未命名
 	CategoryID           *int64
@@ -211,6 +215,9 @@ type TaskCreateOptions struct {
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
 // and the ordered task LLM chain in one transaction.
 func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOptions) (*Task, error) {
+	if opts.ProjectID <= 0 {
+		return nil, ErrProjectRequired
+	}
 	if err := NormalizeNoResultOptions(&opts); err != nil {
 		return nil, err
 	}
@@ -277,7 +284,8 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		active = &id
 	}
 	t := &Task{
-		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
+		ProjectID: opts.ProjectID,
+		Name:      opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
 		LLMProfileID: active, ActiveLLMProfileID: active,
 		LLMProfileIDs:   append([]int64(nil), opts.LLMProfileIDs...),
@@ -288,9 +296,9 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CoverageEnabled: coverageEnabled, ShareGlobalAssets: opts.ShareGlobalAssets, WorkerCount: opts.WorkerCount, Remark: opts.Remark,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, no_result_seconds, no_result_min_findings, no_result_min_severity)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(project_id, name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_project_assets, no_result_seconds, no_result_min_findings, no_result_min_severity)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+RETURNING id, status, paused, created_at`, opts.ProjectID, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -425,13 +433,13 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 	return nil
 }
 
-const taskCols = `id, COALESCE(name,''), remark, category_id,
+const taskCols = `id, project_id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason`
+description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_project_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason); err != nil {
+	if err := sc.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -490,7 +498,7 @@ func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
 		WHEN $4::boolean THEN COALESCE(pinned_at, now())
 		ELSE NULL
 	END,
-	share_global_assets = COALESCE($7::boolean, share_global_assets)
+	share_project_assets = COALESCE($7::boolean, share_project_assets)
 WHERE id=$1 AND deleted_at IS NULL
 RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.Remark != nil, patch.Remark, patch.ShareGlobalAssets))
 	if err == sql.ErrNoRows {

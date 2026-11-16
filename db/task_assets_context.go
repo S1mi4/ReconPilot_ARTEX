@@ -28,7 +28,8 @@ visible_assets AS (
   SELECT a.id FROM assets a
   WHERE EXISTS (
     SELECT 1 FROM tasks current
-    WHERE current.id=$1 AND current.deleted_at IS NULL AND current.share_global_assets
+    WHERE current.id=$1 AND current.deleted_at IS NULL AND current.share_project_assets
+      AND a.project_id = current.project_id
   )
   OR EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
   OR EXISTS (

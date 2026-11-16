@@ -24,7 +24,7 @@ func TestWorkerControlRoutes(t *testing.T) {
 	}
 
 	request := func(path string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"action":"pause"}`))
+		req := newReqWithProject(http.MethodPost, path, strings.NewReader(`{"action":"pause"}`))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()

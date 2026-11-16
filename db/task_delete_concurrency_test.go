@@ -33,8 +33,8 @@ func TestDeleteTaskTrafficHostsUseOneLockedTransaction(t *testing.T) {
 		}
 		defer writerTx.Rollback()
 		if _, err := writerTx.Exec(`
-INSERT INTO assets(type, url, service_type, domain, task_ids)
-VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, second.ID); err != nil {
+INSERT INTO assets(project_id,type, url, service_type, domain, task_ids)
+VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, second.ID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -111,8 +111,8 @@ VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, seco
 		writerDone := make(chan error, 1)
 		go func() {
 			_, writeErr := writer.Exec(`
-INSERT INTO assets(type, url, service_type, domain, task_ids)
-VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, second.ID)
+INSERT INTO assets(project_id,type, url, service_type, domain, task_ids)
+VALUES ( (SELECT id FROM projects WHERE nkey='artex-test'),'service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, second.ID)
 			writerDone <- writeErr
 		}()
 		if err := waitForTaskDeleteBlock(d, writerPID, writerDone); err != nil {
@@ -133,17 +133,17 @@ VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, seco
 func createTaskDeleteRaceFixture(t *testing.T, d *DB) (first, second *Task, host string, rootAssetID int64) {
 	t.Helper()
 	var err error
-	first, err = d.CreateTask("delete race owner", "delete safely", nil, 0, 0)
+	first, err = d.CreateTask(testProjectID(t, d), "delete race owner", "delete safely", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err = d.CreateTask("delete race sharer", "preserve shared host", nil, 0, 0)
+	second, err = d.CreateTask(testProjectID(t, d), "delete race sharer", "preserve shared host", nil, 0, 0)
 	if err != nil {
 		_ = d.DeleteTask(first.ID)
 		t.Fatal(err)
 	}
 	host = fmt.Sprintf("task-delete-race-%d.example.test", first.ID)
-	rootAssetID, err = d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: host, TaskID: first.ID})
+	rootAssetID, err = d.Assets(testProjectID(t, d)).UpsertRootDomain(UpsertRootDomainReq{Domain: host, TaskID: first.ID})
 	if err != nil {
 		_ = d.DeleteTask(first.ID)
 		_ = d.DeleteTask(second.ID)

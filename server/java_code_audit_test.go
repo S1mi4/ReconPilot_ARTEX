@@ -211,7 +211,7 @@ func TestTaskCodeAuditReviewPublishesToTaskAndGlobalFindings(t *testing.T) {
 	taskID := *baseFinding.TaskID
 	versionID := fmt.Sprintf("%032x", taskID)
 	codebaseID := fmt.Sprintf("review-codebase-%d", taskID)
-	root := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	root := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	serviceRoot := filepath.Join(root, "contents", "repository", "service")
 	for name, content := range map[string]string{
 		"src/main/java/app/Controller.java": "package app;\nclass Controller {\n  String search(String q) {\n    return dao.find(q);\n  }\n}\n",
@@ -234,8 +234,8 @@ func TestTaskCodeAuditReviewPublishesToTaskAndGlobalFindings(t *testing.T) {
 	}
 	assetExtra, _ := json.Marshal(map[string]any{"task_id": taskID, "codebase_id": codebaseID, "relative_path": "service"})
 	var assetID, serviceID int64
-	if err := s.m.pg.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
+	if err := s.m.pg.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, taskID, string(assetExtra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.m.pg.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,
@@ -317,7 +317,7 @@ func TestTaskCodeAuditRetryEndpointRequeuesFailedServiceRun(t *testing.T) {
 	codebaseID := fmt.Sprintf("retry-codebase-%d", taskID)
 	versionID := fmt.Sprintf("%032x", taskID)
 	version := taskCodebaseVersion{ID: versionID, CodebaseID: codebaseID, Name: "repository", Kind: "directory", Format: "directory"}
-	versionRoot := filepath.Join(taskCodebaseRootPath(s.m.dir, strconv.FormatInt(taskID, 10)), versionID)
+	versionRoot := filepath.Join(s.m.taskCodebaseRoot(strconv.FormatInt(taskID, 10)), versionID)
 	serviceRoot := filepath.Join(versionRoot, "contents", "repository", "service")
 	if err := os.MkdirAll(filepath.Join(serviceRoot, "src/main/java/app"), 0o750); err != nil {
 		t.Fatal(err)

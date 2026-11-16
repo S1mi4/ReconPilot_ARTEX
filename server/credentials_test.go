@@ -63,7 +63,7 @@ func TestCredentialProcessingFlowBindingAndScopes(t *testing.T) {
 	if s.settingsPayload()[db.SettingCredentialTraffic] != false {
 		t.Fatal("binding default must be off")
 	}
-	assetID, err := s.m.Assets().UpsertHTTPService(db.UpsertHTTPServiceReq{URL: "http://evidence.local", TaskID: taskID})
+	assetID, err := s.m.Assets(testProjectID(t, s.m)).UpsertHTTPService(db.UpsertHTTPServiceReq{URL: "http://evidence.local", TaskID: taskID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestCredentialProcessingFlowBindingAndScopes(t *testing.T) {
 	if r.Code != 200 || !strings.Contains(r.Body.String(), "qa-pass-321") {
 		t.Fatal("flow detail", r.Code, r.Body)
 	}
-	other, err := s.m.pg.CreateTask("credential scope", "local", nil, 0, 0)
+	other, err := s.m.pg.CreateTask(testProjectID(t, s.m.pg), "credential scope", "local", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

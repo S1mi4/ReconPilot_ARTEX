@@ -98,7 +98,7 @@ func TestTaskCodeAuditEvidenceMergePreservesObservationAndFixHistory(t *testing.
 func TestTaskCodeAuditQueueProgressAndResume(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("code audit queue", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "code audit queue", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ VALUES($1,$2,'.','service','confirmed','manual',$3,true) RETURNING id`, task.ID,
 func TestConfirmedTaskCodeAuditCandidateCreatesLinkedFindingOnce(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("publish code audit finding", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "publish code audit finding", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,8 +186,8 @@ func TestConfirmedTaskCodeAuditCandidateCreatesLinkedFindingOnce(t *testing.T) {
 	versionID := fmt.Sprintf("%032x", task.ID)
 	extra, _ := json.Marshal(map[string]any{"task_id": task.ID, "codebase_id": codebaseID, "relative_path": "service"})
 	var assetID, serviceID int64
-	if err := d.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, task.ID, string(extra)).Scan(&assetID); err != nil {
+	if err := d.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, task.ID, string(extra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,
@@ -258,7 +258,7 @@ asset_id,latest_version_id,latest_present) VALUES($1,$2,'service','service','con
 func TestTaskCodeAuditFindingHistoryMergesAndMarksFixedOnlyAfterFullAudit(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("track code audit finding history", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "track code audit finding history", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,8 +270,8 @@ func TestTaskCodeAuditFindingHistoryMergesAndMarksFixedOnlyAfterFullAudit(t *tes
 	versionOne := fmt.Sprintf("%032x", task.ID+101)
 	versionTimes[versionOne] = time.Now().UTC().Add(-4 * time.Minute)
 	extra, _ := json.Marshal(map[string]any{"task_id": task.ID, "codebase_id": codebaseID, "relative_path": servicePath})
-	if err := d.QueryRow(`INSERT INTO assets(type,task_ids,service_name,extra)
-VALUES('code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, task.ID, string(extra)).Scan(&assetID); err != nil {
+	if err := d.QueryRow(`INSERT INTO assets(project_id,type,task_ids,service_name,extra)
+VALUES( (SELECT id FROM projects WHERE nkey='artex-test'),'code_service',ARRAY[$1]::bigint[],'service',$2) RETURNING id`, task.ID, string(extra)).Scan(&assetID); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,
@@ -448,7 +448,7 @@ VALUES($1,$2,$3,true)`, serviceID, versionID, createdAt); err != nil {
 func TestRejectedTaskCodeAuditCandidateStaysOutOfFindings(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	task, err := d.CreateTask("reject code audit candidate", "local fixture", nil, 0, 0)
+	task, err := d.CreateTask(testProjectID(t, d), "reject code audit candidate", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,12 +499,12 @@ VALUES($1,$2,'service','service','confirmed','manual',$3,true) RETURNING id`, ta
 func TestTaskCodeAuditQueueCapsGloballyRefillsSlotsAndRetriesIndependently(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()
-	taskA, err := d.CreateTask("audit queue cap A", "local fixture", nil, 0, 0)
+	taskA, err := d.CreateTask(testProjectID(t, d), "audit queue cap A", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(taskA.ID) })
-	taskB, err := d.CreateTask("audit queue cap B", "local fixture", nil, 0, 0)
+	taskB, err := d.CreateTask(testProjectID(t, d), "audit queue cap B", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -43,7 +43,8 @@ func TestCountQualifyingFindings(t *testing.T) {
 			}
 		}
 	}
-	child, err := d.CreateTaskWithOptions("child", "inherits only", TaskCreateOptions{SourceTaskIDs: []int64{task.ID}})
+	child, err := d.CreateTaskWithOptions("child", "inherits only", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), SourceTaskIDs: []int64{task.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +74,7 @@ func TestNoResultPersistenceGuardAndLegacyArchive(t *testing.T) {
 	}
 	defer d.Close()
 	task, err := d.CreateTaskWithOptions("checkpoint", "goal", TaskCreateOptions{
+		ProjectID:       testProjectID(t, d),
 		NoResultSeconds: 1, NoResultMinFindings: 0, NoResultMinSeverity: "high",
 	})
 	if err != nil {
@@ -145,7 +147,8 @@ func noResultTestDB(t *testing.T) (*DB, *Task) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	task, err := d.CreateTaskWithOptions("checkpoint concurrency", "goal", TaskCreateOptions{NoResultSeconds: 60})
+	task, err := d.CreateTaskWithOptions("checkpoint concurrency", "goal", TaskCreateOptions{
+		ProjectID: testProjectID(t, d), NoResultSeconds: 60})
 	if err != nil {
 		t.Fatal(err)
 	}

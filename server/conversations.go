@@ -57,7 +57,11 @@ func (s *Server) pgListConversations(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	cs, err := pg.ListConversations()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	cs, err := pg.ListConversations(projectID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -74,6 +78,10 @@ func (s *Server) pgListConversations(w http.ResponseWriter, r *http.Request) {
 func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -120,7 +128,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("标题最多 %d 个字符", maxConversationTitleRunes))
 		return
 	}
-	c, err := pg.CreateConversation(req.AgentKey, title, req.LLMProfileID)
+	c, err := pg.CreateConversation(projectID, req.AgentKey, title, req.LLMProfileID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -412,7 +420,7 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "消息不能为空")
 		return
 	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, msg)
+	agentMessage, ok := s.prepareChatMentionMessage(w, c.ProjectID, msg)
 	if !ok {
 		return
 	}
@@ -937,11 +945,19 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	pg := s.m.pg
 	var c *db.Conversation
 	var err error
+	// 后台触发没有请求头，项目只能从它正在处理的任务/会话上继承。
+	triggerProject := s.projectOfConversation(item.conversationID)
+	if triggerProject == 0 {
+		triggerProject = s.projectOfTask(item.taskID)
+	}
 	if item.conversationID > 0 {
 		c, err = pg.GetConversation(item.conversationID)
 		_, _ = pg.Exec(`UPDATE finding_case_review_runs SET state='running' WHERE conversation_id=$1`, item.conversationID)
+	} else if triggerProject == 0 {
+		log.Printf("[trigger] 跳过 %s 的触发运行：无法确定所属项目（无任务/会话上下文）", item.agentKey)
+		return
 	} else {
-		c, err = pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+		c, err = pg.CreateConversation(triggerProject, item.agentKey, firstLine(item.title, 60), nil)
 	}
 	if err != nil || c == nil {
 		if item.conversationID > 0 {

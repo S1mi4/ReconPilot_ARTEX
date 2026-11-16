@@ -26,7 +26,7 @@ func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 
 	s := &Server{m: m}
 	w := httptest.NewRecorder()
-	s.authStatus(w, httptest.NewRequest("GET", "/api/auth/status", nil))
+	s.authStatus(w, newReqWithProject("GET", "/api/auth/status", nil))
 
 	if w.Code != 503 {
 		t.Fatalf("status=%d want 503 (读失败被当成未初始化会把用户送去 /setup 覆盖密码); body=%s", w.Code, w.Body.String())
@@ -52,7 +52,7 @@ func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 	s := &Server{m: m}
 	w := httptest.NewRecorder()
 	body := strings.NewReader(`{"password":"correct horse battery"}`)
-	s.authInit(w, httptest.NewRequest("POST", "/api/auth/init", body))
+	s.authInit(w, newReqWithProject("POST", "/api/auth/init", body))
 
 	if w.Code != 503 {
 		t.Fatalf("status=%d want 503 (读失败时放行会让未认证请求覆盖已有密码); body=%s", w.Code, w.Body.String())

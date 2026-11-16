@@ -34,7 +34,7 @@ func TestHealthGateAndResponse(t *testing.T) {
 			h := s.Handler()
 			for _, method := range []string{http.MethodGet, http.MethodHead} {
 				t.Run(method, func(t *testing.T) {
-					r := httptest.NewRequest(method, "/api/health", nil)
+					r := newReqWithProject(method, "/api/health", nil)
 					switch tc.auth {
 					case "wrong":
 						r.SetBasicAuth("entry", "wrong-password")
@@ -108,7 +108,7 @@ func TestVersionRequiresAuthentication(t *testing.T) {
 					t.Fatalf("enable gate: %d %s", w.Code, w.Body.String())
 				}
 			}
-			r := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+			r := newReqWithProject(http.MethodGet, "/api/version", nil)
 			if tc.basic {
 				r.SetBasicAuth("entry", "test-pass")
 			}

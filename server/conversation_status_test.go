@@ -10,7 +10,7 @@ func TestConversationListRunningState(t *testing.T) {
 	s, _ := newRetestServer(t)
 	var ids []int64
 	for _, key := range []string{"auto", "reporter", "retester"} {
-		c, err := s.m.pg.CreateConversation(key, "runtime status test", nil)
+		c, err := s.m.pg.CreateConversation(testProjectID(t, s.m.pg), key, "runtime status test", nil)
 		if err != nil {
 			t.Fatal(err)
 		}

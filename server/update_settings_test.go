@@ -38,7 +38,7 @@ func TestUpdateSettingsHTTPPersistence(t *testing.T) {
 	}
 	handler := s.Handler()
 	request := func(method, body string, authenticated bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, "/api/update/settings", bytes.NewBufferString(body))
+		req := newReqWithProject(method, "/api/update/settings", bytes.NewBufferString(body))
 		if authenticated {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}

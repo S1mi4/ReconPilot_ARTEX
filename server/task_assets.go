@@ -49,7 +49,7 @@ func (s *Server) attachTaskAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Scope != nil {
-		mutation, err := s.m.Assets().RegisterTaskAssetScopes(taskID, request.Scope)
+		mutation, err := s.m.assetsForTask(task).RegisterTaskAssetScopes(taskID, request.Scope)
 		if err != nil {
 			writeTaskAssetError(w, err)
 			return
@@ -58,7 +58,7 @@ func (s *Server) attachTaskAssets(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mutation)
 		return
 	}
-	mutation, err := s.m.Assets().AttachAssetsToTask(taskID, request.AssetIDs, request.SourceSummary)
+	mutation, err := s.m.assetsForTask(task).AttachAssetsToTask(taskID, request.AssetIDs, request.SourceSummary)
 	if err != nil {
 		writeTaskAssetError(w, err)
 		return
@@ -79,7 +79,7 @@ func (s *Server) detachTaskAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID, _ := parseTaskID(task.ID)
-	detached, err := s.m.Assets().DetachAssetFromTask(taskID, assetID)
+	detached, err := s.m.assetsForTask(task).DetachAssetFromTask(taskID, assetID)
 	if err != nil {
 		writeTaskAssetError(w, err)
 		return
@@ -99,7 +99,7 @@ func (s *Server) taskIntentAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID, _ := parseTaskID(task.ID)
-	assets, err := s.m.Assets().IntentAssets(taskID)
+	assets, err := s.m.assetsForTask(task).IntentAssets(taskID)
 	if err != nil {
 		writeTaskAssetError(w, err)
 		return

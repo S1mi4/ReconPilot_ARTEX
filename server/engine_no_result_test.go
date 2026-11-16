@@ -82,7 +82,8 @@ func TestNoResultCheckpointAndRevival(t *testing.T) {
 		{"no findings", "", true}, {"qualifying", "high", false}, {"below threshold", "low", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			task, err := m.CreateTaskWithOptions("checkpoint test", "goal", db.TaskCreateOptions{NoResultSeconds: 60, NoResultMinFindings: 1, NoResultMinSeverity: "high"})
+			task, err := m.CreateTaskWithOptions("checkpoint test", "goal", db.TaskCreateOptions{
+				ProjectID: testProjectID(t, m), NoResultSeconds: 60, NoResultMinFindings: 1, NoResultMinSeverity: "high"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -165,7 +166,8 @@ func TestNoResultCoordinatorStopsAndReleasesMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	task, err := m.CreateTaskWithOptions("coordinator stop", "goal", db.TaskCreateOptions{NoResultSeconds: 60})
+	task, err := m.CreateTaskWithOptions("coordinator stop", "goal", db.TaskCreateOptions{
+		ProjectID: testProjectID(t, m), NoResultSeconds: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +223,7 @@ func TestNoResultCoordinatorStopsAndReleasesMarker(t *testing.T) {
 func TestCreateTaskRejectsInvalidNoResultSeverity(t *testing.T) {
 	s := &Server{}
 	w := httptest.NewRecorder()
-	s.createTask(w, httptest.NewRequest("POST", "/api/tasks", strings.NewReader(`{"description":"test","goal":"test","no_result_min_severity":"urgent"}`)))
+	s.createTask(w, newReqWithProject("POST", "/api/tasks", strings.NewReader(`{"description":"test","goal":"test","no_result_min_severity":"urgent"}`)))
 	if w.Code != 400 {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}

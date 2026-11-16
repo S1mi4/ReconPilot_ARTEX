@@ -7,12 +7,12 @@ import "time"
 // these match the *target asset*: an exact/fuzzy domain·ip·url, or a CIDR range.
 // This layer only stores rules; the matching/enforcement logic lives elsewhere.
 type AssetInterceptRule struct {
-	ID        int64     `json:"id"`
-	Enabled   bool      `json:"enabled"`
-	Kind      string    `json:"kind"` // exact_domain|exact_ip|exact_url|fuzzy_domain|fuzzy_ip|fuzzy_url|cidr
-	Pattern   string    `json:"pattern"`
-	Note      string    `json:"note"`
-	Builtin   bool      `json:"builtin"`
+	ID      int64  `json:"id"`
+	Enabled bool   `json:"enabled"`
+	Kind    string `json:"kind"` // exact_domain|exact_ip|exact_url|fuzzy_domain|fuzzy_ip|fuzzy_url|cidr
+	Pattern string `json:"pattern"`
+	Note    string `json:"note"`
+	Builtin bool   `json:"builtin"`
 	// Action 仅用于任务级规则：'block'=拦截 'allow'=允许(白名单)。
 	// 全局规则(asset_intercept_rules)不带此列，恒为空，视为拦截。
 	Action    string    `json:"action,omitempty"`
@@ -29,8 +29,8 @@ func scanAssetInterceptRule(row interface{ Scan(...any) error }) (AssetIntercept
 }
 
 // ListAssetInterceptRules returns all rules, built-ins first then newest first.
-func (d *DB) ListAssetInterceptRules() ([]AssetInterceptRule, error) {
-	rows, err := d.Query(`SELECT ` + assetInterceptRuleCols + ` FROM asset_intercept_rules ORDER BY builtin DESC, id DESC`)
+func (d *DB) ListAssetInterceptRules(projectID int64) ([]AssetInterceptRule, error) {
+	rows, err := d.Query(`SELECT `+assetInterceptRuleCols+` FROM asset_intercept_rules WHERE project_id = $1 ORDER BY builtin DESC, id DESC`, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -47,12 +47,15 @@ func (d *DB) ListAssetInterceptRules() ([]AssetInterceptRule, error) {
 }
 
 // CreateAssetInterceptRule inserts a new user rule (builtin is always false here).
-func (d *DB) CreateAssetInterceptRule(kind, pattern, note string, enabled bool) (AssetInterceptRule, error) {
+func (d *DB) CreateAssetInterceptRule(projectID int64, kind, pattern, note string, enabled bool) (AssetInterceptRule, error) {
+	if projectID <= 0 {
+		return AssetInterceptRule{}, ErrProjectRequired
+	}
 	row := d.QueryRow(`
-INSERT INTO asset_intercept_rules(enabled, kind, pattern, note, builtin)
-VALUES ($1, $2, $3, $4, false)
+INSERT INTO asset_intercept_rules(project_id, enabled, kind, pattern, note, builtin)
+VALUES ($1, $2, $3, $4, $5, false)
 RETURNING `+assetInterceptRuleCols,
-		enabled, kind, pattern, note)
+		projectID, enabled, kind, pattern, note)
 	return scanAssetInterceptRule(row)
 }
 

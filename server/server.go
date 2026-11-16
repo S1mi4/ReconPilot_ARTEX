@@ -98,7 +98,8 @@ type Server struct {
 	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
 	// so edits take effect.
 	profMu         sync.Mutex
-	profChatAgents map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	profChatAgents map[chatAgentKey]*agent.ChatAgent // per-(project,profile) ChatAgent cache (chat page)
+	projChatAgents map[chatAgentKey]*agent.ChatAgent // per-project agents on the global config
 
 	// provByProfile caches ONE provider per LLM profile id so every agent bound or
 	// pinned to the same profile shares a single provider instance — hence one rate
@@ -175,7 +176,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
-		profChatAgents: map[int64]*agent.ChatAgent{},
+		profChatAgents: map[chatAgentKey]*agent.ChatAgent{},
+		projChatAgents: map[chatAgentKey]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), auditWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
 	m.SetTaskControlMutex(&s.concMu)
@@ -265,14 +267,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
-		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
+		// 域工具（资产/企业写工具）按运行所属项目注入，见 domainToolRegistry。
+		wireTools(m.pg, s.domainToolRegistry) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
+		go s.runEvidenceGC(s.ctx)
 		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		// Calendar scheduler starts after persisted tasks are restored.
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
@@ -316,6 +318,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		s.seedCredentialProcessor()
 		go s.runCredentialProcessor()
+		go s.runProjectPurgeWorker()
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
@@ -550,14 +553,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.cfgMu.Lock()
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
-	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	s.chatAgent.SetProxyProvider(s.m.ProxyAddr)
-	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
-	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
-	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
-	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	s.chatAgent = s.configureChatAgent(agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win), cfg) // chat page runner
 	s.llmProv = prov
 	s.llmCfg = cfg
 	s.llmOn = true
@@ -624,9 +620,9 @@ func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 
 // picked a valid profile still got rejected with "LLM 未配置" when no global
 // config was active.
 func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
-	ca := s.chatAgentRef()
+	ca := s.chatAgentForProject(c.ProjectID)
 	if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
-		if pa := s.chatAgentForProfile(*eff); pa != nil {
+		if pa := s.chatAgentForProfile(c.ProjectID, *eff); pa != nil {
 			ca = pa
 		}
 	}
@@ -742,9 +738,31 @@ func (s *Server) requestLimiterForProfileLocked(id int64) *agent.RequestLimiter 
 
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
-func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
+// chatAgentKey scopes the chat-agent cache: each project gets its own instance so
+// the conversation transcripts land in that project's directory.
+type chatAgentKey struct {
+	project int64
+	profile int64
+}
+
+// configureChatAgent installs the shared options every chat agent needs.
+func (s *Server) configureChatAgent(ca *agent.ChatAgent, cfg agent.Config) *agent.ChatAgent {
+	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetProxyProvider(s.m.ProxyAddr)
+	ca.SetWebSearch(s.m.WebSearchOpts())
+	ca.SetGuard(s.chatGuard())
+	ca.SetNonStreaming(nonStreamingResolver(cfg))
+	ca.SetMaxTokens(maxTokensResolver(cfg))
+	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	return ca
+}
+
+// chatAgentForProfile returns the ChatAgent for one project + LLM profile. Both the
+// transcripts directory and the instance are per project.
+func (s *Server) chatAgentForProfile(projectID, id int64) *agent.ChatAgent {
+	key := chatAgentKey{project: projectID, profile: id}
 	s.profMu.Lock()
-	cached := s.profChatAgents[id]
+	cached := s.profChatAgents[key]
 	s.profMu.Unlock()
 	if cached != nil {
 		return cached
@@ -753,20 +771,14 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	if !ok {
 		return nil
 	}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	ca.SetProxyProvider(s.m.ProxyAddr)
-	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
-	ca.SetNonStreaming(nonStreamingResolver(cfg))
-	ca.SetMaxTokens(maxTokensResolver(cfg))
-	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+	tx := transcript.NewStore(s.transcriptDir(projectID))
+	ca := s.configureChatAgent(
+		agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow()), cfg)
 	s.profMu.Lock()
-	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
+	if ex := s.profChatAgents[key]; ex != nil { // lost the race → keep the winner
 		ca = ex
 	} else {
-		s.profChatAgents[id] = ca
+		s.profChatAgents[key] = ca
 	}
 	s.profMu.Unlock()
 	return ca
@@ -777,13 +789,42 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 // (and re-resolves each agent's bound model) on their next round.
 func (s *Server) invalidateProfileAgents() {
 	s.profMu.Lock()
-	s.profChatAgents = map[int64]*agent.ChatAgent{}
+	s.profChatAgents = map[chatAgentKey]*agent.ChatAgent{}
+	s.projChatAgents = map[chatAgentKey]*agent.ChatAgent{}
 	s.profMu.Unlock()
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
 	s.invalidateTaskAgents()
+}
+
+// chatAgentForProject returns the default-config ChatAgent of one project, cached
+// per project so its conversation transcripts live in the project directory.
+func (s *Server) chatAgentForProject(projectID int64) *agent.ChatAgent {
+	s.cfgMu.Lock()
+	global, prov, cfg := s.chatAgent, s.llmProv, s.llmCfg
+	s.cfgMu.Unlock()
+	if projectID <= 0 || global == nil || prov == nil {
+		return global
+	}
+	key := chatAgentKey{project: projectID}
+	s.profMu.Lock()
+	cached := s.projChatAgents[key]
+	s.profMu.Unlock()
+	if cached != nil {
+		return cached
+	}
+	tx := transcript.NewStore(s.transcriptDir(projectID))
+	ca := s.configureChatAgent(agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, cfg.CompactionWindow()), cfg)
+	s.profMu.Lock()
+	if ex := s.projChatAgents[key]; ex != nil {
+		ca = ex
+	} else {
+		s.projChatAgents[key] = ca
+	}
+	s.profMu.Unlock()
+	return ca
 }
 
 func (s *Server) chatAgentRef() *agent.ChatAgent {
@@ -810,6 +851,18 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/version", s.version)
+
+	// 项目（最高级分层）：本身是全局资源，不需要项目上下文。项目内内容一律要求
+	// 请求携带 X-Project-ID，由各 handler 通过 s.requireProject 解析。
+	mux.HandleFunc("GET /api/projects", s.listProjects)
+	mux.HandleFunc("POST /api/projects", s.createProject)
+	mux.HandleFunc("GET /api/projects/{id}", s.getProject)
+	mux.HandleFunc("PATCH /api/projects/{id}", s.updateProject)
+	mux.HandleFunc("POST /api/projects/{id}/archive", s.archiveProject)
+	mux.HandleFunc("POST /api/projects/{id}/restore", s.restoreProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.deleteProject)
+	mux.HandleFunc("GET /api/projects/{id}/stats", s.projectStats)
+
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/system/metrics", s.systemMetrics)
 	mux.HandleFunc("GET /api/logs", s.getLogs)
@@ -964,6 +1017,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/generate-report", s.generateFindingReport)
+	s.registerEscalations(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
@@ -1186,6 +1240,10 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	out := map[string]any{}
 	out["engine_mode"] = "idle"              // spec enum; overridden below when a task is active
 	out["llm_configured"] = s.engine.Ready() // is an LLM provider installed at all
@@ -1194,7 +1252,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		out["traffic"] = c
 		out["traffic_enabled"] = true
 	}
-	if counts, err := s.m.Assets().CountsByType(); err == nil {
+	if counts, err := s.m.Assets(projectID).CountsByType(); err == nil {
 		total := 0
 		for _, n := range counts {
 			total += n
@@ -1749,6 +1807,10 @@ type createTaskReq struct {
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	var req createTaskReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
@@ -1803,7 +1865,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var schedule *db.TaskScheduleInput
 	if req.Schedule != nil {
-		input := s.scheduleInput(*req.Schedule, nil)
+		input := s.scheduleInput(projectID, *req.Schedule, nil)
 		input.TaskIDs = nil
 		if err := db.ValidateTaskScheduleInput(input); err != nil {
 			writeErr(w, 400, err.Error())
@@ -1825,8 +1887,9 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
-		Schedule: schedule,
-		Name:     strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
+		ProjectID: projectID,
+		Schedule:  schedule,
+		Name:      strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
@@ -2009,7 +2072,7 @@ func (s *Server) seed(t *Task, text string) {
 		u += ":" + strconv.Itoa(port)
 	}
 	var rootID int64
-	if as := s.m.Assets(); as != nil {
+	if as := s.m.Assets(t.ProjectID); as != nil {
 		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 		if net.ParseIP(host) != nil {
 			rootID, _ = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
@@ -2072,7 +2135,7 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2100,7 +2163,7 @@ func (s *Server) taskCoverageGraph(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2156,7 +2219,7 @@ func (s *Server) taskScopeList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2176,7 +2239,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2205,7 +2268,7 @@ func (s *Server) taskScopeDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	as := s.m.Assets()
+	as := s.m.Assets(t.ProjectID)
 	if as == nil {
 		writeErr(w, 503, "asset store 未启用")
 		return
@@ -2243,11 +2306,15 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	// 带 task 参数 → 仅该任务（任务概览/发现 Tab 用），从 exploration_nodes 读（任务在则节点在）。
 	q := r.URL.Query()
 	taskParam := q.Get("task")
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	if taskParam == "" {
 		// 带 page/limit → 服务端分页 {items,total,...}；不带 → 裸数组（dashboard 汇总用，
 		// 与 intents 端点的兼容策略一致）。筛选/排序统一下推到 SQL。
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			fs, _ := s.m.pg.ListFindings(projectID, 500)
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -2258,7 +2325,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		}
 		page := findingPaginationParam(q.Get("page"), 1, 0)
 		limit := findingPaginationParam(q.Get("limit"), 20, 200)
-		fs, total, err := s.m.pg.ListFindingsPage(findingFilterFromQuery(q), page, limit)
+		fs, total, err := s.m.pg.ListFindingsPage(findingFilterForProject(projectID, q), page, limit)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -2272,7 +2339,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.m.ResolveTask(taskParam)
-	if t == nil {
+	if t == nil || (t.ProjectID != 0 && t.ProjectID != projectID) {
 		writeJSON(w, 200, []any{})
 		return
 	}
@@ -2362,7 +2429,9 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 	if len(uniq) == 0 {
 		return assets
 	}
-	list, err := s.m.pg.Assets().GetByIDs(uniq)
+	// GetByIDs is a primary-key lookup: the ids came from findings the caller
+	// already scoped to one project, so no extra filter is needed here.
+	list, err := s.m.pg.Assets(0).GetByIDs(uniq)
 	if err != nil {
 		log.Printf("[findings] resolve assets: %v", err)
 	}
@@ -2374,7 +2443,11 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 
 // findingStats serves filtered, pagination-independent counts and global options.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FilteredFindingStats(findingFilterFromQuery(r.URL.Query()))
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	st, err := s.m.pg.FilteredFindingStats(findingFilterForProject(projectID, r.URL.Query()))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2388,6 +2461,9 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	f, err := s.m.pg.GetFinding(id)
@@ -2437,9 +2513,14 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	format := q.Get("format")
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 
 	var ids []int64
-	var filter db.FindingFilter
+	// 导出同样受项目边界约束：all 也必须只导出当前项目。
+	filter := db.FindingFilter{ProjectID: projectID}
 	switch scope {
 	case "selected":
 		for _, part := range strings.Split(q.Get("ids"), ",") {
@@ -2459,9 +2540,9 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "all":
-		// 空 filter = 不加任何条件。
+		// 只带项目边界，不加其它筛选。
 	case "filtered", "":
-		filter = findingFilterFromQuery(q)
+		filter = findingFilterForProject(projectID, q)
 	default:
 		writeErr(w, 400, "bad scope: "+scope)
 		return
@@ -2487,7 +2568,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(stage)
-	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
+	if err = s.evidenceStoreFor(projectID).StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
 		evidenceError(w, err)
 		return
 	}
@@ -2577,6 +2658,9 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
+	if !s.requireFindingInProject(w, r, id) {
+		return
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2612,6 +2696,9 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	var body struct {
@@ -2704,6 +2791,9 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	if !s.requireFindingInProject(w, r, id) {
 		return
 	}
 	n, err := s.m.pg.DeleteFinding(id)
@@ -3465,11 +3555,12 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	if rawTaskID := strings.TrimSpace(q.Get("task_id")); rawTaskID != "" {
 		taskScoped = true
 		taskID, err := strconv.ParseInt(rawTaskID, 10, 64)
-		if err != nil || taskID <= 0 || s.m.ResolveTask(rawTaskID) == nil {
+		task := s.m.ResolveTask(rawTaskID)
+		if err != nil || taskID <= 0 || task == nil {
 			writeErr(w, http.StatusNotFound, "task not found")
 			return
 		}
-		taskHosts, err = s.m.Assets().HostsByTaskWithSources(taskID)
+		taskHosts, err = s.m.Assets(task.ProjectID).HostsByTaskWithSources(taskID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -3524,11 +3615,12 @@ func (s *Server) getTrafficHosts(w http.ResponseWriter, r *http.Request) {
 	var hosts []string
 	if rawTaskID := strings.TrimSpace(r.URL.Query().Get("task_id")); rawTaskID != "" {
 		taskID, err := strconv.ParseInt(rawTaskID, 10, 64)
-		if err != nil || taskID <= 0 || s.m.ResolveTask(rawTaskID) == nil {
+		task := s.m.ResolveTask(rawTaskID)
+		if err != nil || taskID <= 0 || task == nil {
 			writeErr(w, http.StatusNotFound, "task not found")
 			return
 		}
-		hosts, err = s.m.Assets().HostsByTaskWithSources(taskID)
+		hosts, err = s.m.Assets(task.ProjectID).HostsByTaskWithSources(taskID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -4323,7 +4415,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
+	agentMessage, ok := s.prepareChatMentionMessage(w, t.ProjectID, req.Message)
 	if !ok {
 		return
 	}
@@ -4392,10 +4484,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			resume := func() { s.reviveTask(t) } // set_goals 新增目标 → 把任务拉回 running
 			// 把上传附件的【绝对路径】清单拼进发给 agent 的消息,它据此用 Read/Bash 打开文件。
 			// taskDir = agent 的工作目录(CWD),与 chatUpload 落盘、ensureRunDir 一致。
-			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
+			taskDir := s.m.taskDataDir(t.ProjectID, maTaskID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(t.ProjectID), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
@@ -4473,7 +4565,7 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 		_, _ = t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
 		return "已记录提示，规划者下次会读到：" + text
 	default:
-		assetCounts, _ := s.m.Assets().CountsByType()
+		assetCounts, _ := s.m.Assets(t.ProjectID).CountsByType()
 		assets := 0
 		for _, c := range assetCounts {
 			assets += c
@@ -4493,7 +4585,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
+		ns, _ := s.m.Assets(t.ProjectID).QueryByType(ty, 100000, 0)
 		if len(ns) > 0 {
 			counts[ty] = len(ns)
 		}

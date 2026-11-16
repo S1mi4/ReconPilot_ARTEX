@@ -146,7 +146,11 @@ func (s *Server) interceptListRules(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	rules, err := pg.ListInterceptRules()
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
+	rules, err := pg.ListInterceptRules(projectID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -162,6 +166,10 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	var req interceptRuleReq
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -171,7 +179,7 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.CreateInterceptRule(projectID, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
