@@ -25,7 +25,7 @@ type codebaseTestFile struct {
 func taskCodebaseFixture(t *testing.T) (*Server, *http.ServeMux, string) {
 	t.Helper()
 	base := t.TempDir()
-	m := &Manager{dir: base, tasks: map[string]*Task{"313": {ID: "313"}}}
+	m := &Manager{dir: base, tasks: map[string]*Task{"313": {ID: "313", ProjectID: 1}}}
 	s := &Server{m: m, engine: NewEngine(m)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/tasks/{id}/codebases", s.taskCodebasesList)
@@ -65,6 +65,7 @@ func taskCodebasePost(t *testing.T, mux *http.ServeMux, taskID, kind string, fil
 		t.Fatal(err)
 	}
 	req := newReqWithProject(http.MethodPost, "/api/tasks/"+taskID+"/codebases", &body)
+	req.Header.Set(projectIDHeader, "1")
 	req.Header.Set("Content-Type", form.FormDataContentType())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -117,6 +118,7 @@ func TestTaskCodebaseDirectoryUploadsCreateIndependentVersions(t *testing.T) {
 	}
 
 	listReq := newReqWithProject(http.MethodGet, "/api/tasks/313/codebases", nil)
+	listReq.Header.Set(projectIDHeader, "1")
 	listRec := httptest.NewRecorder()
 	mux.ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {

@@ -620,8 +620,8 @@ var builtinRulesV4 = []struct {
 	},
 }
 
-// approvalHint 追加到每条 V4 规则的提示里：拒绝不是死路，而是要求走审批。
-const approvalHint = "（如需执行：漏洞详情 → 利用验证 → 提交扩展提案，批准后由受控执行单独下发）"
+// approvalHint 追加到每条 V4 规则的提示里：拒绝不是死路，而是要求走人工审批流程。
+const approvalHint = "（如需继续：漏洞详情 → 利用验证 → 提交扩展提案；批准后由人工按步骤执行并回填结果）"
 
 // seedInterceptRulesV4 给单个项目补上高影响动作的拦截规则。语句自带 WHERE NOT EXISTS，
 // 因此可以（也必须）对已经灌过内置规则的老项目重复执行——它放在 rules_seeded_at 闸门之前。

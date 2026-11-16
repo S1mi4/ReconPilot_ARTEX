@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -131,9 +133,13 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "拒绝或仅保留理论时必须填写理由")
 		return
 	}
+	if body.Approve && body.TTLHours > int(pgdb.MaxEscalationApprovalTTL/time.Hour) {
+		writeErr(w, http.StatusBadRequest, "批准有效期最长为 24 小时")
+		return
+	}
 	ttl := time.Duration(body.TTLHours) * time.Hour
 	if body.TTLHours <= 0 {
-		ttl = 24 * time.Hour
+		ttl = pgdb.MaxEscalationApprovalTTL
 	}
 	e, err := s.m.pg.DecideEscalation(r.Context(), id, body.Approve, s.adminActor(r), body.Note, ttl)
 	if err != nil {
@@ -225,3 +231,34 @@ func (s *Server) recordEscalationOutcome(w http.ResponseWriter, r *http.Request)
 // adminActor 是审批人标识。单管理员部署下没有多用户身份，统一记 "admin"；
 // 关键是它绝不取自请求体——谁能批必须由服务端决定，不能由调用方自报。
 func (s *Server) adminActor(*http.Request) string { return "admin" }
+
+// runEscalationExpiryWorker expires stale approvals promptly after startup and
+// then periodically, while the database transition itself remains the final gate.
+func (s *Server) runEscalationExpiryWorker() {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	expire := func() {
+		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+		defer cancel()
+		count, err := s.m.pg.ExpireStaleApprovals(ctx)
+		if err != nil && s.ctx.Err() == nil {
+			log.Printf("[escalations] 过期审批清理失败: %v", err)
+			return
+		}
+		if count > 0 {
+			log.Printf("[escalations] 已将 %d 条过期审批标记为 expired", count)
+		}
+	}
+	expire()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			expire()
+		}
+	}
+}

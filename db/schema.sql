@@ -1243,6 +1243,7 @@ ALTER TABLE task_schedule_tasks ADD COLUMN IF NOT EXISTS paused_by_schedule BOOL
 CREATE TABLE IF NOT EXISTS intercept_rules (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL,
+    is_builtin      BOOLEAN NOT NULL DEFAULT false,
     enabled         BOOLEAN NOT NULL DEFAULT true,
     priority        INTEGER NOT NULL DEFAULT 0,
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
@@ -1256,6 +1257,13 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE intercept_rules ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN NOT NULL DEFAULT false;
+UPDATE intercept_rules SET is_builtin=true WHERE name LIKE '[内置]%' AND is_builtin=false;
+UPDATE intercept_rules
+SET message = replace(message,
+    '（如需执行：漏洞详情 → 利用验证 → 提交扩展提案，批准后由受控执行单独下发）',
+    '（如需继续：漏洞详情 → 利用验证 → 提交扩展提案；批准后由人工按步骤执行并回填结果）')
+WHERE message LIKE '%批准后由受控执行单独下发%';
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1839,7 +1847,7 @@ CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- 利用扩展提案：agent 想「扩大影响」时只产出提案，绝不自己执行。人工在漏洞详情页
--- 审核批准后，才由受控执行器单独跑一次（见 docs/利用安全整改方案.md §5/§6）。
+-- 审核批准后由人按步骤手动执行，再回填实际结果；平台不会自动执行提案。
 -- 刻意把"理论步骤"和"审批结论"分开存：步骤是 agent 写的，status/decided_by 只有人能写。
 CREATE TABLE IF NOT EXISTS finding_escalations (
     id                BIGSERIAL PRIMARY KEY,
@@ -1868,10 +1876,18 @@ CREATE TABLE IF NOT EXISTS finding_escalations (
     -- 批准时写下的执行窗口终点；过期的批准既不能再执行，也不该继续假装有效。
     expires_at        TIMESTAMPTZ,
     run_id            BIGINT,
-    impact_observed   TEXT NOT NULL DEFAULT '',
+    impact_observed   TEXT NOT NULL DEFAULT 'none',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT finding_escalations_impact_observed_check
+        CHECK (impact_observed IN ('none','read','write','exec'))
 );
+UPDATE finding_escalations SET impact_observed='none'
+WHERE impact_observed NOT IN ('none','read','write','exec');
+ALTER TABLE finding_escalations ALTER COLUMN impact_observed SET DEFAULT 'none';
+ALTER TABLE finding_escalations DROP CONSTRAINT IF EXISTS finding_escalations_impact_observed_check;
+ALTER TABLE finding_escalations ADD CONSTRAINT finding_escalations_impact_observed_check
+    CHECK (impact_observed IN ('none','read','write','exec'));
 CREATE INDEX IF NOT EXISTS idx_finding_escalations_finding ON finding_escalations(finding_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_finding_escalations_project ON finding_escalations(project_id, status, created_at DESC);
 -- 同一漏洞同一等级只允许一条待审提案：避免 agent 反复提同一件事把审批列表刷满。
@@ -1930,6 +1946,22 @@ ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_project_id
 ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
 ALTER TABLE asset_intercept_rules DROP CONSTRAINT IF EXISTS asset_intercept_rules_project_id_fkey;
 ALTER TABLE asset_intercept_rules ADD CONSTRAINT asset_intercept_rules_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+
+-- Project-scoped audit trail for rule changes, especially disabling or deleting
+-- built-in high-impact deny rules.
+CREATE TABLE IF NOT EXISTS intercept_rule_audit_events (
+    id           BIGSERIAL PRIMARY KEY,
+    project_id   BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    rule_id      BIGINT REFERENCES intercept_rules(id) ON DELETE SET NULL,
+    action       TEXT NOT NULL CHECK (action IN ('created','updated','enabled','disabled','deleted')),
+    actor        TEXT NOT NULL,
+    before_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    after_state  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intercept_rule_audit_project
+    ON intercept_rule_audit_events(project_id, created_at DESC);
+
 ALTER TABLE traffic_evidence_snapshots DROP CONSTRAINT IF EXISTS traffic_evidence_snapshots_project_id_fkey;
 ALTER TABLE traffic_evidence_snapshots ADD CONSTRAINT traffic_evidence_snapshots_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
 

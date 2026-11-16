@@ -653,8 +653,8 @@ export interface Finding {
 }
 
 // 利用扩展提案（agent 提出、人审）。status 是状态机：
-// proposed → approved（带窗口）→ running → executed/failed；approved 可 cancel，
-// 过窗口自动 expired；rejected = 只保留理论，不执行。
+// proposed → approved（带窗口）→ 人工记录 executed/failed；running 留给未来受控执行器，
+// approved 可 cancel，过窗口自动 expired；rejected = 只保留理论，不执行。
 export type EscalationStatus =
   | "proposed"
   | "approved"

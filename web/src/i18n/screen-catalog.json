@@ -2992,16 +2992,16 @@
   "screen.9344597efd4950": ["执行失败", "Failed"],
   "screen.59d5d9ae744093": ["已作废", "Cancelled"],
   "screen.2fe0e3339ac4d1": ["已过期", "Expired"],
-  "screen.2769e7199035a5": ["批准执行", "Approve run"],
+  "screen.2769e7199035a5": ["批准人工执行", "Approve manual run"],
   "screen.8bb820a80d5cec": ["仅保留理论", "Keep theoretical only"],
   "screen.d1a61d663759ba": ["作废", "Cancel"],
   "screen.eb5c5c53f7fe6e": ["理由", "Reason"],
-  "screen.4616b8c24fbcc4": ["执行窗口（小时）", "Window (hours)"],
+  "screen.4616b8c24fbcc4": ["人工执行窗口（小时，最长 24）", "Manual execution window (hours, max 24)"],
   "screen.e547c4baa83221": ["提案人", "Proposed by"],
   "screen.57060c88a36bf3": ["目标", "Objective"],
   "screen.948fd8083430c1": ["前提条件", "Preconditions"],
   "screen.4ec7c214668571": ["理论操作步骤", "Proposed steps"],
-  "screen.5d1f179c1ff4d8": ["预期影响", "Expected impact"],
+  "screen.5d1f179c1ff4d8": ["理论预期影响", "Expected impact (theoretical)"],
   "screen.33fe56244a0438": ["影响面", "Blast radius"],
   "screen.66487c2996805c": ["停止条件", "Stop conditions"],
   "screen.6518e21a8e5ff2": ["回滚", "Rollback"],
@@ -3013,11 +3013,17 @@
   "screen.58e65e336fb7fc": ["审批已记录", "Decision saved"],
   "screen.8646363a96500c": ["L2 · 受限读取", "L2 · Limited read"],
   "screen.1024d95090102b": ["L3 · 高危动作", "L3 · High-impact action"],
-  "screen.5d61887e36948e": ["批准后 agent 仍需在窗口内单独发起执行；这里的批准不等于已执行。", "Approval only opens a window — nothing runs until the controlled executor is started."],
+  "screen.5d61887e36948e": [
+    "批准仅授权人工在窗口内按步骤执行；这里的批准不等于已执行。",
+    "Approval authorizes a person to follow the steps during the window; it does not mean they were executed."
+  ],
   "screen.094d7c1310ede4": ["记录执行结果", "Record outcome"],
   "screen.e04bd1b72f4b06": ["执行结果", "Outcome"],
   "screen.b405227c7e3f93": ["备注（可选）", "Note (optional)"],
   "screen.9fad24e2c377ee": ["记录", "Save"],
   "screen.0dac72b6944aa1": ["批准后由你按上面的理论步骤执行；执行完在这里回填结果与真实影响。", "Approve first, run the steps yourself, then record what actually happened here."],
-  "screen.e58d69f32d57ac": ["平台受控执行尚未启用：批准只开窗口，不替你执行。", "Controlled execution is not enabled yet — approval only opens a window."]
+  "screen.e58d69f32d57ac": [
+    "平台不提供自动执行器：请由人按批准步骤执行，并在完成后回填真实结果。",
+    "The platform does not execute approved steps automatically. A person must perform them and record the actual outcome."
+  ]
 }

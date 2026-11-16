@@ -11,21 +11,24 @@ import (
 )
 
 // 利用扩展提案：agent 在探索中识别到「必须扩大影响才能继续判断」时，只登记提案，
-// 不执行。审批是人的动作（status/decided_by 只由 API 写），执行由 P2 的受控执行器
-// 单独发起。把"写提案"和"批准"分开，是为了让 agent 永远拿不到批准自己的能力。
+// 不执行。审批是人的动作（status/decided_by 只由 API 写），审批后也由人按步骤执行，
+// 再通过 API 回填结果。把"写提案"和"批准"分开，是为了让 agent 永远不能批准自己。
 
 // EscalationStatus 是提案的状态机取值。approved 之后只有取消/执行两种去向；
-// running/executed/failed 由受控执行器写（P2）。
+// 人工路径从 approved 直接回填 executed/failed；running 保留给未来的受控执行器。
 const (
-	EscalationProposed  = "proposed"
-	EscalationApproved  = "approved"
-	EscalationRejected  = "rejected"
-	EscalationRunning   = "running"
-	EscalationExecuted  = "executed"
-	EscalationFailed    = "failed"
-	EscalationCancelled = "cancelled"
-	EscalationExpired   = "expired"
+	EscalationProposed       = "proposed"
+	EscalationApproved       = "approved"
+	EscalationRejected       = "rejected"
+	EscalationRunning        = "running"
+	EscalationExecuted       = "executed"
+	EscalationFailed         = "failed"
+	EscalationCancelled      = "cancelled"
+	EscalationExpired        = "expired"
+	MaxEscalationApprovalTTL = 24 * time.Hour
 )
+
+var ErrEscalationApprovalTTLTooLong = errors.New("批准有效期不能超过 24 小时")
 
 // ValidEscalationLevel 限定提案等级。L1 不需要提案（只改自建对象），L4 永远禁止。
 func ValidEscalationLevel(s string) bool { return s == "L2" || s == "L3" }
@@ -53,9 +56,11 @@ type FindingEscalation struct {
 	DecisionNote   string     `json:"decision_note"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	RunID          *int64     `json:"run_id,string,omitempty"`
-	ImpactObserved string     `json:"impact_observed"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// ImpactObserved records verified, actual effects only. The proposal's
+	// expected_impact is theoretical and must not be copied into this field.
+	ImpactObserved string    `json:"impact_observed"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // EscalationInput 是 agent 提交提案时的完整载荷。必填项在 CreateEscalation 里校验：
@@ -235,7 +240,10 @@ func (d *DB) DecideEscalation(ctx context.Context, id int64, approve bool, by, n
 	var expires any
 	if approve {
 		if ttl <= 0 {
-			ttl = 24 * time.Hour
+			ttl = MaxEscalationApprovalTTL
+		}
+		if ttl > MaxEscalationApprovalTTL {
+			return nil, ErrEscalationApprovalTTLTooLong
 		}
 		status = EscalationApproved
 		expires = time.Now().Add(ttl)
@@ -283,7 +291,7 @@ RETURNING `+escalationCols, id, by, note)
 func (d *DB) ExpireStaleApprovals(ctx context.Context) (int64, error) {
 	res, err := d.ExecContext(ctx, `
 UPDATE finding_escalations SET status='expired', updated_at=now()
-WHERE status='approved' AND expires_at IS NOT NULL AND expires_at < now()`)
+WHERE status='approved' AND (expires_at IS NULL OR expires_at <= now())`)
 	if err != nil {
 		return 0, err
 	}
@@ -295,7 +303,8 @@ WHERE status='approved' AND expires_at IS NOT NULL AND expires_at < now()`)
 func (d *DB) MarkEscalationRunning(ctx context.Context, id, runID int64) (*FindingEscalation, error) {
 	row := d.QueryRowContext(ctx, `
 UPDATE finding_escalations SET status='running', run_id=$2, updated_at=now()
-WHERE id=$1 AND status='approved' RETURNING `+escalationCols, id, runID)
+WHERE id=$1 AND status='approved' AND expires_at IS NOT NULL AND expires_at > now()
+RETURNING `+escalationCols, id, runID)
 	e, err := scanEscalation(row)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("提案 %d 不是已批准状态，无法开始执行", id)
@@ -303,9 +312,8 @@ WHERE id=$1 AND status='approved' RETURNING `+escalationCols, id, runID)
 	return e, err
 }
 
-// RecordEscalationOutcome 是「人工执行」这条路的结案入口：人按批准的理论步骤自己执行
-// （或在受监督的会话里执行）之后，把结果与真实影响回填。它接受 approved 和 running
-// 两种来源，因为人工路径不会有 running 阶段——平台受控执行（P2-A）才会先置 running。
+// RecordEscalationOutcome 是人工执行路径的结案入口：人按批准的理论步骤执行之后，
+// 把结果与真实影响回填。它也接受 running，供未来受控执行器完成运行中的提案。
 func (d *DB) RecordEscalationOutcome(ctx context.Context, id int64, status, impact, note string) (*FindingEscalation, error) {
 	if status != EscalationExecuted && status != EscalationFailed {
 		return nil, fmt.Errorf("结案状态只能是 executed 或 failed")
@@ -318,7 +326,8 @@ UPDATE finding_escalations
 SET status=$2, impact_observed=$3,
 	decision_note = CASE WHEN $4::text='' THEN decision_note ELSE $4::text END,
 	updated_at=now()
-WHERE id=$1 AND status IN ('approved','running')
+WHERE id=$1 AND (status='running' OR
+    (status='approved' AND expires_at IS NOT NULL AND expires_at > now()))
 RETURNING `+escalationCols, id, status, impact, note)
 	e, err := scanEscalation(row)
 	if err == sql.ErrNoRows {

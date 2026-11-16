@@ -3,15 +3,22 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
 
+var (
+	ErrInterceptRuleNotFound = errors.New("intercept rule not found in project")
+	ErrBuiltinInterceptRule  = errors.New("built-in intercept rules cannot be deleted; disable them instead")
+)
+
 // InterceptRule is one row of intercept_rules.
 type InterceptRule struct {
 	ID             int64     `json:"id"`
+	IsBuiltin      bool      `json:"is_builtin"`
 	Name           string    `json:"name"`
 	Enabled        bool      `json:"enabled"`
 	Priority       int       `json:"priority"`
@@ -43,11 +50,11 @@ type InterceptPending struct {
 	CreatedAt      time.Time       `json:"created_at"`
 }
 
-const interceptRuleCols = `id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, created_at, updated_at`
+const interceptRuleCols = `id, name, is_builtin, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, created_at, updated_at`
 
 func scanInterceptRule(row interface{ Scan(...any) error }) (InterceptRule, error) {
 	var r InterceptRule
-	err := row.Scan(&r.ID, &r.Name, &r.Enabled, &r.Priority,
+	err := row.Scan(&r.ID, &r.Name, &r.IsBuiltin, &r.Enabled, &r.Priority,
 		&r.MatchTarget, &r.MatchType, &r.Pattern, &r.Action, &r.Message,
 		&r.TimeoutEnabled, &r.TimeoutSeconds, &r.TimeoutAction,
 		&r.CreatedAt, &r.UpdatedAt)
@@ -73,41 +80,153 @@ func (d *DB) ListInterceptRules(projectID int64) ([]InterceptRule, error) {
 }
 
 // CreateInterceptRule inserts a new rule.
-func (d *DB) CreateInterceptRule(projectID int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+func (d *DB) CreateInterceptRule(projectID int64, actor, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
 	if projectID <= 0 {
 		return InterceptRule{}, ErrProjectRequired
 	}
-	row := d.QueryRow(`
+	tx, err := d.Begin()
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	defer tx.Rollback()
+	rule, err := scanInterceptRule(tx.QueryRow(`
 INSERT INTO intercept_rules(project_id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING `+interceptRuleCols,
-		projectID, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
-	return scanInterceptRule(row)
+		projectID, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction))
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	if err := recordInterceptRuleAudit(tx, projectID, rule.ID, "created", actor, map[string]any{}, rule); err != nil {
+		return InterceptRule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return InterceptRule{}, err
+	}
+	return rule, nil
 }
 
-// UpdateInterceptRule replaces all editable fields of an existing rule.
-func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
-	row := d.QueryRow(`
+func loadInterceptRuleForUpdate(tx *sql.Tx, projectID, id int64) (InterceptRule, error) {
+	rule, err := scanInterceptRule(tx.QueryRow(`SELECT `+interceptRuleCols+`
+FROM intercept_rules WHERE id=$1 AND project_id=$2 FOR UPDATE`, id, projectID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return InterceptRule{}, ErrInterceptRuleNotFound
+	}
+	return rule, err
+}
+
+func recordInterceptRuleAudit(tx *sql.Tx, projectID, ruleID int64, action, actor string, before, after any) error {
+	if strings.TrimSpace(actor) == "" {
+		return errors.New("intercept rule actor is required")
+	}
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`
+INSERT INTO intercept_rule_audit_events(project_id, rule_id, action, actor, before_state, after_state)
+VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb)`, projectID, ruleID, action, strings.TrimSpace(actor), beforeJSON, afterJSON)
+	return err
+}
+
+// UpdateInterceptRule replaces editable fields and records the before/after state.
+func (d *DB) UpdateInterceptRule(projectID, id int64, actor, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+	if projectID <= 0 {
+		return InterceptRule{}, ErrProjectRequired
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	defer tx.Rollback()
+	before, err := loadInterceptRuleForUpdate(tx, projectID, id)
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	rule, err := scanInterceptRule(tx.QueryRow(`
 UPDATE intercept_rules
    SET name=$2, enabled=$3, priority=$4, match_target=$5,
        match_type=$6, pattern=$7, action=$8, message=$9,
        timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12
-WHERE id=$1
-RETURNING `+interceptRuleCols,
-		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
-	return scanInterceptRule(row)
+WHERE id=$1 AND project_id=$13
+RETURNING `+interceptRuleCols, id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, projectID))
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	auditAction := "updated"
+	if before.Enabled && !rule.Enabled {
+		auditAction = "disabled"
+	} else if !before.Enabled && rule.Enabled {
+		auditAction = "enabled"
+	}
+	if err := recordInterceptRuleAudit(tx, projectID, id, auditAction, actor, before, rule); err != nil {
+		return InterceptRule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return InterceptRule{}, err
+	}
+	return rule, nil
 }
 
-// DeleteInterceptRule removes a rule.
-func (d *DB) DeleteInterceptRule(id int64) error {
-	_, err := d.Exec(`DELETE FROM intercept_rules WHERE id=$1`, id)
-	return err
+// DeleteInterceptRule removes a project rule and audits the deleted state. Built-ins
+// remain present so their explicit, audited disabled state can be restored later.
+func (d *DB) DeleteInterceptRule(projectID, id int64, actor string) error {
+	if projectID <= 0 {
+		return ErrProjectRequired
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	before, err := loadInterceptRuleForUpdate(tx, projectID, id)
+	if err != nil {
+		return err
+	}
+	if before.IsBuiltin {
+		return ErrBuiltinInterceptRule
+	}
+	if _, err := tx.Exec(`DELETE FROM intercept_rules WHERE id=$1 AND project_id=$2`, id, projectID); err != nil {
+		return err
+	}
+	if err := recordInterceptRuleAudit(tx, projectID, id, "deleted", actor, before, map[string]any{}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// ToggleInterceptRule flips the enabled state of a rule.
-func (d *DB) ToggleInterceptRule(id int64, enabled bool) error {
-	_, err := d.Exec(`UPDATE intercept_rules SET enabled=$2 WHERE id=$1`, id, enabled)
-	return err
+// ToggleInterceptRule changes one project rule and records the before/after state.
+func (d *DB) ToggleInterceptRule(projectID, id int64, enabled bool, actor string) error {
+	if projectID <= 0 {
+		return ErrProjectRequired
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	before, err := loadInterceptRuleForUpdate(tx, projectID, id)
+	if err != nil {
+		return err
+	}
+	rule, err := scanInterceptRule(tx.QueryRow(`
+UPDATE intercept_rules SET enabled=$3
+WHERE id=$1 AND project_id=$2 RETURNING `+interceptRuleCols, id, projectID, enabled))
+	if err != nil {
+		return err
+	}
+	action := "enabled"
+	if !enabled {
+		action = "disabled"
+	}
+	if err := recordInterceptRuleAudit(tx, projectID, id, action, actor, before, rule); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateInterceptPending inserts a pending approval record and returns its ID.

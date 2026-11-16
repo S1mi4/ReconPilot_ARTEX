@@ -51,6 +51,11 @@ function levelLabel(ui: UITranslate, level: FindingEscalation["level"]) {
   return level === "L3" ? ui("screen.1024d95090102b") : ui("screen.8646363a96500c");
 }
 
+function observedImpactLabel(ui: UITranslate, impact: string) {
+  const key = IMPACT_KEYS[impact as keyof typeof IMPACT_KEYS] ?? IMPACT_KEYS.none;
+  return ui(key);
+}
+
 function fmt(ts?: string) {
   if (!ts) return "";
   const d = new Date(ts);
@@ -217,6 +222,9 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
                 <Field label={ui("screen.6518e21a8e5ff2")}>{e.rollback_plan || "-"}</Field>
                 <Field label={ui("screen.b9943e91f0ac4c")}>{e.alternative || "-"}</Field>
               </div>
+              {e.status === "executed" || e.status === "failed" ? (
+                <Field label={ui("screen.e8baec335dc4a6")}>{observedImpactLabel(ui, e.impact_observed)}</Field>
+              ) : null}
               {e.stop_conditions.length > 0 ? (
                 <Field label={ui("screen.66487c2996805c")}>
                   <ul className="list-disc pl-4">
@@ -257,6 +265,7 @@ export function FindingEscalationPanel({ findingId, readOnly = false }: { findin
                           className="w-20"
                           type="number"
                           min={1}
+                          max={24}
                           aria-label={ui("screen.4616b8c24fbcc4")}
                           value={hours}
                           onChange={(ev) => setHours(ev.target.value)}

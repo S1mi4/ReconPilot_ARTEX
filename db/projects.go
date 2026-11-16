@@ -385,6 +385,9 @@ func (d *DB) seedRulesForProject(projectID int64) error {
 	if err := d.seedInterceptRulesV4(projectID); err != nil {
 		return err
 	}
+	if _, err := d.Exec(`UPDATE intercept_rules SET is_builtin=true WHERE project_id=$1 AND name LIKE '[内置]%'`, projectID); err != nil {
+		return err
+	}
 	var seeded sql.NullTime
 	if err := d.QueryRow(`SELECT rules_seeded_at FROM projects WHERE id = $1`, projectID).Scan(&seeded); err != nil {
 		return err
@@ -414,6 +417,9 @@ func (d *DB) seedRulesForProject(projectID int64) error {
 		if err := d.seedAssetInterceptRules(projectID); err != nil {
 			return err
 		}
+	}
+	if _, err := d.Exec(`UPDATE intercept_rules SET is_builtin=true WHERE project_id=$1 AND name LIKE '[内置]%'`, projectID); err != nil {
+		return err
 	}
 	_, err := d.Exec(`UPDATE projects SET rules_seeded_at = now() WHERE id = $1`, projectID)
 	return err

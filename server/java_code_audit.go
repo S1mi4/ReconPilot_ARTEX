@@ -199,12 +199,15 @@ var taskCodeAuditTools = []llm.ToolSchema{
 }
 
 func (s *Server) taskCodeAuditConfigHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	numericTaskID, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	numericTaskID, _ := strconv.ParseInt(taskID, 10, 64)
+	taskID := strconv.FormatInt(numericTaskID, 10)
 	serviceID, err := strconv.ParseInt(r.PathValue("serviceID"), 10, 64)
 	if err != nil || serviceID <= 0 {
 		writeErr(w, http.StatusBadRequest, "无效的代码服务")
@@ -269,12 +272,15 @@ func (s *Server) taskCodeAuditConfigHandler(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) taskCodeAuditStartHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	numericTaskID, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	numericTaskID, _ := strconv.ParseInt(taskID, 10, 64)
+	taskID := strconv.FormatInt(numericTaskID, 10)
 	serviceID, err := strconv.ParseInt(r.PathValue("serviceID"), 10, 64)
 	if err != nil || serviceID <= 0 {
 		writeErr(w, http.StatusBadRequest, "无效的代码服务")
@@ -351,12 +357,14 @@ func (s *Server) taskCodeAuditStartHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) taskCodeAuditsListHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	numericTaskID, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	numericTaskID, _ := strconv.ParseInt(taskID, 10, 64)
 	runs, err := s.m.pg.ListTaskCodeAudits(numericTaskID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "无法读取白盒审计记录")
@@ -366,12 +374,14 @@ func (s *Server) taskCodeAuditsListHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) taskCodeAuditGetHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
 	runID, err := strconv.ParseInt(r.PathValue("runID"), 10, 64)
 	if err != nil || runID <= 0 {
 		writeErr(w, http.StatusNotFound, "审计记录不存在")
@@ -390,12 +400,15 @@ func (s *Server) taskCodeAuditGetHandler(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) taskCodeAuditResumeHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
+	taskID := strconv.FormatInt(taskNum, 10)
 	runID, err := strconv.ParseInt(r.PathValue("runID"), 10, 64)
 	if err != nil || runID <= 0 {
 		writeErr(w, http.StatusNotFound, "审计记录不存在")
@@ -433,12 +446,15 @@ func (s *Server) taskCodeAuditResumeHandler(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) taskCodeAuditRetryHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
+	taskID := strconv.FormatInt(taskNum, 10)
 	runID, err := strconv.ParseInt(r.PathValue("runID"), 10, 64)
 	if err != nil || runID <= 0 {
 		writeErr(w, http.StatusNotFound, "审计记录不存在")
@@ -497,12 +513,15 @@ func (s *Server) taskCodeAuditRunIsBinaryOnly(taskID, runID int64) (bool, error)
 }
 
 func (s *Server) taskCodeAuditCandidateReviewHandler(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
-	if !ok || s.m.pg == nil {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
+	if !ok {
+		return
+	}
+	if s.m.pg == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	taskNum, _ := strconv.ParseInt(taskID, 10, 64)
+	taskID := strconv.FormatInt(taskNum, 10)
 	runID, runErr := strconv.ParseInt(r.PathValue("runID"), 10, 64)
 	candidateID, candidateErr := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
 	if runErr != nil || candidateErr != nil || runID <= 0 || candidateID <= 0 {

@@ -62,11 +62,11 @@ type taskCodebaseUpload struct {
 
 // GET /api/tasks/{id}/codebases
 func (s *Server) taskCodebasesList(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	taskID := strconv.FormatInt(taskNum, 10)
 	if _, ok := s.m.Task(taskID); !ok {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
@@ -128,11 +128,11 @@ func (s *Server) taskCodebasesList(w http.ResponseWriter, r *http.Request) {
 // "file", and a matching repeated "relative_path" field. Directory paths come
 // from the browser's webkitRelativePath and are validated before they reach disk.
 func (s *Server) taskCodebasesUpload(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	taskID := strconv.FormatInt(taskNum, 10)
 	if _, ok := s.m.Task(taskID); !ok {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return

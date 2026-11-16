@@ -33,6 +33,55 @@ func (m *Manager) projectDataDir(projectID int64) string {
 	return filepath.Join(m.dir, "projects", strconv.FormatInt(projectID, 10))
 }
 
+// purgeProjectFiles removes project-owned files and legacy files that still live
+// outside the project tree. The caller runs this only after the retention window;
+// it keeps the database row if any filesystem cleanup fails so the worker retries.
+func (m *Manager) purgeProjectFiles(projectID int64, taskIDs, explorationIDs []int64) error {
+	if m == nil || projectID <= 0 {
+		return errors.New("invalid project file cleanup target")
+	}
+	if err := os.RemoveAll(m.projectDataDir(projectID)); err != nil {
+		return err
+	}
+	for _, taskID := range taskIDs {
+		if taskID <= 0 {
+			continue
+		}
+		legacyDir := filepath.Join(m.dir, "tasks", strconv.FormatInt(taskID, 10))
+		if err := os.RemoveAll(legacyDir); err != nil {
+			return err
+		}
+	}
+	if len(explorationIDs) == 0 {
+		return nil
+	}
+	legacyTranscriptDir := filepath.Join(m.dir, "transcripts")
+	entries, err := os.ReadDir(legacyTranscriptDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	prefixes := make([]string, 0, len(explorationIDs))
+	for _, explorationID := range explorationIDs {
+		if explorationID > 0 {
+			prefixes = append(prefixes, "exp"+strconv.FormatInt(explorationID, 10)+"-")
+		}
+	}
+	for _, entry := range entries {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix) {
+				if err := os.RemoveAll(filepath.Join(legacyTranscriptDir, entry.Name())); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
 // taskDataDir returns the directory that owns one task's files. Legacy directories
 // are adopted in place so old and new data never coexist.
 func (m *Manager) taskDataDir(projectID, taskID int64) string {

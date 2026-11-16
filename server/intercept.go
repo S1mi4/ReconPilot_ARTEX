@@ -179,7 +179,7 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateInterceptRule(projectID, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.CreateInterceptRule(projectID, s.adminActor(r), req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -191,6 +191,10 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) interceptUpdateRule(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
 		return
 	}
 	id, ok := pathInt(r, "id")
@@ -207,8 +211,11 @@ func (s *Server) interceptUpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.UpdateInterceptRule(projectID, id, s.adminActor(r), req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
 	if err != nil {
+		if writeInterceptRuleError(w, err) {
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -221,12 +228,19 @@ func (s *Server) interceptDeleteRule(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
+		return
+	}
 	id, ok := pathInt(r, "id")
 	if !ok {
 		writeErr(w, 400, "bad rule id")
 		return
 	}
-	if err := pg.DeleteInterceptRule(id); err != nil {
+	if err := pg.DeleteInterceptRule(projectID, id, s.adminActor(r)); err != nil {
+		if writeInterceptRuleError(w, err) {
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -237,6 +251,10 @@ func (s *Server) interceptDeleteRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) interceptToggleRule(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	projectID, ok := s.requireProject(w, r, false)
+	if !ok {
 		return
 	}
 	id, ok := pathInt(r, "id")
@@ -251,12 +269,28 @@ func (s *Server) interceptToggleRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.ToggleInterceptRule(id, req.Enabled); err != nil {
+	if err := pg.ToggleInterceptRule(projectID, id, req.Enabled, s.adminActor(r)); err != nil {
+		if writeInterceptRuleError(w, err) {
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
 	s.m.interceptor.Invalidate()
 	writeJSON(w, 200, map[string]any{"ok": true, "enabled": req.Enabled})
+}
+
+func writeInterceptRuleError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, db.ErrInterceptRuleNotFound):
+		writeErr(w, http.StatusNotFound, "intercept rule not found")
+		return true
+	case errors.Is(err, db.ErrBuiltinInterceptRule):
+		writeErr(w, http.StatusConflict, "内置高危拦截规则不能删除，请禁用并保留审计记录")
+		return true
+	default:
+		return false
+	}
 }
 
 // --- pending (ask) ---

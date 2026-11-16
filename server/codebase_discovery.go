@@ -77,11 +77,11 @@ type discoveryLLMOutput struct {
 
 // GET /api/tasks/{id}/code-services
 func (s *Server) taskCodeServicesList(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	numericTaskID, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	taskID := strconv.FormatInt(numericTaskID, 10)
 	if _, ok := s.m.Task(taskID); !ok {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
@@ -90,7 +90,6 @@ func (s *Server) taskCodeServicesList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "database unavailable")
 		return
 	}
-	numericTaskID, _ := strconv.ParseInt(taskID, 10, 64)
 	services, runs, err := s.m.pg.ListTaskCodeServices(numericTaskID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "无法读取代码服务发现结果")
@@ -101,11 +100,11 @@ func (s *Server) taskCodeServicesList(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/tasks/{id}/code-services/{serviceID}/decision
 func (s *Server) taskCodeServiceDecision(w http.ResponseWriter, r *http.Request) {
-	taskID, ok := validCodebaseTaskID(r.PathValue("id"))
+	numericTaskID, ok := s.requireTaskInProject(w, r, r.PathValue("id"), false)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	taskID := strconv.FormatInt(numericTaskID, 10)
 	if _, ok := s.m.Task(taskID); !ok {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
@@ -130,7 +129,6 @@ func (s *Server) taskCodeServiceDecision(w http.ResponseWriter, r *http.Request)
 	if !decodeCompanyMutationRequest(w, r, &req) {
 		return
 	}
-	numericTaskID, _ := strconv.ParseInt(taskID, 10, 64)
 	service, err := s.m.pg.DecideTaskCodeService(numericTaskID, serviceID, req.Decision)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

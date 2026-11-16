@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -42,6 +43,51 @@ func resolveProjectID(r *http.Request) (int64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// requireTaskInProject validates both the selected project and the task owner.
+// Task IDs are globally unique, but they are not a substitute for project context:
+// every task-scoped route must ensure its path ID belongs to the selected project.
+func (s *Server) requireTaskInProject(w http.ResponseWriter, r *http.Request, rawTaskID string, allowArchived bool) (int64, bool) {
+	projectID, ok := s.requireProject(w, r, allowArchived)
+	if !ok {
+		return 0, false
+	}
+	taskID, ok := validCodebaseTaskID(rawTaskID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return 0, false
+	}
+	numericTaskID, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return 0, false
+	}
+	if s.m == nil {
+		writeErr(w, http.StatusServiceUnavailable, "task store unavailable")
+		return 0, false
+	}
+	if s.m.pg == nil {
+		// Bare in-memory servers are used by focused tests. They still need an
+		// explicit project owner so this fallback does not silently bypass scope.
+		task, exists := s.m.Task(taskID)
+		if exists && task.ProjectID == projectID {
+			return numericTaskID, true
+		}
+		writeErr(w, http.StatusNotFound, "task not found")
+		return 0, false
+	}
+	var ownerProjectID int64
+	err = s.m.pg.QueryRowContext(r.Context(), `SELECT project_id FROM tasks WHERE id=$1 AND deleted_at IS NULL`, numericTaskID).Scan(&ownerProjectID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows), err == nil && ownerProjectID != projectID:
+		writeErr(w, http.StatusNotFound, "task not found")
+		return 0, false
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, "failed to validate task project")
+		return 0, false
+	}
+	return numericTaskID, true
 }
 
 // requireProject resolves and validates the active project. It writes the error
@@ -112,12 +158,42 @@ func (s *Server) purgeExpiredProjects() {
 		return
 	}
 	for _, project := range candidates {
+		taskIDs, explorationIDs, err := s.projectPurgeTaskIDs(project.ID)
+		if err != nil {
+			log.Printf("[projects] 查询项目 #%d 的文件清理信息失败: %v", project.ID, err)
+			continue
+		}
+		if err := s.m.purgeProjectFiles(project.ID, taskIDs, explorationIDs); err != nil {
+			log.Printf("[projects] 清理项目 #%d (%s) 文件失败: %v", project.ID, project.Name, err)
+			continue
+		}
 		if err := projects.Purge(project.ID); err != nil {
 			log.Printf("[projects] 清理项目 #%d (%s) 失败: %v", project.ID, project.Name, err)
 			continue
 		}
 		log.Printf("[projects] 已清理过期项目 #%d (%s)", project.ID, project.Name)
 	}
+}
+
+func (s *Server) projectPurgeTaskIDs(projectID int64) ([]int64, []int64, error) {
+	rows, err := s.m.pg.Query(`SELECT id, exploration_id FROM tasks WHERE project_id=$1`, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var taskIDs, explorationIDs []int64
+	for rows.Next() {
+		var taskID int64
+		var explorationID sql.NullInt64
+		if err := rows.Scan(&taskID, &explorationID); err != nil {
+			return nil, nil, err
+		}
+		taskIDs = append(taskIDs, taskID)
+		if explorationID.Valid && explorationID.Int64 > 0 {
+			explorationIDs = append(explorationIDs, explorationID.Int64)
+		}
+	}
+	return taskIDs, explorationIDs, rows.Err()
 }
 
 // projectOfFinding resolves a finding's project through its task: findings follow

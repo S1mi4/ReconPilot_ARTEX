@@ -15,7 +15,8 @@ func TestInterceptApprovalFilters(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	scope := "approval-filter-" + t.Name()
 	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN ($1,$2)`, scope, scope+"-other") })
-	rule, err := d.CreateInterceptRule(testProjectID(t, d), "filter fixture", "tool_name", "string", "Bash", "deny", "fixture", 1, true, false, 0, "deny")
+	projectID := testProjectID(t, d)
+	rule, err := d.CreateInterceptRule(projectID, "test", "filter fixture", "tool_name", "string", "Bash", "deny", "fixture", 1, true, false, 0, "deny")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +129,7 @@ func TestInterceptApprovalFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = d.DeleteInterceptRule(rule.ID); err != nil {
+	if err = d.DeleteInterceptRule(projectID, rule.ID, "test"); err != nil {
 		t.Fatal(err)
 	}
 	rows, total, err = d.ListTaskInterceptsPage(scope, 1, 100, InterceptApprovalFilter{DecisionSource: "rule"})
