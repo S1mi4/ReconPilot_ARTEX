@@ -56,12 +56,14 @@ func TestManagerCompleteAssessmentBlockedScenarios(t *testing.T) {
 	m, task := newAssessmentManagerTask(t)
 	// 用确认不存在的任务 ID 验证外键拒绝：projects.id 与 tasks.id 来自独立
 	// 序列，任何取自其它表/对象的 ID（如项目 ID）都可能恰好等于某个已存在
-	// 的任务 ID，让该用例给上一条任务建出轮次而非触发外键失败。
-	var maxTaskID int64
-	if err := m.pg.QueryRow(`SELECT COALESCE(max(id),0)+1 FROM tasks`).Scan(&maxTaskID); err != nil {
+	// 的任务 ID；max(id)+1 也会在 db/server 测试共享同一 PostgreSQL 时被并发
+	// 建出的任务占用。此处用 nextval 保留一个序列值但不插入行——该 ID 永不
+	// 会有对应任务，外键拒绝是确定的。
+	var reservedTaskID int64
+	if err := m.pg.QueryRow(`SELECT nextval(pg_get_serial_sequence('tasks','id'))`).Scan(&reservedTaskID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.pg.CreateAssessmentRound(maxTaskID); err == nil {
+	if _, err := m.pg.CreateAssessmentRound(reservedTaskID); err == nil {
 		t.Fatalf("对不存在的任务 ID 建轮次不应成功")
 	}
 	round, err := m.pg.CreateAssessmentRound(assessmentTaskID(t, task))

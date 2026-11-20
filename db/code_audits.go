@@ -311,10 +311,30 @@ WHERE id=$1 AND status IN ('queued','running')`, runID, reason)
 	return tx.Commit()
 }
 
-func (d *DB) ResumeTaskCodeAudit(taskID, runID int64, additionalBudget int) (*TaskCodeAuditRun, error) {
-	result, err := d.Exec(`UPDATE task_code_audit_runs SET status='queued',budget_tokens=budget_tokens+$3,
-error='',completed_at=NULL,updated_at=now() WHERE task_id=$1 AND id=$2 AND status='incomplete'
-AND $3 BETWEEN 1000 AND 500000`, taskID, runID, additionalBudget)
+// requeueTaskCodeAudit is the shared body of Resume/Retry: it puts a stopped
+// run back into the queue. It acquires the task-row lock (FOR UPDATE) first,
+// which both serializes with FinalizeAssessmentCompletion's queue re-check and
+// enforces the same terminal guard as CreateTaskCodeAudit: an assessment-mode
+// task can no longer requeue white-box work after it finished (the completion
+// report must not omit pending audit work, §6.3-6.4).
+func (d *DB) requeueTaskCodeAudit(taskID, runID int64, additionalBudget int, fromStatus string) (*TaskCodeAuditRun, error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var assessmentMode bool
+	var status string
+	if err := tx.QueryRow(`SELECT assessment_mode, status FROM tasks WHERE id=$1 FOR UPDATE`, taskID).
+		Scan(&assessmentMode, &status); err != nil {
+		return nil, err
+	}
+	if assessmentMode && (status == "done" || status == "failed" || status == "timeout") {
+		return nil, sql.ErrNoRows
+	}
+	result, err := tx.Exec(`UPDATE task_code_audit_runs SET status='queued',budget_tokens=CASE WHEN budget_tokens=0 OR $3=0 THEN 0 ELSE budget_tokens+$3 END,
+error='',completed_at=NULL,updated_at=now() WHERE task_id=$1 AND id=$2 AND status=$4
+AND ($3=0 OR $3 BETWEEN 1000 AND 500000)`, taskID, runID, additionalBudget, fromStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -324,25 +344,19 @@ AND $3 BETWEEN 1000 AND 500000`, taskID, runID, additionalBudget)
 	}
 	if count == 0 {
 		return nil, sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return d.GetTaskCodeAudit(taskID, runID)
 }
 
+func (d *DB) ResumeTaskCodeAudit(taskID, runID int64, additionalBudget int) (*TaskCodeAuditRun, error) {
+	return d.requeueTaskCodeAudit(taskID, runID, additionalBudget, "incomplete")
+}
+
 func (d *DB) RetryTaskCodeAudit(taskID, runID int64, additionalBudget int) (*TaskCodeAuditRun, error) {
-	result, err := d.Exec(`UPDATE task_code_audit_runs SET status='queued',budget_tokens=budget_tokens+$3,
-error='',completed_at=NULL,updated_at=now() WHERE task_id=$1 AND id=$2 AND status='failed'
-AND $3 BETWEEN 1000 AND 500000`, taskID, runID, additionalBudget)
-	if err != nil {
-		return nil, err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if count == 0 {
-		return nil, sql.ErrNoRows
-	}
-	return d.GetTaskCodeAudit(taskID, runID)
+	return d.requeueTaskCodeAudit(taskID, runID, additionalBudget, "failed")
 }
 
 func (d *DB) AddTaskCodeAuditReviewUsage(runID int64, usedTokens int) error {

@@ -1,7 +1,9 @@
 package db
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -215,7 +217,6 @@ func TestObligationTerminalEvidenceContract(t *testing.T) {
 
 func TestAssessmentCompletionContractZeroObligationAndZeroTargets(t *testing.T) {
 	d, task, round := assessmentFixture(t)
-	_ = round
 	// 零资产 + 零义务：只有 fact 的空任务不能判完成。
 	report, err := d.AssessmentCompletionCheck(task.ID)
 	if err != nil {
@@ -225,7 +226,7 @@ func TestAssessmentCompletionContractZeroObligationAndZeroTargets(t *testing.T) 
 
 	// 只建目标不改义务：仍不能完成。
 	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
-		TaskID: task.ID, EntityType: "service", Name: "user-service",
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "service", Name: "user-service",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +240,7 @@ func TestAssessmentCompletionContractZeroObligationAndZeroTargets(t *testing.T) 
 func TestAssessmentCompletionContractUnresolvedGap(t *testing.T) {
 	d, task, round := assessmentFixture(t)
 	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
-		TaskID: task.ID, EntityType: "service", Name: "user-service",
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "module", Name: "user-service",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +261,7 @@ func TestAssessmentCompletionContractUnresolvedGap(t *testing.T) {
 func TestAssessmentCompletionContractMissingCredentials(t *testing.T) {
 	d, task, round := assessmentFixture(t)
 	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
-		TaskID: task.ID, EntityType: "service", Name: "admin-console",
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "service", Name: "admin-console",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +284,7 @@ func TestAssessmentCompletionContractMissingCredentials(t *testing.T) {
 func TestAssessmentCompletionContractFailedOnlyAttempts(t *testing.T) {
 	d, task, round := assessmentFixture(t)
 	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
-		TaskID: task.ID, EntityType: "entry", Name: "POST /api/login",
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "entry", Name: "POST /api/login",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +336,7 @@ VALUES($1,$2,$3,'v1','queued')`, task.ID, serviceID, codebaseID); err != nil {
 func TestAssessmentCompletionContractActiveIntentsAndEvents(t *testing.T) {
 	d, task, round := assessmentFixture(t)
 	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
-		TaskID: task.ID, EntityType: "service", Name: "user-service",
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "service", Name: "user-service",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -818,5 +819,188 @@ VALUES($1,$2,'service','service','confirmed','manual',true,'v1') RETURNING id`,
 		TaskID: task.ID, CodeServiceID: serviceID, CodebaseID: codebaseID, VersionID: "v1",
 	}); err != nil {
 		t.Fatalf("非终态评估任务入队失败: %v", err)
+	}
+}
+
+// mustCodeAuditRun 直插一条指定状态的白盒审计运行并返回其 id。
+func mustCodeAuditRun(t *testing.T, d *DB, taskID int64, status string) int64 {
+	t.Helper()
+	codebaseID := "run-" + strconv.FormatInt(taskID, 10) + "-" + status
+	var serviceID int64
+	if err := d.QueryRow(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,latest_present,latest_version_id)
+VALUES($1,$2,'service','service','confirmed','manual',true,'v1') RETURNING id`,
+		taskID, codebaseID).Scan(&serviceID); err != nil {
+		t.Fatal(err)
+	}
+	var runID int64
+	if err := d.QueryRow(`INSERT INTO task_code_audit_runs(task_id,code_service_id,codebase_id,version_id,status)
+VALUES($1,$2,$3,'v1',$4) RETURNING id`, taskID, serviceID, codebaseID, status).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	return runID
+}
+
+// TestResumeRetryTaskCodeAuditRejectsTerminalAssessmentTask（P1 复审）：
+// Resume/Retry 与入队共用任务行锁 + 终态守卫——评估任务完成后不能再把
+// 白盒运行重新排队，避免完成报告遗漏未结束的审计工作。
+func TestResumeRetryTaskCodeAuditRejectsTerminalAssessmentTask(t *testing.T) {
+	d, task, _ := assessmentFixture(t)
+	resumeRun := mustCodeAuditRun(t, d, task.ID, "incomplete")
+	retryRun := mustCodeAuditRun(t, d, task.ID, "failed")
+	// 评估模式下任务已完成 → 两条重排队路径都拒绝。
+	if _, err := d.Exec(`UPDATE tasks SET assessment_mode=true, status='done' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 0); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("终态评估任务的 Resume 应被拒绝: %v", err)
+	}
+	if _, err := d.RetryTaskCodeAudit(task.ID, retryRun, 0); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("终态评估任务的 Retry 应被拒绝: %v", err)
+	}
+	var status string
+	if err := d.QueryRow(`SELECT status FROM task_code_audit_runs WHERE id=$1`, resumeRun).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "incomplete" {
+		t.Fatalf("被拒绝的 Resume 不应改写运行状态: %q", status)
+	}
+	// 评估模式但非终态 → 允许重排队（Resume 恢复 incomplete，Retry 恢复 failed）。
+	if _, err := d.Exec(`UPDATE tasks SET status='running' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 0); err != nil {
+		t.Fatalf("非终态评估任务 Resume 失败: %v", err)
+	}
+	if _, err := d.RetryTaskCodeAudit(task.ID, retryRun, 0); err != nil {
+		t.Fatalf("非终态评估任务 Retry 失败: %v", err)
+	}
+}
+
+// TestRecordTestAttemptRejectsForeignExecutionLinkage（P2 复审）：执行关联
+// 没有外键，写入时必须连同归属一并核验——他人/不存在的意图节点与白盒
+// 运行不能充当执行依据；判定侧也要把遗留的悬空关联尝试排除在有效处置外。
+func TestRecordTestAttemptRejectsForeignExecutionLinkage(t *testing.T) {
+	d, task, round := assessmentFixture(t)
+	otherDB, otherTask, _ := assessmentFixture(t)
+	obligation := buildSatisfiableObligation(t, d, task, round, DimensionEntryTest, "entry:foreign-link")
+	foreignIntentNode := mustIntentNode(t, otherDB, otherTask)
+	foreignRun := mustCodeAuditRun(t, d, otherTask.ID, "completed")
+	var reservedIntentNode, reservedRun int64
+	if err := d.QueryRow(`SELECT nextval(pg_get_serial_sequence('exploration_nodes','id'))`).Scan(&reservedIntentNode); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.QueryRow(`SELECT nextval(pg_get_serial_sequence('task_code_audit_runs','id'))`).Scan(&reservedRun); err != nil {
+		t.Fatal(err)
+	}
+	for name, in := range map[string]RecordTestAttemptInput{
+		"他人意图节点":   {TaskID: task.ID, ObligationID: obligation.ID, Outcome: AttemptSupported, IntentNodeID: &foreignIntentNode},
+		"不存在的意图节点": {TaskID: task.ID, ObligationID: obligation.ID, Outcome: AttemptSupported, IntentNodeID: &reservedIntentNode},
+		"他人的白盒运行":  {TaskID: task.ID, ObligationID: obligation.ID, Outcome: AttemptSupported, CodeAuditRunID: &foreignRun},
+		"不存在的白盒运行": {TaskID: task.ID, ObligationID: obligation.ID, Outcome: AttemptSupported, CodeAuditRunID: &reservedRun},
+	} {
+		if _, err := d.RecordTestAttempt(in); !errors.Is(err, ErrObligationOwnershipMismatch) {
+			t.Fatalf("%s 应被归属核验拒绝: %v", name, err)
+		}
+	}
+	// 遗留脏数据：绕过写入校验直接落一条悬空关联的 supported 尝试 → 判定侧
+	// 不计入有效处置，执行类义务不能凭它满足。
+	if _, err := d.Exec(`INSERT INTO task_test_attempts(task_id,obligation_id,attempt_no,intent_node_id,outcome)
+VALUES($1,$2,1,$3,'supported')`, task.ID, obligation.ID, reservedIntentNode); err != nil {
+		t.Fatal(err)
+	}
+	staticEvidence := mustEvidence(t, d, task.ID, "controller/ForeignLink.java")
+	if won, err := d.TransitionObligationStatus(obligation.ID, ObligationPending, ObligationSatisfied,
+		TransitionObligationOptions{EvidenceRefID: &staticEvidence}); err == nil || won {
+		t.Fatalf("悬空关联尝试不应支撑 satisfy: won=%v err=%v", won, err)
+	}
+	// 本任务意图节点 → 通过。
+	ownIntentNode := mustIntentNode(t, d, task)
+	if _, err := d.RecordTestAttempt(RecordTestAttemptInput{
+		TaskID: task.ID, ObligationID: obligation.ID, Outcome: AttemptSupported, IntentNodeID: &ownIntentNode,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUnboundRoundRecordsExcludedFromCompletion（P2 复审）：未绑定轮次的
+// 记录不属于任何一轮——写入侧强制绑定，读取侧严格按 round_id 匹配，遗留的
+// NULL round 记录不计入当前轮次的完成判定。
+func TestUnboundRoundRecordsExcludedFromCompletion(t *testing.T) {
+	d, task, _ := assessmentFixture(t)
+	// 写入侧：不绑定轮次直接拒绝。
+	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
+		TaskID: task.ID, EntityType: "service", Name: "unbound-service",
+	}); err == nil || !strings.Contains(err.Error(), "must be bound to an assessment round") {
+		t.Fatalf("未绑定轮次的目标实体应被拒绝: %v", err)
+	}
+	if _, err := d.CreateCoverageObligation(CreateCoverageObligationInput{
+		TaskID: task.ID, Dimension: DimensionCodeAudit, Required: true, DedupeKey: "code:unbound",
+	}); err == nil || !strings.Contains(err.Error(), "must be bound to an assessment round") {
+		t.Fatalf("未绑定轮次的覆盖义务应被拒绝: %v", err)
+	}
+	// 遗留 NULL round 记录（绕过写入校验直接落库）不得混入当前轮次。
+	if _, err := d.Exec(`INSERT INTO task_target_entities(task_id,round_id,entity_type,name)
+VALUES($1,NULL,'service','legacy-service')`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO task_coverage_obligations(task_id,round_id,dimension,purpose,required,status,dedupe_key)
+VALUES($1,NULL,'code_audit','legacy',true,'satisfied','')`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.AssessmentCompletionCheck(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Obligations.Satisfied != 0 || report.TargetCount != 0 {
+		t.Fatalf("NULL round 记录泄漏进当前轮次: satisfied=%d target=%d",
+			report.Obligations.Satisfied, report.TargetCount)
+	}
+	assertCannotComplete(t, report, "没有任何已满足或有依据不适用的必需覆盖义务", "没有任何目标对象")
+}
+
+// TestCompletionCheckTrimsBlankCredentialsAndReasons（P2 复审）：完成检查对
+// 历史记录的空白判定用 btrim——纯空白的凭证引用与不适用理由等同缺失，
+// 不能靠落一串空格绕过契约。
+func TestCompletionCheckTrimsBlankCredentialsAndReasons(t *testing.T) {
+	d, task, round := assessmentFixture(t)
+	cred := buildSatisfiableObligation(t, d, task, round, DimensionIdentityResource, "identity:blank-cred")
+	if _, err := d.Exec(`UPDATE task_coverage_obligations SET requires_credentials=true, credential_ref='   '
+WHERE id=$1`, cred.ID); err != nil {
+		t.Fatal(err)
+	}
+	na := buildSatisfiableObligation(t, d, task, round, DimensionRuntimeAsset, "runtime:blank-reason")
+	if _, err := d.Exec(`UPDATE task_coverage_obligations SET status='not_applicable', not_applicable_reason='   '
+WHERE id=$1`, na.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.AssessmentCompletionCheck(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Obligations.MissingCredentials != 1 {
+		t.Fatalf("空白凭证引用应计入缺凭证: %d", report.Obligations.MissingCredentials)
+	}
+	if report.Obligations.NotApplicableWithoutReason != 1 {
+		t.Fatalf("空白不适用理由应被拦截: %d", report.Obligations.NotApplicableWithoutReason)
+	}
+	assertCannotComplete(t, report, "缺少凭证解析", "缺少可审计的不适用理由")
+}
+
+// TestObligationDedupeIndexMigratedToV2（P3 复审）：dedupe 索引迁移沿用
+// uq_task_scope_v2 惯例——DO $$ 条件块只执行一次，v2 索引存在、旧索引不再重建。
+func TestObligationDedupeIndexMigratedToV2(t *testing.T) {
+	d, _, _ := assessmentFixture(t)
+	var v2, legacy int64
+	if err := d.QueryRow(`SELECT count(*) FROM pg_indexes WHERE indexname='uq_task_coverage_obligations_dedupe_v2'`).Scan(&v2); err != nil {
+		t.Fatal(err)
+	}
+	if v2 != 1 {
+		t.Fatalf("v2 dedupe 索引缺失: %d", v2)
+	}
+	if err := d.QueryRow(`SELECT count(*) FROM pg_indexes WHERE indexname='uq_task_coverage_obligations_dedupe'`).Scan(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy != 0 {
+		t.Fatalf("旧 dedupe 索引应已被 v2 迁移替换: %d", legacy)
 	}
 }

@@ -2262,11 +2262,22 @@ CREATE TABLE IF NOT EXISTS task_coverage_obligations (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     satisfied_at          TIMESTAMPTZ
 );
--- 去重作用域含轮次：同一任务同一轮次幂等，新轮次可重建同名义务。
--- 先删旧版（按 task_id, dedupe_key）再建，保证存量库也迁移到新作用域。
-DROP INDEX IF EXISTS uq_task_coverage_obligations_dedupe;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_task_coverage_obligations_dedupe
-    ON task_coverage_obligations(task_id, COALESCE(round_id, 0), dedupe_key) WHERE dedupe_key <> '';
+-- 去重作用域含轮次（uq_task_scope → uq_task_scope_v2 的迁移惯例）：同一任务
+-- 同一轮次幂等，新轮次可重建同名义务。仅当 v2 不存在时才执行一次旧索引
+-- 删除 + 重建；schema 每次启动都会应用，同名 DROP+CREATE 会在已迁移库上
+-- 反复重建并阻塞义务表。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE indexname = 'uq_task_coverage_obligations_dedupe_v2'
+    ) THEN
+        DROP INDEX IF EXISTS uq_task_coverage_obligations_dedupe;
+        CREATE UNIQUE INDEX uq_task_coverage_obligations_dedupe_v2
+            ON task_coverage_obligations(task_id, COALESCE(round_id, 0), dedupe_key)
+            WHERE dedupe_key <> '';
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_task_coverage_obligations_task
     ON task_coverage_obligations(task_id, status);
 

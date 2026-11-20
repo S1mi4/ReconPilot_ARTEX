@@ -341,6 +341,11 @@ func (d *DB) CreateTargetEntity(in CreateTargetEntityInput) (*TargetEntity, erro
 	if in.Gap && in.GapReason == "" {
 		return nil, errors.New("target entity gap requires a reason")
 	}
+	// 目标实体必须在写入时绑定所属轮次（§6.4）：读取侧按 round_id 严格匹配，
+	// 未绑定的记录不计入任何轮次，不能靠"留空混进每一轮"。
+	if in.RoundID == nil {
+		return nil, errors.New("target entity must be bound to an assessment round")
+	}
 	attributes := "{}"
 	if len(in.Attributes) > 0 {
 		attributes = string(in.Attributes)
@@ -414,6 +419,11 @@ func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*Covera
 	if in.DedupeKey == "" {
 		return nil, errors.New("coverage obligation requires a dedupe key")
 	}
+	// 覆盖义务必须在写入时绑定所属轮次（§6.4）：读取侧按 round_id 严格匹配，
+	// 未绑定的记录不计入任何轮次的完成判定。
+	if in.RoundID == nil {
+		return nil, errors.New("coverage obligation must be bound to an assessment round")
+	}
 	rule := "{}"
 	if len(in.AcceptanceRule) > 0 {
 		rule = string(in.AcceptanceRule)
@@ -465,13 +475,23 @@ type TransitionObligationOptions struct {
 }
 
 // effectiveAttemptCondition 是"有依据的处置"尝试的 SQL 条件：结果属于
-// supported/disproved/unreproduced，且尝试自带可验证的执行关联（意图节点、
-// 白盒运行或执行输出证据）。只有结果枚举、没有任何执行关联的"裸尝试"
-// 不算已执行（§5.3：静态阅读不等于动态验证）。
+// supported/disproved/unreproduced，且尝试自带可验证的执行关联——意图节点
+// 须属于本任务的探索图、白盒运行须属于本任务、执行输出证据须属于本任务。
+// 关联列没有外键，只查 ID 非空会让已删除/不存在/他人的记录蒙混过关；
+// 只有结果枚举、没有任何执行关联的"裸尝试"不算已执行（§5.3）。
 const effectiveAttemptCondition = `outcome IN ('supported','disproved','unreproduced')
-  AND (intent_node_id IS NOT NULL OR code_audit_run_id IS NOT NULL
-       OR EXISTS (SELECT 1 FROM task_evidence_refs e
-                   WHERE e.id = attempt.evidence_ref_id AND e.kind = 'execution_output'))`
+  AND (
+       (intent_node_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM exploration_nodes n
+            WHERE n.id = attempt.intent_node_id
+              AND n.exploration_id = (SELECT t.exploration_id FROM tasks t
+                                       WHERE t.id = attempt.task_id)))
+    OR (code_audit_run_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM task_code_audit_runs r
+            WHERE r.id = attempt.code_audit_run_id AND r.task_id = attempt.task_id))
+    OR EXISTS (SELECT 1 FROM task_evidence_refs e
+               WHERE e.id = attempt.evidence_ref_id AND e.task_id = attempt.task_id
+                 AND e.kind = 'execution_output'))`
 
 func (d *DB) TransitionObligationStatus(obligationID int64, expected, next string, opts TransitionObligationOptions) (bool, error) {
 	if !IsValidObligationStatus(next) {
@@ -588,10 +608,37 @@ func (d *DB) RecordTestAttempt(in RecordTestAttemptInput) (int64, error) {
 		}
 	}
 	// 有依据处置（supported/disproved/unreproduced）的尝试必须自带可验证的
-	// 执行关联：意图节点、白盒运行或执行输出证据。只有结果枚举、配上静态
-	// 证据的"裸尝试"不算已执行（§5.3）。
+	// 执行关联：意图节点、白盒运行或执行输出证据。关联列没有外键，只查
+	// ID 非空会让已删除/不存在/他人的记录蒙混过关——这里连同归属一并核验
+	//（§5.3：静态阅读不等于动态验证）。
 	if _, effective := effectiveAttemptOutcomes[in.Outcome]; effective {
-		linked := in.IntentNodeID != nil || in.CodeAuditRunID != nil
+		linked := false
+		if in.IntentNodeID != nil {
+			var n int64
+			if err := tx.QueryRow(`SELECT count(*) FROM exploration_nodes n
+JOIN tasks t ON t.exploration_id=n.exploration_id
+WHERE n.id=$1 AND t.id=$2`, *in.IntentNodeID, in.TaskID).Scan(&n); err != nil {
+				return 0, err
+			}
+			linked = n > 0
+			if !linked {
+				return 0, fmt.Errorf("%w: intent node %d does not belong to task %d",
+					ErrObligationOwnershipMismatch, *in.IntentNodeID, in.TaskID)
+			}
+		}
+		if in.CodeAuditRunID != nil {
+			var n int64
+			if err := tx.QueryRow(`SELECT count(*) FROM task_code_audit_runs
+WHERE id=$1 AND task_id=$2`, *in.CodeAuditRunID, in.TaskID).Scan(&n); err != nil {
+				return 0, err
+			}
+			if n > 0 {
+				linked = true
+			} else {
+				return 0, fmt.Errorf("%w: code audit run %d does not belong to task %d",
+					ErrObligationOwnershipMismatch, *in.CodeAuditRunID, in.TaskID)
+			}
+		}
 		if !linked && in.EvidenceRefID != nil {
 			var kind string
 			if err := tx.QueryRow(`SELECT kind FROM task_evidence_refs WHERE id=$1`, *in.EvidenceRefID).
@@ -740,7 +787,8 @@ func (d *DB) AssessmentCompletionCheck(taskID int64) (*AssessmentCompletionRepor
 
 	// 必需义务统计 + 证据/凭证核验。缺凭证检查覆盖全部适用义务（含已标
 	// satisfied 的）——satisfied 不能凭空免除凭证要求；仅不适用义务除外
-	//（没有对应工作，自然不需要凭证）。
+	//（没有对应工作，自然不需要凭证）。空白判定与写入侧一致用 btrim：
+	// 纯空白凭证引用/理由同样视为缺失（§6.1）。
 	err = d.QueryRow(`
 SELECT
   count(*) FILTER (WHERE status='satisfied'),
@@ -750,11 +798,11 @@ SELECT
   count(*) FILTER (WHERE status='running'),
   count(*) FILTER (WHERE status='blocked'),
   count(*) FILTER (WHERE status='stale'),
-  count(*) FILTER (WHERE requires_credentials AND credential_ref='' AND status <> 'not_applicable'),
+  count(*) FILTER (WHERE requires_credentials AND btrim(credential_ref)='' AND status <> 'not_applicable'),
   count(*) FILTER (WHERE status='satisfied' AND evidence_ref_id IS NOT NULL),
-  count(*) FILTER (WHERE status='not_applicable' AND not_applicable_reason='')
+  count(*) FILTER (WHERE status='not_applicable' AND btrim(not_applicable_reason)='')
 FROM task_coverage_obligations
-WHERE task_id=$1 AND required AND COALESCE(round_id, $2)=$2`, taskID, round.ID).Scan(
+WHERE task_id=$1 AND required AND round_id=$2`, taskID, round.ID).Scan(
 		&report.Obligations.Satisfied, &report.Obligations.NotApplicable,
 		&report.Obligations.Pending, &report.Obligations.Ready, &report.Obligations.Running,
 		&report.Obligations.Blocked, &report.Obligations.Stale,
@@ -796,7 +844,7 @@ WHERE task_id=$1 AND required AND COALESCE(round_id, $2)=$2`, taskID, round.ID).
 	if err := d.QueryRow(`
 SELECT count(*)
 FROM task_coverage_obligations o
-WHERE o.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2
+WHERE o.task_id=$1 AND o.required AND o.round_id=$2
   AND o.status='satisfied'
   AND o.dimension IN ('entry_test','identity_resource','cross_module')
   AND NOT EXISTS (
@@ -813,8 +861,8 @@ WHERE o.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2
 	// 零资产/零目标不能判完成，缺口不能静默消失。
 	err = d.QueryRow(`
 SELECT
-  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND NOT gap AND COALESCE(round_id,$2)=$2),
-  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND gap AND NOT resolved AND COALESCE(round_id,$2)=$2)`,
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND NOT gap AND round_id=$2),
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND gap AND NOT resolved AND round_id=$2)`,
 		taskID, round.ID).Scan(&report.TargetCount, &report.UnresolvedGaps)
 	if err != nil {
 		return nil, err
@@ -834,7 +882,7 @@ SELECT
   count(*) FILTER (WHERE attempt.outcome IN ('env_mismatch','dependency_missing','failed'))
 FROM task_test_attempts attempt
 JOIN task_coverage_obligations o ON o.id=attempt.obligation_id
-WHERE attempt.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2`, taskID, round.ID).Scan(
+WHERE attempt.task_id=$1 AND o.required AND o.round_id=$2`, taskID, round.ID).Scan(
 		&report.TotalAttempts, &report.EffectiveAttempts, &report.FailedAttempts)
 	if err != nil {
 		return nil, err
