@@ -847,6 +847,26 @@ func TestResumeRetryTaskCodeAuditRejectsTerminalAssessmentTask(t *testing.T) {
 	d, task, _ := assessmentFixture(t)
 	resumeRun := mustCodeAuditRun(t, d, task.ID, "incomplete")
 	retryRun := mustCodeAuditRun(t, d, task.ID, "failed")
+	// 追加预算语义（累加，不清零）：0=不追加、保留存量预算；正数超界拒绝。
+	if _, err := d.Exec(`UPDATE task_code_audit_runs SET budget_tokens=20000 WHERE id=$1`, resumeRun); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("低于下限的预算应被拒绝: %v", err)
+	}
+	if _, err := d.RetryTaskCodeAudit(task.ID, retryRun, 500001); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("超上限的预算应被拒绝: %v", err)
+	}
+	resumed, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 0)
+	if err != nil {
+		t.Fatalf("零预算 Resume（不追加）不应失败: %v", err)
+	}
+	if resumed.BudgetTokens != 20000 {
+		t.Fatalf("零预算 Resume 应保留存量预算: %d want 20000", resumed.BudgetTokens)
+	}
+	if _, err := d.Exec(`UPDATE task_code_audit_runs SET status='incomplete' WHERE id=$1`, resumeRun); err != nil {
+		t.Fatal(err)
+	}
 	// 评估模式下任务已完成 → 两条重排队路径都拒绝。
 	if _, err := d.Exec(`UPDATE tasks SET assessment_mode=true, status='done' WHERE id=$1`, task.ID); err != nil {
 		t.Fatal(err)
@@ -864,14 +884,19 @@ func TestResumeRetryTaskCodeAuditRejectsTerminalAssessmentTask(t *testing.T) {
 	if status != "incomplete" {
 		t.Fatalf("被拒绝的 Resume 不应改写运行状态: %q", status)
 	}
-	// 评估模式但非终态 → 允许重排队（Resume 恢复 incomplete，Retry 恢复 failed）。
+	// 评估模式但非终态 → 允许重排队（Resume 恢复 incomplete，Retry 恢复 failed），
+	// 预算在存量基础上累加。
 	if _, err := d.Exec(`UPDATE tasks SET status='running' WHERE id=$1`, task.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 0); err != nil {
+	run, err := d.ResumeTaskCodeAudit(task.ID, resumeRun, 5000)
+	if err != nil {
 		t.Fatalf("非终态评估任务 Resume 失败: %v", err)
 	}
-	if _, err := d.RetryTaskCodeAudit(task.ID, retryRun, 0); err != nil {
+	if run.BudgetTokens != 25000 {
+		t.Fatalf("Resume 后预算=%d want 25000（存量累加）", run.BudgetTokens)
+	}
+	if _, err := d.RetryTaskCodeAudit(task.ID, retryRun, 50000); err != nil {
 		t.Fatalf("非终态评估任务 Retry 失败: %v", err)
 	}
 }
@@ -1002,5 +1027,94 @@ func TestObligationDedupeIndexMigratedToV2(t *testing.T) {
 	}
 	if legacy != 0 {
 		t.Fatalf("旧 dedupe 索引应已被 v2 迁移替换: %d", legacy)
+	}
+}
+
+// TestLegacyUnboundRecordsBlockCompletion（P2 三审）：旧版允许创建
+// round_id 为空的缺口/义务；升级后遗留的未了结记录不能因"不计入本轮"
+// 被静默跳过——当前轮次全部满足时仍须阻断完成，直到迁移/对账完成。
+func TestLegacyUnboundRecordsBlockCompletion(t *testing.T) {
+	d, task, round := assessmentFixture(t)
+	// 当前轮次构造一个完全满足的评估场景。
+	if _, err := d.CreateTargetEntity(CreateTargetEntityInput{
+		TaskID: task.ID, RoundID: &round.ID, EntityType: "service", Name: "user-service",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	satisfiedEvidence := mustEvidence(t, d, task.ID, "src/LegacyReconcile.java")
+	satisfied := buildSatisfiableObligation(t, d, task, round, DimensionCodeAudit, "code:reconcile")
+	if won, err := d.TransitionObligationStatus(satisfied.ID, ObligationPending, ObligationSatisfied,
+		TransitionObligationOptions{EvidenceRefID: &satisfiedEvidence}); err != nil || !won {
+		t.Fatalf("当前轮次义务满足失败: won=%v err=%v", won, err)
+	}
+	// 遗留未对账缺口 + 未了结必需义务（round_id 为空）→ 哪怕本轮全部满足也不能完成。
+	if _, err := d.Exec(`INSERT INTO task_target_entities(task_id,round_id,entity_type,name,gap,gap_reason)
+VALUES($1,NULL,'module','legacy-ear',true,'解包失败：损坏的 class 文件')`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO task_coverage_obligations(task_id,round_id,dimension,purpose,required,status,dedupe_key)
+VALUES($1,NULL,'runtime_asset','legacy',true,'pending','')`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.AssessmentCompletionCheck(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.UnboundLegacyGaps != 1 || report.UnboundLegacyObligations != 1 {
+		t.Fatalf("遗留未对账计数 gaps=%d obligations=%d want 1/1",
+			report.UnboundLegacyGaps, report.UnboundLegacyObligations)
+	}
+	assertCannotComplete(t, report, "未绑定轮次的遗留缺口未对账", "未绑定轮次的遗留必需义务未了结")
+	// 对账完成（缺口 resolved + 义务了结）后解除阻断，本轮内容可判完成。
+	if _, err := d.Exec(`UPDATE task_target_entities SET resolved=true WHERE task_id=$1 AND round_id IS NULL AND gap`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE task_coverage_obligations SET status='not_applicable', not_applicable_reason='遗留义务已并入本轮评估'
+WHERE task_id=$1 AND round_id IS NULL AND required`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err = d.AssessmentCompletionCheck(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.CanComplete {
+		t.Fatalf("对账完成后应可判完成: %s", assessmentReasons(report))
+	}
+}
+
+// TestObligationDedupeMigrationScopesToCurrentSchema（P2 三审）：共用同一
+// PostgreSQL 时其它 schema 的同名 v2 索引不能让本表跳过迁移——存在性按
+// 当前 schema 的目标表判断，否则 CreateCoverageObligation 的 ON CONFLICT
+// 会因缺少匹配索引以 42P10 失败。
+func TestObligationDedupeMigrationScopesToCurrentSchema(t *testing.T) {
+	d, _, _ := assessmentFixture(t)
+	// 在其它 schema 放一个同名索引作干扰项。
+	if _, err := d.Exec(`CREATE SCHEMA IF NOT EXISTS dedupe_migration_decoy`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DROP SCHEMA dedupe_migration_decoy CASCADE`) })
+	if _, err := d.Exec(`CREATE TABLE IF NOT EXISTS dedupe_migration_decoy.decoy(id int)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`CREATE INDEX uq_task_coverage_obligations_dedupe_v2 ON dedupe_migration_decoy.decoy(id)`); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟本表未迁移：删掉本 schema 的 v2 索引后重新应用 schema。
+	if _, err := d.Exec(`DROP INDEX uq_task_coverage_obligations_dedupe_v2`); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	var migrated int64
+	if err := reopened.QueryRow(`SELECT count(*) FROM pg_indexes
+WHERE schemaname=current_schema() AND tablename='task_coverage_obligations'
+  AND indexname='uq_task_coverage_obligations_dedupe_v2'`).Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 1 {
+		t.Fatalf("干扰 schema 不能阻断本表的 v2 索引迁移: %d", migrated)
 	}
 }

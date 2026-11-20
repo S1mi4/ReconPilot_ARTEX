@@ -2265,12 +2265,15 @@ CREATE TABLE IF NOT EXISTS task_coverage_obligations (
 -- 去重作用域含轮次（uq_task_scope → uq_task_scope_v2 的迁移惯例）：同一任务
 -- 同一轮次幂等，新轮次可重建同名义务。仅当 v2 不存在时才执行一次旧索引
 -- 删除 + 重建；schema 每次启动都会应用，同名 DROP+CREATE 会在已迁移库上
--- 反复重建并阻塞义务表。
+-- 反复重建并阻塞义务表。存在性按当前 schema 的目标表判断——pg_indexes 只按
+-- 索引名匹配会命中其它 schema 的同名索引，导致本表漏迁移、ON CONFLICT 失败。
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_indexes
-        WHERE indexname = 'uq_task_coverage_obligations_dedupe_v2'
+        WHERE schemaname = current_schema()
+          AND tablename = 'task_coverage_obligations'
+          AND indexname = 'uq_task_coverage_obligations_dedupe_v2'
     ) THEN
         DROP INDEX IF EXISTS uq_task_coverage_obligations_dedupe;
         CREATE UNIQUE INDEX uq_task_coverage_obligations_dedupe_v2

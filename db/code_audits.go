@@ -332,7 +332,10 @@ func (d *DB) requeueTaskCodeAudit(taskID, runID int64, additionalBudget int, fro
 	if assessmentMode && (status == "done" || status == "failed" || status == "timeout") {
 		return nil, sql.ErrNoRows
 	}
-	result, err := tx.Exec(`UPDATE task_code_audit_runs SET status='queued',budget_tokens=CASE WHEN budget_tokens=0 OR $3=0 THEN 0 ELSE budget_tokens+$3 END,
+	// 追加预算语义（累加，绝不静默清零）：0=不追加、保留存量预算；正数必须
+	// 在 1,000~500,000 之间并在存量基础上累加。此前版本会把 0 请求写成
+	// "预算清零"，且一旦清零就永远加不回来——worker 会在开工前判定预算耗尽。
+	result, err := tx.Exec(`UPDATE task_code_audit_runs SET status='queued',budget_tokens=budget_tokens+$3,
 error='',completed_at=NULL,updated_at=now() WHERE task_id=$1 AND id=$2 AND status=$4
 AND ($3=0 OR $3 BETWEEN 1000 AND 500000)`, taskID, runID, additionalBudget, fromStatus)
 	if err != nil {

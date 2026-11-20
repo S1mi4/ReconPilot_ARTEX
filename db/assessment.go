@@ -740,15 +740,19 @@ type AssessmentCompletionReport struct {
 		NotApplicableWithoutReason int `json:"not_applicable_without_reason"`
 	} `json:"obligations"`
 
-	TargetCount        int `json:"target_count"`
-	UnresolvedGaps     int `json:"unresolved_gaps"`
-	UnprocessedEvents  int `json:"unprocessed_events"`
-	ActiveWhiteboxRuns int `json:"active_whitebox_runs"`
-	ActiveIntents      int `json:"active_intents"`
-	OpenGoals          int `json:"open_goals"`
-	TotalAttempts      int `json:"total_attempts"`
-	EffectiveAttempts  int `json:"effective_attempts"`
-	FailedAttempts     int `json:"failed_attempts"`
+	TargetCount    int `json:"target_count"`
+	UnresolvedGaps int `json:"unresolved_gaps"`
+	// RoundID 空缺的升级前遗留记录：不属于任何轮次，但未了结的缺口/必需
+	// 义务在对账（迁移绑轮或补录）前阻断完成判定（§6.3）。
+	UnboundLegacyGaps        int `json:"unbound_legacy_gaps"`
+	UnboundLegacyObligations int `json:"unbound_legacy_obligations"`
+	UnprocessedEvents        int `json:"unprocessed_events"`
+	ActiveWhiteboxRuns       int `json:"active_whitebox_runs"`
+	ActiveIntents            int `json:"active_intents"`
+	OpenGoals                int `json:"open_goals"`
+	TotalAttempts            int `json:"total_attempts"`
+	EffectiveAttempts        int `json:"effective_attempts"`
+	FailedAttempts           int `json:"failed_attempts"`
 }
 
 // AssessmentCompletionCheck evaluates the program completion contract for the
@@ -872,6 +876,27 @@ SELECT
 	}
 	if report.UnresolvedGaps > 0 {
 		addReason("材料清单存在 %d 个未对账缺口（读取/解析/分类失败不能静默消失）", report.UnresolvedGaps)
+	}
+
+	// 升级前的遗留记录（round_id 为空）不属于任何轮次：归属明确的由迁移
+	// 绑定轮次，其余未了结的缺口/必需义务不能因为"不计入本轮"就静默消失
+	// ——对账完成前阻止完成判定（§6.3）。
+	err = d.QueryRow(`
+SELECT
+  (SELECT count(*) FROM task_target_entities
+    WHERE task_id=$1 AND round_id IS NULL AND gap AND NOT resolved),
+  (SELECT count(*) FROM task_coverage_obligations
+    WHERE task_id=$1 AND round_id IS NULL AND required
+      AND status NOT IN ('satisfied','not_applicable'))`,
+		taskID).Scan(&report.UnboundLegacyGaps, &report.UnboundLegacyObligations)
+	if err != nil {
+		return nil, err
+	}
+	if report.UnboundLegacyGaps > 0 {
+		addReason("存在 %d 个未绑定轮次的遗留缺口未对账（迁移或补录所属轮次前不能判为完成）", report.UnboundLegacyGaps)
+	}
+	if report.UnboundLegacyObligations > 0 {
+		addReason("存在 %d 条未绑定轮次的遗留必需义务未了结（迁移或补录所属轮次前不能判为完成）", report.UnboundLegacyObligations)
 	}
 
 	// 尝试统计按当前轮次：历史轮次的尝试不参与本轮"只有失败尝试"判定。
