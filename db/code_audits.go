@@ -154,6 +154,12 @@ profile_id,profile_source,profile_name,profile_format,model,endpoint,source_ackn
 SELECT $1,$2,$3,$4,$5,'queued',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
 WHERE EXISTS (SELECT 1 FROM task_code_services WHERE task_id=$1 AND id=$2 AND decision='confirmed' AND latest_present
 AND codebase_id=$3 AND latest_version_id=$4)
+-- 锁任务行：FOR UPDATE 与 FinalizeAssessmentCompletion 的任务行锁互斥，
+-- 消除“完成检查之后、done 提交之前入队”的窗口（完成判定 §6.3）。
+-- 评估模式任务在终态后拒绝入队（已完成/失败/超时的任务不再产生需要
+-- 消化的白盒工作）；非评估任务行为不变。
+AND COALESCE((SELECT NOT (t.assessment_mode AND t.status IN ('done','failed','timeout'))
+              FROM tasks t WHERE t.id=$1 FOR UPDATE), false)
 RETURNING id`, input.TaskID, input.CodeServiceID, input.CodebaseID, input.VersionID, input.ScopePath, profileID,
 		input.ProfileSource, input.ProfileName, input.ProfileFormat, input.Model, input.Endpoint, input.SourceAcknowledged,
 		input.FilesTotal, input.FilesSkipped, input.ChunksTotal, input.BudgetTokens)

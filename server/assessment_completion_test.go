@@ -54,8 +54,15 @@ func TestManagerCompleteAssessmentRefusesWhenContractFails(t *testing.T) {
 
 func TestManagerCompleteAssessmentBlockedScenarios(t *testing.T) {
 	m, task := newAssessmentManagerTask(t)
-	if _, err := m.pg.CreateAssessmentRound(task.ProjectID); err == nil {
-		t.Fatalf("对项目 ID 建轮次不应成功（轮次挂在任务上）")
+	// 用确认不存在的任务 ID 验证外键拒绝：projects.id 与 tasks.id 来自独立
+	// 序列，任何取自其它表/对象的 ID（如项目 ID）都可能恰好等于某个已存在
+	// 的任务 ID，让该用例给上一条任务建出轮次而非触发外键失败。
+	var maxTaskID int64
+	if err := m.pg.QueryRow(`SELECT COALESCE(max(id),0)+1 FROM tasks`).Scan(&maxTaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.CreateAssessmentRound(maxTaskID); err == nil {
+		t.Fatalf("对不存在的任务 ID 建轮次不应成功")
 	}
 	round, err := m.pg.CreateAssessmentRound(assessmentTaskID(t, task))
 	if err != nil {

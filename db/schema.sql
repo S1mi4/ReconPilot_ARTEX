@@ -2247,7 +2247,8 @@ CREATE TABLE IF NOT EXISTS task_coverage_obligations (
     required              BOOLEAN NOT NULL DEFAULT true,
     status                TEXT NOT NULL DEFAULT 'pending'
                           CHECK (status IN ('pending','ready','running','satisfied','blocked','stale','not_applicable')),
-    -- 幂等标识：同一任务内 dedupe_key 唯一，重复规划不重复派工（§10 第 4 步）。
+    -- 幂等标识：同一轮次内 (task, round, dedupe_key) 唯一，重复规划不重复派工
+    --（§10 第 4 步）；新一轮次可用相同 key 重建义务，不命中历史轮次（§6.4）。
     dedupe_key            TEXT NOT NULL DEFAULT '',
     requires_credentials  BOOLEAN NOT NULL DEFAULT false,
     credential_ref        TEXT NOT NULL DEFAULT '',
@@ -2261,8 +2262,11 @@ CREATE TABLE IF NOT EXISTS task_coverage_obligations (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     satisfied_at          TIMESTAMPTZ
 );
+-- 去重作用域含轮次：同一任务同一轮次幂等，新轮次可重建同名义务。
+-- 先删旧版（按 task_id, dedupe_key）再建，保证存量库也迁移到新作用域。
+DROP INDEX IF EXISTS uq_task_coverage_obligations_dedupe;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_coverage_obligations_dedupe
-    ON task_coverage_obligations(task_id, dedupe_key) WHERE dedupe_key <> '';
+    ON task_coverage_obligations(task_id, COALESCE(round_id, 0), dedupe_key) WHERE dedupe_key <> '';
 CREATE INDEX IF NOT EXISTS idx_task_coverage_obligations_task
     ON task_coverage_obligations(task_id, status);
 

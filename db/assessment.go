@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -166,6 +167,10 @@ var (
 	ErrObligationStateConflict = errors.New("obligation state conflict")
 	// ErrObligationEvidenceMissing 表示不满足"证据要求"的终态推进被拒绝。
 	ErrObligationEvidenceMissing = errors.New("obligation terminal state requires evidence or reason")
+	// ErrObligationCredentialsMissing 表示需要凭证的义务未绑定凭证引用。
+	ErrObligationCredentialsMissing = errors.New("obligation requires credentials but none is bound")
+	// ErrObligationOwnershipMismatch 表示证据/尝试引用了不属于本任务（或本项目）的记录。
+	ErrObligationOwnershipMismatch = errors.New("referenced record does not belong to this task")
 )
 
 // ---------- 评估轮次 ----------
@@ -395,7 +400,9 @@ type CreateCoverageObligationInput struct {
 }
 
 // CreateCoverageObligation inserts an obligation; when dedupeKey already exists
-// for the task it returns the existing row unchanged (idempotent replan).
+// in the same round it returns the existing row unchanged (idempotent replan).
+// 去重作用域是 (task, round)（§6.4）：新一轮次可以用相同 key 为同一对象重建
+// 义务，而不会命中历史轮次的记录。
 func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*CoverageObligation, error) {
 	if !IsValidCoverageDimension(in.Dimension) {
 		return nil, fmt.Errorf("%w: %q", ErrObligationDimensionInvalid, in.Dimension)
@@ -415,7 +422,7 @@ func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*Covera
 INSERT INTO task_coverage_obligations(task_id, round_id, dimension, target_entity_id,
                                       purpose, required, dedupe_key, requires_credentials, acceptance_rule)
 VALUES ($1,$2,$3,$4,$5,true,$6,$7,$8::jsonb)
-ON CONFLICT (task_id, dedupe_key) WHERE dedupe_key <> '' DO UPDATE SET updated_at=now()
+ON CONFLICT (task_id, COALESCE(round_id, 0), dedupe_key) WHERE dedupe_key <> '' DO UPDATE SET updated_at=now()
 RETURNING id, task_id, round_id, dimension, target_entity_id, purpose, required, status,
           dedupe_key, requires_credentials, credential_ref, blocked_reason, stale_reason,
           not_applicable_reason, evidence_ref_id, acceptance_rule`,
@@ -445,9 +452,11 @@ func scanCoverageObligation(sc interface{ Scan(...any) error }) (*CoverageObliga
 // (compare-and-set on expected). Terminal states carry evidence requirements
 // so coverage cannot advance without a basis (§6.1/§6.3):
 //
-//   - satisfied：必须有证据引用（evidenceRefID 非空），且执行类维度必须有可执行
-//     依据；证据要求不满足时返回 ErrObligationEvidenceMissing，覆盖不推进。
-//   - not_applicable / blocked / stale：必须携带非空 reason。
+//   - satisfied：必须有证据引用（evidenceRefID 非空），证据必须属于本任务，
+//     需要凭证的义务必须已绑定凭证引用（credential_ref 非空），且执行类维度
+//     必须有可执行的尝试依据；证据要求不满足时返回 ErrObligationEvidenceMissing，
+//     覆盖不推进。
+//   - not_applicable / blocked / stale：必须携带非空白 reason。
 //
 // Planner/Worker 只能经由本方法提交结论建议；满足与否由这里的程序规则裁定。
 type TransitionObligationOptions struct {
@@ -455,29 +464,57 @@ type TransitionObligationOptions struct {
 	EvidenceRefID *int64 // satisfied 的证据引用
 }
 
+// effectiveAttemptCondition 是"有依据的处置"尝试的 SQL 条件：结果属于
+// supported/disproved/unreproduced，且尝试自带可验证的执行关联（意图节点、
+// 白盒运行或执行输出证据）。只有结果枚举、没有任何执行关联的"裸尝试"
+// 不算已执行（§5.3：静态阅读不等于动态验证）。
+const effectiveAttemptCondition = `outcome IN ('supported','disproved','unreproduced')
+  AND (intent_node_id IS NOT NULL OR code_audit_run_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM task_evidence_refs e
+                   WHERE e.id = attempt.evidence_ref_id AND e.kind = 'execution_output'))`
+
 func (d *DB) TransitionObligationStatus(obligationID int64, expected, next string, opts TransitionObligationOptions) (bool, error) {
 	if !IsValidObligationStatus(next) {
 		return false, fmt.Errorf("%w: %q", ErrObligationStatusInvalid, next)
 	}
-	if obligationStatusNeedsReason(next) && opts.Reason == "" {
-		return false, fmt.Errorf("%w: status %s requires a reason", ErrObligationEvidenceMissing, next)
+	if obligationStatusNeedsReason(next) && strings.TrimSpace(opts.Reason) == "" {
+		return false, fmt.Errorf("%w: status %s requires a non-blank reason", ErrObligationEvidenceMissing, next)
 	}
 	if next == ObligationSatisfied {
 		if opts.EvidenceRefID == nil {
 			return false, fmt.Errorf("%w: satisfied requires an evidence reference", ErrObligationEvidenceMissing)
 		}
-		// 执行类维度（入口测试/身份资源/跨模块）必须有可执行的尝试依据；
-		// 静态阅读不算动态验证（§1.1/§5.3）。
-		var dimension string
-		var ineffective int64
-		if err := d.QueryRow(`
-SELECT o.dimension,
-       (SELECT count(*) FROM task_test_attempts a
-         WHERE a.obligation_id=o.id AND a.outcome IN ('supported','disproved','unreproduced'))
-FROM task_coverage_obligations o WHERE o.id=$1`, obligationID).Scan(&dimension, &ineffective); err != nil {
+		// 一次性核验：证据归属本任务、凭证已绑定、执行类维度有可执行尝试依据。
+		var taskID int64
+		var dimension, credentialRef string
+		var requiresCredentials bool
+		var evidenceTask sql.NullInt64
+		var effectiveAttempts int64
+		err := d.QueryRow(`
+SELECT o.task_id, o.dimension, o.requires_credentials, o.credential_ref,
+       (SELECT task_id FROM task_evidence_refs WHERE id=$2),
+       (SELECT count(*) FROM task_test_attempts attempt
+         WHERE attempt.obligation_id=o.id AND `+effectiveAttemptCondition+`)
+FROM task_coverage_obligations o WHERE o.id=$1`, obligationID, *opts.EvidenceRefID).
+			Scan(&taskID, &dimension, &requiresCredentials, &credentialRef,
+				&evidenceTask, &effectiveAttempts)
+		if err != nil {
 			return false, err
 		}
-		if _, needsExecution := executionDimensions[dimension]; needsExecution && ineffective == 0 {
+		if !evidenceTask.Valid {
+			return false, fmt.Errorf("%w: evidence reference %d not found", ErrObligationOwnershipMismatch, *opts.EvidenceRefID)
+		}
+		if evidenceTask.Int64 != taskID {
+			return false, fmt.Errorf("%w: evidence %d belongs to task %d, not %d",
+				ErrObligationOwnershipMismatch, *opts.EvidenceRefID, evidenceTask.Int64, taskID)
+		}
+		if requiresCredentials && strings.TrimSpace(credentialRef) == "" {
+			return false, fmt.Errorf("%w: bind credential_ref before satisfying obligation %d",
+				ErrObligationCredentialsMissing, obligationID)
+		}
+		// 执行类维度（入口测试/身份资源/跨模块）必须有可执行的尝试依据；
+		// 静态阅读不算动态验证（§1.1/§5.3）。
+		if _, needsExecution := executionDimensions[dimension]; needsExecution && effectiveAttempts == 0 {
 			return false, fmt.Errorf("%w: dimension %s requires an effective execution attempt", ErrObligationEvidenceMissing, dimension)
 		}
 	}
@@ -501,8 +538,9 @@ WHERE id=$1 AND status=$2`, obligationID, expected, next, opts.Reason, opts.Evid
 // ---------- 测试尝试 ----------
 
 // RecordTestAttemptInput appends one execution attempt for an obligation.
-// attempt_no 在义务内自增；重复登记同一尝试由调用侧幂等键（后续步骤的
-// attempt 标识）保证，本方法只保证编号唯一。
+// attempt_no 在义务内自增：编号分配在义务行锁（FOR UPDATE）下串行，
+// 并发登记不会读到同一个 max 而撞唯一约束。重复登记同一尝试由调用侧
+// 幂等键（后续步骤的 attempt 标识）保证，本方法只保证编号唯一。
 type RecordTestAttemptInput struct {
 	TaskID         int64
 	ObligationID   int64
@@ -521,8 +559,55 @@ func (d *DB) RecordTestAttempt(in RecordTestAttemptInput) (int64, error) {
 	if len(in.Output) > 0 {
 		output = string(in.Output)
 	}
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	// 串行化编号分配：锁住义务行，两个并发的登记事务在此排队，
+	// 后到的事务提交前必能看到先到者写入的 attempt_no。
+	var obligationTask int64
+	if err := tx.QueryRow(`SELECT task_id FROM task_coverage_obligations WHERE id=$1 FOR UPDATE`,
+		in.ObligationID).Scan(&obligationTask); err != nil {
+		return 0, err
+	}
+	if obligationTask != in.TaskID {
+		return 0, fmt.Errorf("%w: obligation %d belongs to task %d, not %d",
+			ErrObligationOwnershipMismatch, in.ObligationID, obligationTask, in.TaskID)
+	}
+	if in.EvidenceRefID != nil {
+		var evidenceTask int64
+		err := tx.QueryRow(`SELECT task_id FROM task_evidence_refs WHERE id=$1`, *in.EvidenceRefID).
+			Scan(&evidenceTask)
+		if err == sql.ErrNoRows || (err == nil && evidenceTask != in.TaskID) {
+			return 0, fmt.Errorf("%w: evidence %d does not belong to task %d",
+				ErrObligationOwnershipMismatch, *in.EvidenceRefID, in.TaskID)
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	// 有依据处置（supported/disproved/unreproduced）的尝试必须自带可验证的
+	// 执行关联：意图节点、白盒运行或执行输出证据。只有结果枚举、配上静态
+	// 证据的"裸尝试"不算已执行（§5.3）。
+	if _, effective := effectiveAttemptOutcomes[in.Outcome]; effective {
+		linked := in.IntentNodeID != nil || in.CodeAuditRunID != nil
+		if !linked && in.EvidenceRefID != nil {
+			var kind string
+			if err := tx.QueryRow(`SELECT kind FROM task_evidence_refs WHERE id=$1`, *in.EvidenceRefID).
+				Scan(&kind); err == nil {
+				linked = kind == string(EvidenceExecution)
+			} else if err != sql.ErrNoRows {
+				return 0, err
+			}
+		}
+		if !linked {
+			return 0, fmt.Errorf("%w: effective attempts require an execution association (intent node / code-audit run / execution-output evidence)",
+				ErrObligationEvidenceMissing)
+		}
+	}
 	var id int64
-	err := d.QueryRow(`
+	err = tx.QueryRow(`
 INSERT INTO task_test_attempts(task_id, obligation_id, attempt_no, intent_node_id,
                                 code_audit_run_id, outcome, evidence_ref_id, output)
 VALUES ($1,$2,
@@ -531,6 +616,9 @@ VALUES ($1,$2,
 RETURNING id`, in.TaskID, in.ObligationID, in.IntentNodeID, in.CodeAuditRunID,
 		in.Outcome, in.EvidenceRefID, output).Scan(&id)
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -600,6 +688,9 @@ type AssessmentCompletionReport struct {
 		MissingCredentials int `json:"missing_credentials"`
 		// EvidenceBackedSatisfied 统计带证据引用的 satisfied 义务（应为全部）。
 		EvidenceBackedSatisfied int `json:"evidence_backed_satisfied"`
+		// NotApplicableWithoutReason 统计没有可审计理由的 not_applicable 记录
+		//（正常写入已被拦截；历史/脏数据在此兜底阻断契约）。
+		NotApplicableWithoutReason int `json:"not_applicable_without_reason"`
 	} `json:"obligations"`
 
 	TargetCount        int `json:"target_count"`
@@ -647,7 +738,9 @@ func (d *DB) AssessmentCompletionCheck(taskID int64) (*AssessmentCompletionRepor
 	}
 	report.RoundID, report.RoundNo = round.ID, round.RoundNo
 
-	// 必需义务统计 + 证据/凭证核验。
+	// 必需义务统计 + 证据/凭证核验。缺凭证检查覆盖全部适用义务（含已标
+	// satisfied 的）——satisfied 不能凭空免除凭证要求；仅不适用义务除外
+	//（没有对应工作，自然不需要凭证）。
 	err = d.QueryRow(`
 SELECT
   count(*) FILTER (WHERE status='satisfied'),
@@ -657,7 +750,7 @@ SELECT
   count(*) FILTER (WHERE status='running'),
   count(*) FILTER (WHERE status='blocked'),
   count(*) FILTER (WHERE status='stale'),
-  count(*) FILTER (WHERE requires_credentials AND credential_ref='' AND status NOT IN ('satisfied','not_applicable')),
+  count(*) FILTER (WHERE requires_credentials AND credential_ref='' AND status <> 'not_applicable'),
   count(*) FILTER (WHERE status='satisfied' AND evidence_ref_id IS NOT NULL),
   count(*) FILTER (WHERE status='not_applicable' AND not_applicable_reason='')
 FROM task_coverage_obligations
@@ -667,7 +760,7 @@ WHERE task_id=$1 AND required AND COALESCE(round_id, $2)=$2`, taskID, round.ID).
 		&report.Obligations.Blocked, &report.Obligations.Stale,
 		&report.Obligations.MissingCredentials,
 		&report.Obligations.EvidenceBackedSatisfied,
-		new(int64)) // not_applicable without reason: DB 写入已拦截,此处计数仅作审计
+		&report.Obligations.NotApplicableWithoutReason)
 	if err != nil {
 		return nil, err
 	}
@@ -693,8 +786,12 @@ WHERE task_id=$1 AND required AND COALESCE(round_id, $2)=$2`, taskID, round.ID).
 	if report.Obligations.EvidenceBackedSatisfied != report.Obligations.Satisfied {
 		addReason("%d 条 satisfied 义务缺少证据引用", report.Obligations.Satisfied-report.Obligations.EvidenceBackedSatisfied)
 	}
+	if report.Obligations.NotApplicableWithoutReason > 0 {
+		addReason("%d 条 not_applicable 义务缺少可审计的不适用理由", report.Obligations.NotApplicableWithoutReason)
+	}
 
-	// 执行类维度的 satisfied 必须有可执行尝试依据；只有失败尝试不能推进覆盖。
+	// 执行类维度的 satisfied 必须有可执行的尝试依据（带执行关联的有效处置）；
+	// 只有失败尝试或裸结果枚举不能推进覆盖。
 	var satisfiedNoEffectiveAttempt int64
 	if err := d.QueryRow(`
 SELECT count(*)
@@ -703,8 +800,8 @@ WHERE o.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2
   AND o.status='satisfied'
   AND o.dimension IN ('entry_test','identity_resource','cross_module')
   AND NOT EXISTS (
-      SELECT 1 FROM task_test_attempts a
-      WHERE a.obligation_id=o.id AND a.outcome IN ('supported','disproved','unreproduced'))`,
+      SELECT 1 FROM task_test_attempts attempt
+      WHERE attempt.obligation_id=o.id AND `+effectiveAttemptCondition+`)`,
 		taskID, round.ID).Scan(&satisfiedNoEffectiveAttempt); err != nil {
 		return nil, err
 	}
@@ -712,12 +809,13 @@ WHERE o.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2
 		addReason("%d 条已满足的执行类义务缺少可执行尝试依据（静态阅读不等于动态验证）", satisfiedNoEffectiveAttempt)
 	}
 
-	// 目标对象与清单缺口（零资产/零目标不能判完成；缺口不能静默消失）。
+	// 目标对象与清单缺口按当前轮次统计（历史轮次的目标不进入本轮分母）；
+	// 零资产/零目标不能判完成，缺口不能静默消失。
 	err = d.QueryRow(`
 SELECT
-  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND NOT gap),
-  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND gap AND NOT resolved)`,
-		taskID).Scan(&report.TargetCount, &report.UnresolvedGaps)
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND NOT gap AND COALESCE(round_id,$2)=$2),
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND gap AND NOT resolved AND COALESCE(round_id,$2)=$2)`,
+		taskID, round.ID).Scan(&report.TargetCount, &report.UnresolvedGaps)
 	if err != nil {
 		return nil, err
 	}
@@ -728,13 +826,15 @@ SELECT
 		addReason("材料清单存在 %d 个未对账缺口（读取/解析/分类失败不能静默消失）", report.UnresolvedGaps)
 	}
 
-	// 尝试统计：只有失败尝试（无任何有依据的处置）不能判完成。
+	// 尝试统计按当前轮次：历史轮次的尝试不参与本轮"只有失败尝试"判定。
 	err = d.QueryRow(`
 SELECT
   count(*),
-  count(*) FILTER (WHERE outcome IN ('supported','disproved','unreproduced')),
-  count(*) FILTER (WHERE outcome IN ('env_mismatch','dependency_missing','failed'))
-FROM task_test_attempts WHERE task_id=$1`, taskID).Scan(
+  count(*) FILTER (WHERE `+effectiveAttemptCondition+`),
+  count(*) FILTER (WHERE attempt.outcome IN ('env_mismatch','dependency_missing','failed'))
+FROM task_test_attempts attempt
+JOIN task_coverage_obligations o ON o.id=attempt.obligation_id
+WHERE attempt.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2`, taskID, round.ID).Scan(
 		&report.TotalAttempts, &report.EffectiveAttempts, &report.FailedAttempts)
 	if err != nil {
 		return nil, err
@@ -789,6 +889,81 @@ WHERE task_id=$1 AND NOT processed`, taskID).Scan(&report.UnprocessedEvents); er
 
 	report.CanComplete = len(report.Reasons) == 0
 	return report, nil
+}
+
+// FinalizeAssessmentCompletion 在单个事务里原子完成评估收尾（§6.3/§6.4）：
+//
+//  1. 锁定任务行并复核白盒队列没有 queued/running 运行——与
+//     CreateTaskCodeAudit 的任务行锁互斥，消除"完成检查之后、done 提交之前
+//     并发入队"的窗口；
+//  2. guarded 终态写入 done（与常规 done/timeout 路径 CAS，首写者胜出）；
+//  3. 关闭当前 open 轮次并落完成报告；
+//  4. 阶段推进到 completed。
+//
+// 任一步失败整体回滚，不会留下"任务 done 但轮次未关/报告缺失"的中间状态
+// （此前三步分开提交时，中途失败无法重试——终态守卫会拒绝一切后续写入）。
+// 队列在锁下仍非空时返回 won=false（非错误），调用方让任务继续运行。
+func (d *DB) FinalizeAssessmentCompletion(taskID, roundID int64, report json.RawMessage) (active int64, started *time.Time, won bool, err error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// 锁任务行：串行化与评估模式下白盒入队（CreateTaskCodeAudit 对
+	// assessment_mode 任务行 FOR UPDATE）的并发。
+	var status string
+	if err := tx.QueryRow(`SELECT status FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status); err != nil {
+		return 0, nil, false, err
+	}
+	if status == "done" || status == "failed" || status == "timeout" {
+		return 0, nil, false, nil
+	}
+	// 复核白盒队列：契约检查与终态提交之间不允许出现新的 queued/running 工作。
+	var queuedRuns int64
+	if err := tx.QueryRow(`SELECT count(*) FROM task_code_audit_runs
+WHERE task_id=$1 AND status IN ('queued','running')`, taskID).Scan(&queuedRuns); err != nil {
+		return 0, nil, false, err
+	}
+	if queuedRuns > 0 {
+		return 0, nil, false, nil
+	}
+	// Guarded 终态：与常规路径的 done/timeout 竞态由首写者胜出解决。
+	err = tx.QueryRow(`
+UPDATE tasks
+   SET status='done', pause_reason='', stop_reason='',
+       completed_at=COALESCE(completed_at, now()),
+       active_run_seconds = active_run_seconds + CASE WHEN run_segment_started_at IS NOT NULL
+           THEN GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - run_segment_started_at)))::bigint) ELSE 0 END,
+       run_segment_started_at = NULL
+ WHERE id=$1 AND status NOT IN ('done','failed','timeout')
+ RETURNING active_run_seconds, run_segment_started_at`, taskID).Scan(&active, &started)
+	if err == sql.ErrNoRows {
+		return 0, nil, false, nil
+	}
+	if err != nil {
+		return 0, nil, false, err
+	}
+	// 关闭当前轮次并落完成报告：轮次已被并发关闭时整体回滚（不覆盖历史）。
+	result, err := tx.Exec(`
+UPDATE task_assessment_rounds
+   SET status='completed', completion_report=$3, completed_at=now()
+ WHERE id=$2 AND task_id=$1 AND status='open'`, taskID, roundID, string(report))
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return 0, nil, false, ErrObligationStateConflict
+	}
+	// 阶段推进到 completed。
+	if _, err := tx.Exec(`UPDATE tasks SET assessment_phase=$2 WHERE id=$1`,
+		taskID, AssessmentPhaseCompleted); err != nil {
+		return 0, nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, false, err
+	}
+	return active, started, true, nil
 }
 
 // scanJSONRaw scans a nullable JSONB column into a RawMessage target.

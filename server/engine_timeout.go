@@ -285,9 +285,11 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, reason string) {
 	// ⑥ 定终态(带守卫):met → done(completed);否则 timeout。若常规路径已先落 done,
 	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
 	status := "timeout"
-	if met && t.AssessmentMode {
-		// 白盒驱动评估模式：终局判定的 done 同样必须经过程序完成契约（§6.3）；
-		// 契约未通过的超时任务按 timeout 收场，不冒充全覆盖完成。
+	if t.AssessmentMode {
+		// 白盒驱动评估模式：程序数据满足契约即可完成——不依赖终局 Planner
+		// 是否再次给出 met（终局 planner 出错/未提交 met 时，落库的程序数据
+		// 仍可满足契约；模型结论不能否决程序判定，§6.3）。契约未通过的超时
+		// 任务按 timeout 收场，不冒充全覆盖完成。
 		completed, report, cErr := e.m.CompleteAssessment(t)
 		switch {
 		case cErr != nil:
