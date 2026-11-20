@@ -118,14 +118,14 @@ func (d *DB) ListFindingCases(filter FindingFilter, page, size int) ([]FindingCa
 		return nil, 0, err
 	}
 	where, args := filter.where()
-	base := `WITH matched AS (SELECT f.id,f.severity,f.created_at,COALESCE(m.case_id,0) cid FROM findings f LEFT JOIN tasks t ON t.id=f.task_id LEFT JOIN finding_case_members m ON m.finding_id=f.id` + where + `), entities AS (SELECT CASE WHEN cid>0 THEN 'c:'||cid ELSE 'f:'||id END key,MAX(cid) cid,MIN(id) fid,jsonb_agg(id ORDER BY id) matched_ids,MAX(created_at) created,MAX(CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) severity_rank FROM matched GROUP BY key)`
+	base := `WITH matched AS (SELECT f.id,f.severity,f.created_at,CASE WHEN f.code_audit_evidence->>'registration_tier'='B' THEN 1 ELSE 0 END tier_rank,COALESCE(m.case_id,0) cid FROM findings f LEFT JOIN tasks t ON t.id=f.task_id LEFT JOIN finding_case_members m ON m.finding_id=f.id` + where + `), entities AS (SELECT CASE WHEN cid>0 THEN 'c:'||cid ELSE 'f:'||id END key,MAX(cid) cid,MIN(id) fid,jsonb_agg(id ORDER BY id) matched_ids,MIN(tier_rank) tier_rank,MAX(created_at) created,MAX(CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) severity_rank FROM matched GROUP BY key)`
 	var total int
 	if err := d.QueryRow(base+` SELECT count(*) FROM entities`, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	order := `e.created ` + filter.timeOrder() + `,e.fid DESC`
 	if filter.Sort == "severity" {
-		order = `e.severity_rank DESC,` + order
+		order = `e.tier_rank,e.severity_rank DESC,` + order
 	}
 	args = append(args, size, (page-1)*size)
 	rows, err := d.Query(base+fmt.Sprintf(` SELECT e.cid,e.fid,e.matched_ids FROM entities e ORDER BY %s LIMIT $%d OFFSET $%d`, order, len(args)-1, len(args)), args...)

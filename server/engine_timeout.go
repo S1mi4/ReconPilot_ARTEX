@@ -135,7 +135,7 @@ func needsNoResultCoordinator(t *Task) bool {
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || (t.TimeoutSeconds <= 0 && !needsNoResultCoordinator(t)) {
+	if t == nil || t.IsDraft() || (t.TimeoutSeconds <= 0 && !needsNoResultCoordinator(t)) {
 		return
 	}
 	e.deleteMu.RLock()

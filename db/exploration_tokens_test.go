@@ -111,6 +111,34 @@ func TestTokenStatsBySessionUsesCompleteIntentHistory(t *testing.T) {
 		14+24+completedRuns*4+34+44+54)
 }
 
+func TestTokenStatsBySessionMergesWhiteboxAliases(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+	expID, err := d.CreateExploration("whitebox sessions", "canonical and legacy audit history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	store := d.Exploration(expID)
+	for _, worker := range []string{"whitebox_audit", "whitebox_java_audit"} {
+		input, output, read, write := 11, 12, 13, 14
+		if _, err := store.AppendActivity(Activity{Worker: worker, Kind: "result", InputTokens: &input, OutputTokens: &output, CacheReadTokens: &read, CacheWriteTokens: &write}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessions, err := store.TokenStatsBySession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, want one canonical whitebox session", sessions)
+	}
+	assertSessionTokens(t, sessions[0], "whitebox_audit", 22, 24, 26, 28)
+}
+
 func assertSessionTokens(t *testing.T, got SessionTokenUsage, session string, input, output, read, write int) {
 	t.Helper()
 	if got.Session != session || got.InputTokens != input || got.OutputTokens != output ||

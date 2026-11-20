@@ -117,7 +117,7 @@ cd ARTEX
 脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
 
 - **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
+- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → 使用 Go、Maven 和 JDK 21 构建 ARTEX 与 JavaCodeDB → 启动。运行二进制审计还需要 Java 21 运行时。
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
 
@@ -142,7 +142,7 @@ docker compose up -d          # 拉取 ruoji6/artex 镜像 + postgres
 
 ### 方式三：下载预编译二进制（Releases）
 
-到本仓库的 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`。Linux ARM64（包括 ARM64 Kali）选择 `linux-arm64`，x86_64 选择 `linux-amd64`：
+到本仓库的 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex`、`java-code-db.jar`、`start.sh`（Windows 为 `start.bat`）、`skills/` 和 `config.example.json`。Linux ARM64（包括 ARM64 Kali）选择 `linux-arm64`，x86_64 选择 `linux-amd64`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
@@ -152,21 +152,23 @@ cp config.example.json config.json   # 填好 database 连接
 > 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./artex`。它是个守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的[一键更新](#方式一页面一键更新推荐)靠它完成换装**。直接运行 `./artex` 时更新完就不会被拉起了。
 > 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
 
-### 方式四：从源码编译单二进制
+### 方式四：从源码构建 ARTEX 与审计引擎
 
 ```bash
 # 1) 前端静态导出
 cd web && npm ci && npm run build:static && cd ..
 # 2) 拷进内嵌目录
 cp -r web/out server/webui/dist
-# 3) 编译（-tags embedui 才内嵌前端）
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+# 3) 构建 JavaCodeDB（需要 JDK 21 和 Maven；二进制审计运行时也需要 Java 21）
+./scripts/build-java-code-db.sh java-code-db.jar
+# 4) 编译（-tags embedui 才内嵌前端）
+CGO_ENABLED=0 go build -tags embedui,javacodedb -o artex ./cmd/artex
 ./start.sh
 ```
 
 ### 方式五：构建跨平台 Release 压缩包
 
-`build.sh` 会先构建并嵌入前端，再使用 Go linker 去除调试信息，并将发布文件压缩为 zip。Release 模式默认生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 的 zip 包：
+`build.sh` 需要 Maven 和 JDK 21，会先构建 JavaCodeDB JAR，再构建并嵌入前端、使用 Go linker 去除调试信息，并将 ARTEX、JavaCodeDB JAR 和启动文件压缩为 zip。Release 模式默认生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 的 zip 包：
 
 ```bash
 ./build.sh --release
@@ -192,7 +194,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 本仓库构建的程序固定从 `RuoJi6/ARTEX` 的最新正式 GitHub Release 检查更新，跳过草稿和预发布版本。旧版官方程序仍指向原作者仓库，因此首次切换必须手动安装本仓库构建的程序；以后发布更高的三段式版本即可通过页面升级。仅推送 main 或 Git 标签但未发布 Release，不会产生可在线安装的新版本。
 
-点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `artex.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
+点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存 ARTEX 与 JavaCodeDB JAR → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
 
 - **失败不会留下坏程序**：校验或冒烟不通过就丢弃暂存件、继续跑当前版本；换装后的新版若连续 3 次启动失败，会自动回滚到 `artex.old`（失败的那个留作 `artex.failed` 供排查）。
 - **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
@@ -238,7 +240,7 @@ docker compose logs --tail=50 artex
 
 继续使用原部署目录和 Compose 项目名称，确保 `./data`、`./skills` 和 PostgreSQL 数据卷仍指向原数据。迁移后程序从 `RuoJi6/ARTEX` 检查在线更新；后续可用页面更新程序或上述命令更新整个镜像。
 
-首次迁移已有 Docker 部署时，将已校验的新 ARM64 ZIP 解压到宿主机，备份原程序，然后只替换已有容器中的 `/app/artex`。例如现有容器名为 `artex-artex-1`：
+首次迁移已有 Docker 部署时，将已校验的新 ARM64 ZIP 解压到宿主机，备份原程序，然后替换容器中的 `/app/artex` 和 `/app/java-code-db.jar`。例如现有容器名为 `artex-artex-1`：
 
 ```bash
 # 在下载目录运行；先按 SHA256SUMS 核对下载的 ZIP，再解压。
@@ -247,6 +249,7 @@ unzip artex-0.3.17-linux-arm64.zip
 sudo docker stop artex-artex-1
 sudo docker cp artex-artex-1:/app/artex ./artex-before-migration
 sudo docker cp ./artex-0.3.17-linux-arm64/artex artex-artex-1:/app/artex
+sudo docker cp ./artex-0.3.17-linux-arm64/java-code-db.jar artex-artex-1:/app/java-code-db.jar
 sudo docker start artex-artex-1
 curl --fail http://127.0.0.1:8787/api/health
 ```
@@ -263,7 +266,7 @@ cd ARTEX
 脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
 
 - **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
-- **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
+- **② 本地**：重建前端静态产物 → 使用 Maven/JDK 21 重建 JavaCodeDB JAR 和 `./artex`（完成后重启进程生效）。
 
 ### 方式三：Docker Compose（手动）
 
@@ -281,7 +284,7 @@ docker image prune -f          # 清理旧镜像（可选）
 到 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
 
 ```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
+cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./ && cp <解压目录>/java-code-db.jar ./
 ./start.sh
 ```
 
@@ -291,7 +294,8 @@ cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
 git pull
 cd web && npm ci && npm run build:static && cd ..
 cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+./scripts/build-java-code-db.sh java-code-db.jar
+CGO_ENABLED=0 go build -tags embedui,javacodedb -o artex ./cmd/artex
 # 重启 ./start.sh
 ```
 
@@ -406,7 +410,8 @@ server {
 ./dev.sh    # 后端(:8787) + 流量代理(:8788) + 前端 next dev(:5173) → http://localhost:5173
 ```
 
-- 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
+- 后端：`dev.sh` 在 Maven/JDK 21 可用时构建 JavaCodeDB，再以 `go run -tags javacodedb` 启动后端；不带 `-tags embedui` 时前端仍由 Next.js 提供。
+- 二进制审计：也可以设置 `ARTEX_JAVACODEDB_JAR` 指向自己的 JAR。
 - 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
 - 测试：`go test ./...`
 - Mock 预览（无后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`

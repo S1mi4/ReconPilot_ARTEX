@@ -889,6 +889,11 @@
     "Live connection lost; reconnecting automatically. History is still available"
   ],
   "screen.ab7e3afbecbdaf": ["重连中", "Reconnecting"],
+  "screen.taskSessionsLoading": ["正在加载会话", "Loading sessions"],
+  "screen.taskSessionsConnecting": ["正在连接", "Connecting"],
+  "screen.taskSessionsListFailed": ["会话列表加载失败", "Could not load session list"],
+  "screen.taskSessionsHistoryFailed": ["会话历史加载失败", "Could not load session history"],
+  "screen.taskSessionsStreamFailed": ["实时连接失败", "Live connection failed"],
   "screen.a6304c4eebab4b": ["任务总计", "Task total"],
   "screen.ac01baaa43d42b": ["· 输出", "· Output"],
   "screen.a32617219732b2": ["· 缓存读取", "· Cache reads"],
@@ -900,7 +905,12 @@
   "screen.64581b6cb2b857": ["新建主 Agent 会话", "New main Agent session"],
   "screen.50ef2f4cf6a469": ["新建", "New"],
   "screen.279a6ac7544928": ["加载更早的 Worker", "Load earlier Workers"],
-  "screen.20785247ce9fea": ["暂无运行中的 Worker 会话。", "No running Worker sessions."],
+  "screen.taskSessionsNoActiveWorkers": ["暂无运行中或暂停的 Worker。", "No running or paused Workers."],
+  "screen.taskSessionsArchivedWorkers": ["归档 Worker", "Archived Workers"],
+  "screen.taskSessionsArchivedUnread": ["{{v0}} 条未读消息", "Unread messages: {{v0}}"],
+  "screen.taskSessionsAuditWorker": ["白盒审计 Worker", "White-box audit Worker"],
+  "screen.taskSessionsAuditWorkerWholeService": ["白盒审计 · 整个服务", "White-box audit · Entire service"],
+  "screen.taskSessionsAuditWorkerScope": ["白盒审计 · {{v0}}", "White-box audit · {{v0}}"],
   "screen.6f366ec16cc84e": [
     "有任务描述、Planner/Worker 结果或发现记录后即可提问",
     "Available once a task description, Planner/Worker results or findings exist"

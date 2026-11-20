@@ -86,12 +86,16 @@ type Task struct {
 	//（CompleteAssessment），Planner/Worker 的目标判定不再直接落 done。
 	AssessmentMode bool `json:"assessment_mode"`
 	// AssessmentPhase：评估阶段（''=传统模式/未启用）。与运行状态分离。
-	AssessmentPhase string                 `json:"assessment_phase"`
-	Store           *pgdb.ExplorationStore `json:"-"`
-	Guard           *guard.Guard           `json:"-"`
-	notify          chan struct{}
-	lifecycleMu     sync.RWMutex
-	llmMu           sync.RWMutex
+	AssessmentPhase string `json:"assessment_phase"`
+	// Draft：两阶段创建草稿锁。true 时严禁启动执行引擎、Planner 或 Worker。
+	Draft            bool                     `json:"draft"`
+	AssessmentConfig pgdb.AssessmentConfig    `json:"assessment_config,omitempty"`
+	MaterialCheck    pgdb.MaterialCheckReport `json:"material_check,omitempty"`
+	Store            *pgdb.ExplorationStore   `json:"-"`
+	Guard            *guard.Guard             `json:"-"`
+	notify           chan struct{}
+	lifecycleMu      sync.RWMutex
+	llmMu            sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -105,34 +109,45 @@ type Task struct {
 // updateLifecycle instead of reading or writing the corresponding Task fields
 // directly after the task has been published by Manager.
 type taskLifecycleState struct {
-	ShareGlobalAssets   bool
-	Name                string
-	Remark              string
-	PinnedAt            int64
-	Status              string
-	Paused              bool
-	PauseReason         string
-	ReconnectAttempt    int
-	ReconnectMax        int
-	ReconnectNextAt     int64
-	ReconnectExhausted  bool
-	ReconnectLastError  string
-	ReconnectGeneration uint64
-	Queued              bool
-	QueuedAt            int64
-	QueueMode           string
-	CompletedAt         int64
-	FirstRunAt          int64
-	DeadlineAt          int64
-	NoResultBaseSeconds int64
-	NoResultCheckedAt   int64
-	StopReason          string
-	ActiveRunSeconds    int64
-	RunSegmentStartedAt int64
-	SourceTaskIDs       []int64
-	CompanyIDs          []int64
-	CategoryID          *int64
-	CategoryName        string
+	ShareGlobalAssets    bool
+	Name                 string
+	Remark               string
+	Description          string
+	Goal                 string
+	PinnedAt             int64
+	Status               string
+	Paused               bool
+	PauseReason          string
+	ReconnectAttempt     int
+	ReconnectMax         int
+	ReconnectNextAt      int64
+	ReconnectExhausted   bool
+	ReconnectLastError   string
+	ReconnectGeneration  uint64
+	Queued               bool
+	QueuedAt             int64
+	QueueMode            string
+	CompletedAt          int64
+	FirstRunAt           int64
+	DeadlineAt           int64
+	NoResultBaseSeconds  int64
+	NoResultCheckedAt    int64
+	StopReason           string
+	ActiveRunSeconds     int64
+	RunSegmentStartedAt  int64
+	TimeoutSeconds       int
+	PlanHeartbeatSeconds int
+	CoverageEnabled      bool
+	WorkerCount          int
+	SourceTaskIDs        []int64
+	CompanyIDs           []int64
+	CategoryID           *int64
+	CategoryName         string
+	AssessmentMode       bool
+	AssessmentPhase      string
+	Draft                bool
+	AssessmentConfig     pgdb.AssessmentConfig
+	MaterialCheck        pgdb.MaterialCheckReport
 }
 
 func (t *Task) lifecycleSnapshot() taskLifecycleState {
@@ -146,28 +161,50 @@ func (t *Task) lifecycleSnapshot() taskLifecycleState {
 
 func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 	return taskLifecycleState{
-		ShareGlobalAssets: t.ShareGlobalAssets,
-		Name:              t.Name,
-		Remark:            t.Remark,
-		PinnedAt:          t.PinnedAt,
-		Status:            t.Status,
-		Paused:            t.Paused,
-		PauseReason:       t.PauseReason,
-		ReconnectAttempt:  t.ReconnectAttempt, ReconnectMax: t.ReconnectMax, ReconnectNextAt: t.ReconnectNextAt, ReconnectExhausted: t.ReconnectExhausted, ReconnectLastError: t.ReconnectLastError, ReconnectGeneration: t.ReconnectGeneration,
-		Queued:              t.Queued,
-		QueuedAt:            t.QueuedAt,
-		QueueMode:           t.QueueMode,
-		CompletedAt:         t.CompletedAt,
-		FirstRunAt:          t.FirstRunAt,
-		DeadlineAt:          t.DeadlineAt,
-		NoResultBaseSeconds: t.NoResultBaseSeconds, NoResultCheckedAt: t.NoResultCheckedAt, StopReason: t.StopReason,
-		ActiveRunSeconds:    t.ActiveRunSeconds,
-		RunSegmentStartedAt: t.RunSegmentStartedAt,
-		SourceTaskIDs:       append([]int64(nil), t.SourceTaskIDs...),
-		CompanyIDs:          append([]int64(nil), t.CompanyIDs...),
-		CategoryID:          cloneInt64Ptr(t.CategoryID),
-		CategoryName:        t.CategoryName,
+		ShareGlobalAssets:    t.ShareGlobalAssets,
+		Name:                 t.Name,
+		Remark:               t.Remark,
+		Description:          t.Description,
+		Goal:                 t.Goal,
+		PinnedAt:             t.PinnedAt,
+		Status:               t.Status,
+		Paused:               t.Paused,
+		PauseReason:          t.PauseReason,
+		ReconnectAttempt:     t.ReconnectAttempt,
+		ReconnectMax:         t.ReconnectMax,
+		ReconnectNextAt:      t.ReconnectNextAt,
+		ReconnectExhausted:   t.ReconnectExhausted,
+		ReconnectLastError:   t.ReconnectLastError,
+		ReconnectGeneration:  t.ReconnectGeneration,
+		Queued:               t.Queued,
+		QueuedAt:             t.QueuedAt,
+		QueueMode:            t.QueueMode,
+		CompletedAt:          t.CompletedAt,
+		FirstRunAt:           t.FirstRunAt,
+		DeadlineAt:           t.DeadlineAt,
+		NoResultBaseSeconds:  t.NoResultBaseSeconds,
+		NoResultCheckedAt:    t.NoResultCheckedAt,
+		StopReason:           t.StopReason,
+		ActiveRunSeconds:     t.ActiveRunSeconds,
+		RunSegmentStartedAt:  t.RunSegmentStartedAt,
+		TimeoutSeconds:       t.TimeoutSeconds,
+		PlanHeartbeatSeconds: t.PlanHeartbeatSeconds,
+		CoverageEnabled:      t.CoverageEnabled,
+		WorkerCount:          t.WorkerCount,
+		SourceTaskIDs:        append([]int64(nil), t.SourceTaskIDs...),
+		CompanyIDs:           append([]int64(nil), t.CompanyIDs...),
+		CategoryID:           cloneInt64Ptr(t.CategoryID),
+		CategoryName:         t.CategoryName,
+		AssessmentMode:       t.AssessmentMode,
+		AssessmentPhase:      t.AssessmentPhase,
+		Draft:                t.Draft,
+		AssessmentConfig:     t.AssessmentConfig,
+		MaterialCheck:        t.MaterialCheck,
 	}
+}
+
+func (t *Task) IsDraft() bool {
+	return t != nil && t.lifecycleSnapshot().Draft
 }
 
 func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
@@ -180,6 +217,8 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.ShareGlobalAssets = state.ShareGlobalAssets
 	t.Name = state.Name
 	t.Remark = state.Remark
+	t.Description = state.Description
+	t.Goal = state.Goal
 	t.PinnedAt = state.PinnedAt
 	t.Status = state.Status
 	t.Paused = state.Paused
@@ -201,10 +240,19 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.StopReason = state.StopReason
 	t.ActiveRunSeconds = state.ActiveRunSeconds
 	t.RunSegmentStartedAt = state.RunSegmentStartedAt
+	t.TimeoutSeconds = state.TimeoutSeconds
+	t.PlanHeartbeatSeconds = state.PlanHeartbeatSeconds
+	t.CoverageEnabled = state.CoverageEnabled
+	t.WorkerCount = state.WorkerCount
 	t.SourceTaskIDs = append(t.SourceTaskIDs[:0], state.SourceTaskIDs...)
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
 	t.CategoryName = state.CategoryName
+	t.AssessmentMode = state.AssessmentMode
+	t.AssessmentPhase = state.AssessmentPhase
+	t.Draft = state.Draft
+	t.AssessmentConfig = state.AssessmentConfig
+	t.MaterialCheck = state.MaterialCheck
 	t.lifecycleMu.Unlock()
 }
 
@@ -1191,7 +1239,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		ActiveRunSeconds: pt.ActiveRunSeconds, RunSegmentStartedAt: unixOrZero(pt.RunSegmentStartedAt),
-		AssessmentMode: pt.AssessmentMode, AssessmentPhase: pt.AssessmentPhase,
+		AssessmentMode: pt.AssessmentMode, AssessmentPhase: pt.AssessmentPhase, Draft: pt.Draft, AssessmentConfig: pt.AssessmentConfig, MaterialCheck: pt.MaterialCheck,
 		Store: store, Guard: guard.NewWithInterceptor(ic).WithProject(pt.ProjectID), notify: make(chan struct{}, 1),
 	}
 }
@@ -1222,6 +1270,118 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
 	})
 	return task, nil
+}
+
+func (m *Manager) syncTaskFromPG(taskID string, pt *pgdb.Task) *Task {
+	if pt == nil {
+		return nil
+	}
+	m.mu.RLock()
+	task := m.tasks[taskID]
+	m.mu.RUnlock()
+	if task == nil {
+		return nil
+	}
+	task.updateLifecycle(func(state *taskLifecycleState) {
+		state.ShareGlobalAssets = pt.ShareGlobalAssets
+		state.Name = pt.Name
+		state.Remark = pt.Remark
+		state.Description = pt.Description
+		state.Goal = pt.Goal
+		state.CategoryID = cloneInt64Ptr(pt.CategoryID)
+		state.CategoryName = pt.CategoryName
+		state.PinnedAt = unixOrZero(pt.PinnedAt)
+		state.TimeoutSeconds = pt.TimeoutSeconds
+		state.PlanHeartbeatSeconds = pt.PlanHeartbeatSeconds
+		state.CoverageEnabled = pt.CoverageEnabled
+		state.WorkerCount = pt.WorkerCount
+		state.NoResultBaseSeconds = pt.NoResultBaseSeconds
+		state.NoResultCheckedAt = unixOrZero(pt.NoResultCheckedAt)
+		state.SourceTaskIDs = append([]int64(nil), pt.SourceTaskIDs...)
+		state.CompanyIDs = append([]int64(nil), pt.CompanyIDs...)
+		state.AssessmentMode = pt.AssessmentMode
+		state.AssessmentPhase = pt.AssessmentPhase
+		state.Draft = pt.Draft
+		state.AssessmentConfig = pt.AssessmentConfig
+		state.MaterialCheck = pt.MaterialCheck
+	})
+	task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+	return task
+}
+
+// UpdateAssessmentDraft persists edited draft fields/config and invalidates cached readiness.
+func (m *Manager) UpdateAssessmentDraft(taskID string, patch pgdb.AssessmentDraftPatch) (*Task, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	if patch.CompanyIDs != nil {
+		m.companyMu.Lock()
+		defer m.companyMu.Unlock()
+	}
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, nil
+	}
+	updated, err := m.pg.UpdateAssessmentDraft(id, patch)
+	if err != nil || updated == nil {
+		return nil, err
+	}
+	return m.syncTaskFromPG(taskID, updated), nil
+}
+
+// SaveMaterialCheckReport persists the latest material check report on a draft task.
+func (m *Manager) SaveMaterialCheckReport(taskID string, report pgdb.MaterialCheckReport) (*Task, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, nil
+	}
+	updated, err := m.pg.SaveMaterialCheckReport(id, report)
+	if err != nil || updated == nil {
+		return nil, err
+	}
+	return m.syncTaskFromPG(taskID, updated), nil
+}
+
+// InvalidateTaskMaterialCheck clears cached readiness after uploading/deleting draft codebases.
+func (m *Manager) InvalidateTaskMaterialCheck(taskID string) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return
+	}
+	if err := m.pg.InvalidateTaskMaterialCheck(id); err != nil {
+		return
+	}
+	m.mu.RLock()
+	task := m.tasks[taskID]
+	m.mu.RUnlock()
+	if task == nil {
+		return
+	}
+	task.updateLifecycle(func(state *taskLifecycleState) {
+		if state.AssessmentMode && state.Draft {
+			state.AssessmentPhase = pgdb.AssessmentPhaseMaterialCheck
+			state.MaterialCheck = pgdb.MaterialCheckReport{}
+		}
+	})
+}
+
+// StartAssessmentTask validates & unlocks a draft task into profiling phase with Round 1.
+func (m *Manager) StartAssessmentTask(taskID string, in pgdb.AssessmentStartInput) (*Task, *pgdb.AssessmentRound, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, nil, nil
+	}
+	in.TaskID = id
+	updated, round, err := m.pg.StartAssessmentTask(in)
+	if err != nil || updated == nil {
+		return nil, nil, err
+	}
+	return m.syncTaskFromPG(taskID, updated), round, nil
 }
 
 // CreateTask creates a task + its exploration and makes it active.

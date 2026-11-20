@@ -5,7 +5,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -14,7 +13,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 type codebaseTestFile struct {
@@ -274,25 +276,28 @@ func makeCodebaseTarGzip(t *testing.T, files []codebaseTestFile) []byte {
 func TestTaskCodebaseSourceArchivesAreExtractedForDiscovery(t *testing.T) {
 	s, mux, base := taskCodebaseFixture(t)
 	files := []codebaseTestFile{
-		{path: "A Service/pom.xml", data: []byte("<project><artifactId>a-service</artifactId></project>")},
-		{path: "A Service/src/main/App.java", data: []byte("class AService {}")},
-		{path: "B Service/build.gradle", data: []byte("plugins { id 'java' }")},
-		{path: "B Service/src/main/App.java", data: []byte("class BService {}")},
+		{path: "orderdesk/pom.xml", data: []byte("<project><artifactId>orderdesk</artifactId></project>")},
+		{path: "orderdesk/A Service/src/main/App.java", data: []byte("class AService {}")},
+		{path: "orderdesk/team/B Service/src/worker.py", data: []byte("print('fixture')")},
+		{path: "orderdesk/build/output.jar", data: []byte("archive placeholder")},
+		{path: "orderdesk/misc/main.c", data: []byte("int main(void) { return 0; }")},
+		{path: "orderdesk/misc/src", data: []byte("a file named src is not a directory")},
 	}
-	zipData := makeCodebaseZip(t, map[string]struct {
+	zipEntries := map[string]struct {
 		data []byte
 		mode os.FileMode
-	}{
-		files[0].path: {data: files[0].data, mode: 0o644},
-		files[1].path: {data: files[1].data, mode: 0o644},
-		files[2].path: {data: files[2].data, mode: 0o644},
-		files[3].path: {data: files[3].data, mode: 0o644},
-	})
+	}{}
+	for _, file := range files {
+		zipEntries[file.path] = struct {
+			data []byte
+			mode os.FileMode
+		}{data: file.data, mode: 0o644}
+	}
 	archives := []struct {
 		name string
 		data []byte
 	}{
-		{name: "source.zip", data: zipData},
+		{name: "source.zip", data: makeCodebaseZip(t, zipEntries)},
 		{name: "source.tar.gz", data: makeCodebaseTarGzip(t, files)},
 	}
 	for _, archive := range archives {
@@ -316,16 +321,22 @@ func TestTaskCodebaseSourceArchivesAreExtractedForDiscovery(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(base, "tasks", "313", "codebases", version.ID, "contents", archive.name)); !os.IsNotExist(err) {
 			t.Fatalf("original %s was left as the codebase input instead of extracting it: err=%v", archive.name, err)
 		}
-		metadata, err := s.scanCodebaseServiceMetadata(context.Background(), 313, version)
+		candidates, note, err := s.discoverCodebaseServices(t.Context(), 313, version)
 		if err != nil {
 			t.Fatalf("scan extracted %s: %v", archive.name, err)
 		}
-		services := map[string]bool{}
-		for _, item := range metadata {
-			services[item.Path] = true
+		if len(candidates) != 2 || note != "" {
+			t.Fatalf("%s candidates=%+v note=%q", archive.name, candidates, note)
 		}
-		if !services["A Service"] || !services["B Service"] {
-			t.Fatalf("discovery did not see services extracted from %s: %+v", archive.name, metadata)
+		wantPaths := []string{"orderdesk/A Service", "orderdesk/team/B Service"}
+		wantNames := []string{"A Service", "B Service"}
+		wantLanguages := [][]string{{"java"}, {"python"}}
+		for i, item := range candidates {
+			if item.RelativePath != wantPaths[i] || item.Name != wantNames[i] ||
+				!reflect.DeepEqual(item.Languages, wantLanguages[i]) ||
+				item.Decision != "service" || item.Source != "discovery" || !item.SourceDirectory {
+				t.Fatalf("%s candidate %d = %+v", archive.name, i, item)
+			}
 		}
 	}
 	unsafe := makeCodebaseZip(t, map[string]struct {
@@ -342,6 +353,37 @@ func TestTaskCodebaseSourceArchivesAreExtractedForDiscovery(t *testing.T) {
 	}
 	if len(versions) != len(archives) {
 		t.Fatalf("rejected source archive left a partial snapshot: got %d versions", len(versions))
+	}
+}
+
+func TestTaskCodebaseSourceArchiveDecodesGBKEntryNames(t *testing.T) {
+	_, mux, base := taskCodebaseFixture(t)
+	gbkName, err := simplifiedchinese.GBK.NewEncoder().String("config/源码归档链接.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zipData := makeCodebaseZip(t, map[string]struct {
+		data []byte
+		mode os.FileMode
+	}{gbkName: {data: []byte("gbk"), mode: 0o644}})
+	response := taskCodebasePost(t, mux, "313", "source_archive", []codebaseTestFile{{path: "source.zip", data: zipData}})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("GBK-named source archive rejected: %d %s", response.Code, response.Body.String())
+	}
+	version := readTaskCodebaseVersion(t, response.Body)
+	stored := filepath.Join(base, "tasks", "313", "codebases", version.ID, "contents", version.Name,
+		"config", "源码归档链接.txt")
+	if data, err := os.ReadFile(stored); err != nil || string(data) != "gbk" {
+		t.Fatalf("GBK entry was not decoded to UTF-8: data=%q err=%v", data, err)
+	}
+
+	corrupt := makeCodebaseZip(t, map[string]struct {
+		data []byte
+		mode os.FileMode
+	}{"bad\xff.txt": {data: []byte("bad"), mode: 0o644}})
+	response = taskCodebasePost(t, mux, "313", "source_archive", []codebaseTestFile{{path: "corrupt.zip", data: corrupt}})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("corrupt entry name accepted: %d %s", response.Code, response.Body.String())
 	}
 }
 

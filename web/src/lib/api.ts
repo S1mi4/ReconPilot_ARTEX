@@ -14,6 +14,8 @@ import type {
   AgentDetail,
   AgentTrigger,
   ArchiveBatchItem,
+  AssessmentConfig,
+  AssessmentPhase,
   Asset,
   AssetInterceptRule,
   AssetInterceptRuleInput,
@@ -70,6 +72,7 @@ import type {
   LLMRetryOverride,
   LLMRetryPolicy,
   LLMTask,
+  MaterialCheckReport,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -311,7 +314,7 @@ export function openSSE(path: string): EventSource {
   return source;
 }
 
-const get = <T>(p: string) => http<T>(p);
+const get = <T>(p: string, signal?: AbortSignal) => http<T>(p, signal ? { signal } : undefined);
 const post = <T>(p: string, body?: unknown) =>
   http<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined });
 const put = <T>(p: string, body?: unknown) =>
@@ -425,7 +428,7 @@ export const api = {
     remark?: string;
     categoryId?: number;
     description: string;
-    goal: string;
+    goal?: string;
     llmProfileIds?: number[];
     sourceTaskIds?: string[];
     companyIds?: number[];
@@ -440,13 +443,16 @@ export const api = {
     workerCount?: number;
     interceptRules?: AssetInterceptRuleInput[];
     schedule?: ScheduleInput;
+    assessmentMode?: boolean;
+    draft?: boolean;
+    assessmentConfig?: AssessmentConfig;
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
       remark: input.remark ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
-      goal: input.goal,
+      goal: input.goal ?? "",
       llm_profile_ids: input.llmProfileIds ?? [],
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
@@ -461,7 +467,65 @@ export const api = {
       worker_count: input.workerCount ?? 0, // 0 = 用全局默认 workers
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
       schedule: input.schedule ? schedulePayload(input.schedule) : undefined,
+      assessment_mode: input.assessmentMode ?? false,
+      draft: input.draft,
+      assessment_config: input.assessmentConfig,
     }),
+  updateTaskDraft: (
+    id: string,
+    patchInput: {
+      name?: string;
+      remark?: string;
+      categoryId?: number | null;
+      clearCategory?: boolean;
+      description?: string;
+      goal?: string;
+      llmProfileIds?: number[];
+      sourceTaskIds?: string[];
+      companyIds?: number[];
+      timeoutSeconds?: number;
+      noResultSeconds?: number;
+      noResultMinFindings?: number;
+      noResultMinSeverity?: "" | "low" | "medium" | "high" | "critical";
+      planHeartbeatSeconds?: number;
+      coverageEnabled?: boolean;
+      shareGlobalAssets?: boolean;
+      workerCount?: number;
+      assessmentConfig?: AssessmentConfig;
+    },
+  ) =>
+    patch<Task>(`/tasks/${encodeURIComponent(id)}/draft`, {
+      name: patchInput.name,
+      remark: patchInput.remark,
+      category_id: patchInput.categoryId,
+      clear_category: patchInput.clearCategory,
+      description: patchInput.description,
+      goal: patchInput.goal,
+      llm_profile_ids: patchInput.llmProfileIds,
+      source_task_ids: patchInput.sourceTaskIds,
+      company_ids: patchInput.companyIds,
+      timeout_seconds: patchInput.timeoutSeconds,
+      no_result_seconds: patchInput.noResultSeconds,
+      no_result_min_findings: patchInput.noResultMinFindings,
+      no_result_min_severity: patchInput.noResultMinSeverity,
+      plan_heartbeat_seconds: patchInput.planHeartbeatSeconds,
+      coverage_enabled: patchInput.coverageEnabled,
+      share_global_assets: patchInput.shareGlobalAssets,
+      worker_count: patchInput.workerCount,
+      assessment_config: patchInput.assessmentConfig,
+    }),
+  checkTaskMaterials: (id: string) =>
+    post<{ task: Task; report: MaterialCheckReport }>(`/tasks/${encodeURIComponent(id)}/material-check`),
+  startAssessmentTask: async (id: string, sourceAcknowledged: boolean) =>
+    post<{
+      task: Task;
+      round?: { id: number; round_no: number; phase?: AssessmentPhase };
+      report: MaterialCheckReport;
+    }>(`/tasks/${encodeURIComponent(id)}/start`, { source_acknowledged: sourceAcknowledged }),
+  deleteTaskCodebase: (id: string, codebaseId: string) =>
+    del<{ deleted_versions: number; codebase_id: string }>(
+      `/tasks/${encodeURIComponent(id)}/codebases/${encodeURIComponent(codebaseId)}`,
+    ),
   schedules: () => get<{ schedules: TaskSchedule[] }>("/schedules").then((r) => arr(r.schedules)),
   renameSchedule: (id: number, name: string) => patch<TaskSchedule>(`/schedules/${id}/metadata`, { name }),
   updateScheduleRemark: (id: number, remark: string) => patch<TaskSchedule>(`/schedules/${id}/remark`, { remark }),
@@ -696,16 +760,19 @@ export const api = {
         service: {} as TaskCodeService,
         version: {} as TaskCodebaseVersion,
         scope_path: scopePath,
+        languages: [],
         production_source_files: 0,
+        test_files: 0,
         test_java_files: 0,
         config_files: 0,
         binary_class_files: 0,
         binary_only: false,
         source_available: false,
         audit_available: false,
-        source_notice: "演示数据没有 Java 源码。",
-        audit_notice: "演示数据没有 Java 源码或 class 文件。",
-        decompiler_available: false,
+        source_notice: "演示数据没有 Java/Python/C 源码。",
+        audit_notice: "演示数据没有 Java/Python/C 源码或 Java class 文件。",
+        javacodedb_available: false,
+        javacodedb_notice: undefined,
         llm: {
           profile_name: "任务默认配置",
           profile_source: "task_chain",
@@ -723,8 +790,29 @@ export const api = {
   startTaskCodeAudit: (
     id: string,
     serviceID: number,
-    body: { scope_path: string; profile_id?: number; budget_tokens: number; source_acknowledged: boolean },
+    body: { scope_path: string; profile_id?: number; budget_tokens?: number; source_acknowledged: boolean },
   ) => post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-services/${serviceID}/audits`, body),
+  taskCodeAuditAgentChat: async (
+    id: string,
+    message: string,
+    sourceAcknowledged: boolean,
+    selectedServiceID?: number,
+  ) => {
+    if (MOCK) return { status: "accepted" };
+    return post<{ status: string }>(`/tasks/${id}/code-audit-agent/chat`, {
+      message,
+      source_acknowledged: sourceAcknowledged,
+      ...(selectedServiceID ? { selected_service_id: selectedServiceID } : {}),
+    });
+  },
+  taskCodeAuditAgentChatStatus: async (id: string) => {
+    if (MOCK) return { running: false };
+    return get<{ running: boolean }>(`/tasks/${id}/code-audit-agent/chat/status`);
+  },
+  stopTaskCodeAuditAgentChat: async (id: string) => {
+    if (MOCK) return { status: "idle" };
+    return post<{ status: string }>(`/tasks/${id}/code-audit-agent/chat/stop`, {});
+  },
   taskCodeAudits: async (id: string) => {
     if (MOCK) return [] as TaskCodeAuditRun[];
     const response = await get<{ runs: TaskCodeAuditRun[] | null }>(`/tasks/${id}/code-audits`);
@@ -738,11 +826,8 @@ export const api = {
     post<{ run: TaskCodeAuditRun }>(`/tasks/${id}/code-audits/${runID}/retry`, {
       additional_budget_tokens: additionalBudgetTokens,
     }),
-  reviewTaskCodeAuditCandidate: (id: string, runID: number, candidateID: number) =>
-    post<{ review: { status: "published" | "rejected"; finding_id?: number } }>(
-      `/tasks/${id}/code-audits/${runID}/candidates/${candidateID}/review`,
-      {},
-    ),
+  stopTaskCodeAudit: (id: string, runID: number) =>
+    post<{ status: "stopped" | "stopping" }>(`/tasks/${id}/code-audits/${runID}/stop`, {}),
   taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
   taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
   taskFileRead: (id: string, path: string) =>
@@ -824,20 +909,22 @@ export const api = {
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
-  assetCounts: (taskId = "") =>
-    get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
+  assetCounts: (taskId = "", currentOnly = false) =>
+    get<Record<string, number>>(
+      `/assets/counts?${taskId ? `task_id=${encodeURIComponent(taskId)}&` : ""}${currentOnly ? "present=current" : ""}`,
+    ),
   deleteAssets: (ids: number[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`
-  taskAssets: (taskId: string, type = "", limit = 50, offset = 0) =>
+  taskAssets: (taskId: string, type = "", limit = 50, offset = 0, currentOnly = false) =>
     get<{ count: number; total: number; assets: Asset[] }>(
-      `/assets?task_id=${encodeURIComponent(taskId)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}`,
+      `/assets?task_id=${encodeURIComponent(taskId)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}${currentOnly ? "&present=current" : ""}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   // DSL search scoped to a task — the backend forces the task_id filter, so it
   // always stays within that task's assets (same DSL grammar as `searchAssets`).
-  searchTaskAssets: (taskId: string, dsl: string, type = "", limit = 50, offset = 0) =>
+  searchTaskAssets: (taskId: string, dsl: string, type = "", limit = 50, offset = 0, currentOnly = false) =>
     get<{ count: number; total: number; assets: Asset[] }>(
-      `/assets?task_id=${encodeURIComponent(taskId)}&dsl=${encodeURIComponent(dsl)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}`,
+      `/assets?task_id=${encodeURIComponent(taskId)}&dsl=${encodeURIComponent(dsl)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}${currentOnly ? "&present=current" : ""}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   attachTaskAssets: (taskId: string, assetIds: number[], sourceSummary: string) =>
     post<TaskAssetMutation>(`/tasks/${taskId}/assets`, {
@@ -1164,12 +1251,13 @@ export const api = {
   // snapshotCursor is the TASK-level max id at query time — open the task SSE at
   // since=snapshotCursor so history (id≤cursor) and the live tail (id>cursor) meet
   // gap-free. hasMore = still-older steps exist (drives scroll-up loading).
-  activityHistory: (task: string, session: string, before = 0, limit = 200) => {
+  activityHistory: (task: string, session: string, before = 0, limit = 200, signal?: AbortSignal) => {
     const q = new URLSearchParams({ session, limit: String(limit) });
     if (task) q.set("task", task);
     if (before > 0) q.set("before", String(before));
     return get<{ items: Activity[]; snapshot_cursor: number; earliest_cursor: number; has_more: boolean }>(
       `/exploration/activity/history?${q.toString()}`,
+      signal,
     ).then((r) => ({
       items: arr(r.items),
       snapshotCursor: r.snapshot_cursor ?? 0,
@@ -1192,9 +1280,10 @@ export const api = {
 
   // Main-agent conversation segments of a task. Each segment is a resettable session
   // (clean transcript/context) over the same task; `current` is the writable one.
-  mainSessions: (task: string) =>
+  mainSessions: (task: string, signal?: AbortSignal) =>
     get<{ sessions: { seq: number; created_at: string }[]; current: number }>(
       `/exploration/main-sessions${tq(task)}`,
+      signal,
     ).then((r) => ({ sessions: arr(r.sessions), current: r.current ?? 0 })),
   // Start a fresh main-agent session segment (does not touch the task's graph/assets/goal).
   newMainSession: (task: string) =>

@@ -282,7 +282,7 @@ func (sc *Scheduler) fireTaskSchedulesAt(now time.Time) {
 				continue
 			}
 			state := t.lifecycleSnapshot()
-			if db.IsTerminal(state.Status) {
+			if state.Draft || db.IsTerminal(state.Status) {
 				continue
 			}
 			// A proxy-paused task can remain paused when a calendar window ends

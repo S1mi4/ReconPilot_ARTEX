@@ -75,6 +75,14 @@ func Bootstrap() (Action, State) {
 // 守护脚本会不知疲倦地反复拉起它，而 Go 代码根本没机会运行，自动回滚也就无从谈起。
 func applyStaged(p Paths) (Action, State) {
 	m, _ := readMarker(p.Marker)
+	if p.NewJavaCodeDB != "" {
+		if _, err := os.Stat(p.NewJavaCodeDB); err == nil {
+			m.JavaCodeDBUpdated = true
+			if info, err := os.Lstat(p.JavaCodeDB); err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+				m.HadJavaCodeDB = true
+			}
+		}
+	}
 
 	if err := verifyStaged(p); err != nil {
 		log.Printf("[update] 暂存的新版本未通过校验，已丢弃，继续运行当前版本：%v", err)
@@ -169,6 +177,23 @@ func verifyStaged(p Paths) error {
 	if !strings.EqualFold(strings.TrimSpace(string(want)), got) {
 		return errors.New("SHA256 不匹配（下载损坏或被篡改）")
 	}
+	if p.NewJavaCodeDB != "" {
+		info, err := os.Lstat(p.NewJavaCodeDB)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxBinarySize {
+			return errors.New("暂存的 JavaCodeDB JAR 缺失或无效")
+		}
+		want, err := os.ReadFile(p.JavaCodeDBSum)
+		if err != nil {
+			return fmt.Errorf("读取 JavaCodeDB JAR 校验和: %w", err)
+		}
+		got, err := fileSHA256(p.NewJavaCodeDB)
+		if err != nil {
+			return fmt.Errorf("计算 JavaCodeDB JAR 校验和: %w", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(string(want)), got) {
+			return errors.New("JavaCodeDB JAR SHA256 不匹配")
+		}
+	}
 	return smokeTest(p.New)
 }
 
@@ -197,30 +222,75 @@ func smokeTest(bin string) error {
 	return nil
 }
 
-// swap 把当前二进制换成暂存的新版本。
+// swap 把当前 ARTEX 程序和 JavaCodeDB JAR 换成暂存的新版本。
 //
 // Unix 和 Windows 都允许 rename 一个正在运行的可执行文件（Windows 禁止的是删除和
 // 覆盖，rename 不在其列），所以这里不需要分平台，也不需要先停掉自己。
 func swap(p Paths) error {
+	updateJavaCodeDB := p.NewJavaCodeDB != ""
+	if updateJavaCodeDB {
+		info, err := os.Lstat(p.NewJavaCodeDB)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("暂存的 JavaCodeDB JAR 缺失或无效")
+		}
+	}
 	// Windows 的 rename 不会覆盖已存在的目标，上一轮升级留下的 .old 必须先清掉。
 	if err := os.Remove(p.Old); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧备份 %s: %w", p.Old, err)
 	}
+	hadJavaCodeDB := false
+	if updateJavaCodeDB {
+		if err := os.Remove(p.OldJavaCodeDB); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("清理 JavaCodeDB 旧备份 %s: %w", p.OldJavaCodeDB, err)
+		}
+		info, err := os.Lstat(p.JavaCodeDB)
+		if err == nil {
+			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("当前 JavaCodeDB JAR 不是安全的普通文件")
+			}
+			hadJavaCodeDB = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	if err := os.Rename(p.Current, p.Old); err != nil {
 		return fmt.Errorf("备份当前版本: %w", err)
+	}
+	if hadJavaCodeDB {
+		if err := os.Rename(p.JavaCodeDB, p.OldJavaCodeDB); err != nil {
+			_ = os.Rename(p.Old, p.Current)
+			return fmt.Errorf("备份当前 JavaCodeDB JAR: %w", err)
+		}
 	}
 	if err := os.Rename(p.New, p.Current); err != nil {
 		// 换装失败但当前版本已经被挪走了，必须原样放回去，否则下次启动没有可执行文件。
 		if rerr := os.Rename(p.Old, p.Current); rerr != nil {
 			return fmt.Errorf("装入新版本失败(%v)，且恢复当前版本失败: %w", err, rerr)
 		}
+		if hadJavaCodeDB {
+			_ = os.Rename(p.OldJavaCodeDB, p.JavaCodeDB)
+		}
 		return fmt.Errorf("装入新版本: %w", err)
 	}
+	if updateJavaCodeDB {
+		if err := os.Rename(p.NewJavaCodeDB, p.JavaCodeDB); err != nil {
+			_ = os.Remove(p.Current)
+			binRestoreErr := os.Rename(p.Old, p.Current)
+			var jarRestoreErr error
+			if hadJavaCodeDB {
+				jarRestoreErr = os.Rename(p.OldJavaCodeDB, p.JavaCodeDB)
+			}
+			return errors.Join(fmt.Errorf("安装 JavaCodeDB JAR: %w", err), binRestoreErr, jarRestoreErr)
+		}
+	}
 	_ = os.Remove(p.Sum)
+	if p.JavaCodeDBSum != "" {
+		_ = os.Remove(p.JavaCodeDBSum)
+	}
 	return nil
 }
 
-// rollback 把 swap 备份的旧版本换回来。
+// rollback 把 swap 备份的旧程序和 JavaCodeDB JAR 换回来。
 func rollback(p Paths) error {
 	if _, err := os.Stat(p.Old); err != nil {
 		return fmt.Errorf("没有可回滚的备份 %s: %w", p.Old, err)
@@ -233,6 +303,20 @@ func rollback(p Paths) error {
 	}
 	if err := os.Rename(p.Old, p.Current); err != nil {
 		return fmt.Errorf("恢复旧版本: %w", err)
+	}
+	m, _ := readMarker(p.Marker)
+	if m.JavaCodeDBUpdated && p.JavaCodeDB != "" {
+		failedJar := p.JavaCodeDB + ".failed"
+		_ = os.Remove(failedJar)
+		if err := os.Rename(p.JavaCodeDB, failedJar); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("移走失败的 JavaCodeDB JAR: %w", err)
+		}
+		if m.HadJavaCodeDB {
+			if err := os.Rename(p.OldJavaCodeDB, p.JavaCodeDB); err != nil {
+				_ = os.Rename(failedJar, p.JavaCodeDB)
+				return fmt.Errorf("恢复旧 JavaCodeDB JAR: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -263,6 +347,22 @@ func Rollback() error {
 	}
 	if err := os.Rename(tmp, p.Old); err != nil {
 		log.Printf("[update] 回滚后整理备份失败（不影响运行）：%v", err)
+	}
+	if p.OldJavaCodeDB != "" {
+		if _, err := os.Stat(p.OldJavaCodeDB); err == nil {
+			jarTmp := p.JavaCodeDB + ".swap"
+			_ = os.Remove(jarTmp)
+			if err := os.Rename(p.JavaCodeDB, jarTmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("暂存当前 JavaCodeDB JAR: %w", err)
+			}
+			if err := os.Rename(p.OldJavaCodeDB, p.JavaCodeDB); err != nil {
+				_ = os.Rename(jarTmp, p.JavaCodeDB)
+				return fmt.Errorf("装入上一版 JavaCodeDB JAR: %w", err)
+			}
+			if err := os.Rename(jarTmp, p.OldJavaCodeDB); err != nil {
+				log.Printf("[update] 回滚后整理 JavaCodeDB 备份失败（不影响运行）：%v", err)
+			}
+		}
 	}
 	_ = os.Remove(p.Marker)
 	return nil

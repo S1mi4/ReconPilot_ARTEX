@@ -7,6 +7,7 @@ import {
   Building2,
   ChevronDown,
   ChevronUp,
+  Code2Icon,
   Globe,
   Link2,
   type LucideIcon,
@@ -24,6 +25,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
+import { taskAssetTypeLabel } from "@/lib/task-assets";
 import type { CoverageAssetRef, CoverageAssetRefs, CoverageGraphEdge, CoverageGraphNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -75,6 +77,13 @@ const kindMeta = (ui: UITranslate): Record<Kind, KindMeta> => ({
   subdomain: { label: ui("screen.4b4788120c34db"), icon: Waypoints, iconBg: "bg-blue-500", hex: "#3b82f6", size: 30 },
   ip: { label: "IP", icon: Server, iconBg: "bg-cyan-600", hex: "#0891b2", size: 28 },
   service: { label: ui("screen.ec309ab207ef7f"), icon: Radio, iconBg: "bg-amber-500", hex: "#f59e0b", size: 26 },
+  code_service: {
+    label: taskAssetTypeLabel("code_service", ui),
+    icon: Code2Icon,
+    iconBg: "bg-violet-600",
+    hex: "#7c3aed",
+    size: 28,
+  },
   app: { label: "App", icon: AppWindow, iconBg: "bg-fuchsia-500", hex: "#d946ef", size: 26 },
   endpoint: { label: ui("screen.52fff1680de153"), icon: Link2, iconBg: "bg-rose-500", hex: "#f43f5e", size: 20 },
 });
@@ -112,6 +121,7 @@ const KIND_ICON: Record<Kind, string> = {
   endpoint: svgUri(
     '<path d="M9 17H7A5 5 0 0 1 7 7h2"/><path d="M15 7h2a5 5 0 1 1 0 10h-2"/><line x1="8" x2="16" y1="12" y2="12"/>',
   ),
+  code_service: svgUri('<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/><path d="m14.5 4-5 16"/>'),
 };
 
 type DatabaseEngine = "mysql" | "sqlserver" | "postgres" | "redis" | "database";
@@ -289,6 +299,7 @@ function graphLabel(n: CoverageGraphNode, viewMode: CoverageViewMode = "asset", 
     if (n.status_code) parts.push(String(n.status_code));
     return parts.length ? parts.join(" · ") : n.domain || n.ip || n.label;
   }
+  if (n.kind === "code_service") return n.service_name || n.relative_path || n.label;
   if (n.kind === "endpoint" && n.url) {
     try {
       return new URL(n.url).pathname || "/";
@@ -326,6 +337,7 @@ function toG6Nodes(
     ip: 520,
     service: 680,
     app: 680,
+    code_service: 680,
     endpoint: 1000,
   };
   const placeGrid = (items: RenderNode[], left: number, right: number) => {
@@ -581,6 +593,8 @@ function AssetSheet({
                     {node.status_code ? node.status_code : undefined}
                   </DetailRow>
                   <DetailRow label="App">{node.app_name}</DetailRow>
+                  <DetailRow label="服务名称">{node.kind === "code_service" ? node.service_name : undefined}</DetailRow>
+                  <DetailRow label="相对路径">{node.kind === "code_service" ? node.relative_path : undefined}</DetailRow>
                   <DetailRow label={ui("screen.511bb69c1de1d5")}>
                     {node.asset_id ? <span className="font-mono text-xs">{node.asset_id}</span> : undefined}
                   </DetailRow>

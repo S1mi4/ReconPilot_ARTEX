@@ -8,7 +8,10 @@ import (
 	"unicode/utf8"
 )
 
-const IntentBlockedLLMQuota = "llm_quota_exhausted"
+const (
+	IntentBlockedLLMQuota   = "llm_quota_exhausted"
+	IntentBlockedNoProgress = "worker_no_progress"
+)
 
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {
@@ -420,6 +423,13 @@ func (d *DB) ReplaceTaskLLMProfiles(taskID int64, profileIDs []int64, activeProf
 		}
 		return err
 	}
+	if err := replaceTaskLLMProfilesTx(tx, taskID, profileIDs, activeProfileID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func replaceTaskLLMProfilesTx(tx *sql.Tx, taskID int64, profileIDs []int64, activeProfileID int64) error {
 	if _, err := tx.Exec(`DELETE FROM task_llm_profiles WHERE task_id=$1`, taskID); err != nil {
 		return err
 	}
@@ -449,7 +459,7 @@ SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_re
 WHERE id=$1`, taskID, active); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // MarkTaskLLMProfileQuotaExhausted advances the shared task cursor once. A late

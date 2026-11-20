@@ -67,39 +67,67 @@ function FieldRow({ label, children }: { label: string; children: React.ReactNod
 
 function FindingCodeAuditEvidenceCard({
   evidence,
+  findingClass,
   status,
   ui,
 }: {
   evidence: CodeAuditFindingEvidence;
+  findingClass: string;
   status: FindingStatus;
   ui: UITranslate;
 }) {
-  const location = (label: string, item: CodeAuditFindingEvidence["candidate"]["source"]) => (
-    <div className="rounded-md border p-3">
-      <p className="font-medium text-xs text-muted-foreground">{label}</p>
-      <p className="mt-1 break-all font-mono text-xs">
-        {item.file}:{item.line} · {item.symbol}
-        {item.parameter ? ` (${item.parameter})` : ""}
-      </p>
-      <p className="mt-1 text-sm">{item.description}</p>
-    </div>
-  );
+  const lowConfidence = (evidence.registration_tier ?? evidence.candidate.registration_tier) === "B";
+  const validationIssues = evidence.validation_issues ?? evidence.candidate.validation_issues ?? [];
+  const location = (label: string, item: CodeAuditFindingEvidence["candidate"]["source"]) =>
+    item?.file ? (
+      <div className="rounded-md border p-3">
+        <p className="font-medium text-xs text-muted-foreground">{label}</p>
+        <p className="mt-1 break-all font-mono text-xs">
+          {item.file}:{item.line} · {item.symbol}
+          {item.parameter ? ` (${item.parameter})` : ""}
+        </p>
+        <p className="mt-1 text-sm">{item.description}</p>
+      </div>
+    ) : null;
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">白盒污点路径与复核证据</CardTitle>
+        <CardTitle className="text-sm">白盒审计与代码证据</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="text-xs text-muted-foreground">
           服务：{evidence.service_name} · 路径：{evidence.relative_path} · 版本：{evidence.version_id} · 范围：
           {evidence.scope_path}
         </div>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+          <span>Finding 分类：{findingClass}</span>
+          {evidence.candidate.category ? <span>候选原始类别：{evidence.candidate.category}</span> : null}
+          {evidence.candidate.language ? <span>语言：{evidence.candidate.language}</span> : null}
+          {evidence.candidate.cwe ? <span>CWE：{evidence.candidate.cwe}</span> : null}
+        </div>
+        {evidence.registration_tier || evidence.candidate.registration_tier ? (
+          <section className="space-y-2 rounded-md border p-3">
+            <Badge variant="outline">{lowConfidence ? "B 级 · 低置信度线索" : "A 级 · 完整静态证据"}</Badge>
+            <p className="text-xs text-muted-foreground">
+              {lowConfidence
+                ? "代码位置与符号已核对，推理链路或可利用条件仍待确认；报告不自动生成。"
+                : "已通过完整静态证据校验，报告自动排队；尚未动态验证。"}
+            </p>
+            {validationIssues.length > 0 ? (
+              <ul className="list-disc space-y-1 pl-4 text-xs">
+                {validationIssues.map((issue) => (
+                  <li key={issue}>{issue}</li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+        ) : null}
         {evidence.candidate.provenance ? (
           <section className="space-y-2 rounded-md border p-3">
             <h3 className="font-medium text-sm">反编译来源</h3>
             <p className="break-all text-xs text-muted-foreground">
-              {evidence.candidate.provenance.decompiler} · {evidence.candidate.provenance.artifact_name} · SHA-256{" "}
+              {evidence.candidate.provenance.javacodedb} · {evidence.candidate.provenance.artifact_name} · SHA-256{" "}
               {evidence.candidate.provenance.artifact_sha256}
             </p>
             <p className="break-all font-mono text-xs">
@@ -132,7 +160,7 @@ function FindingCodeAuditEvidenceCard({
             <ol className="space-y-2">
               {evidence.history.map((event, index) => {
                 let label = "再次复现";
-                if (event.kind === "observed") label = "复核确认";
+                if (event.kind === "observed") label = "首次发现";
                 if (event.kind === "fixed") label = "未再复现";
                 return (
                   <li
@@ -149,10 +177,16 @@ function FindingCodeAuditEvidenceCard({
                         <span className="text-xs text-muted-foreground">{fmtTime(event.observed_at, ui)}</span>
                       ) : null}
                     </div>
-                    {event.candidate ? (
+                    {event.candidate?.source?.file && event.candidate.sink?.file ? (
                       <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
                         {event.candidate.source.file}:{event.candidate.source.line} · {event.candidate.source.symbol} →{" "}
                         {event.candidate.sink.file}:{event.candidate.sink.line} · {event.candidate.sink.symbol}
+                      </p>
+                    ) : event.candidate?.anchors?.length ? (
+                      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                        {event.candidate.anchors
+                          .map((anchor) => `${anchor.file}:${anchor.line} · ${anchor.symbol}`)
+                          .join(" → ")}
                       </p>
                     ) : null}
                     {event.reason ? <p className="mt-1 text-xs">{event.reason}</p> : null}
@@ -167,10 +201,44 @@ function FindingCodeAuditEvidenceCard({
           {location("Sink", evidence.candidate.sink)}
           {location("可访问入口", evidence.candidate.entry_point)}
         </div>
+        {evidence.candidate.anchors?.length ? (
+          <section>
+            <h3 className="mb-2 font-medium text-sm">关键代码位置</h3>
+            <ol className="space-y-2">
+              {evidence.candidate.anchors.map((anchor, index) => (
+                <li
+                  className="rounded-md border p-2"
+                  key={`${anchor.role}:${anchor.file}:${anchor.line}:${anchor.symbol}`}
+                >
+                  <p className="break-all font-mono text-xs">
+                    {index + 1}. {anchor.role ? <Badge variant="outline">{anchor.role}</Badge> : null} {anchor.file}:
+                    {anchor.line} · {anchor.symbol}
+                  </p>
+                  {anchor.description ? <p className="mt-1 text-sm">{anchor.description}</p> : null}
+                  {anchor.excerpt ? (
+                    <pre className="mt-2 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 text-xs">
+                      {anchor.excerpt}
+                    </pre>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </section>
+        ) : null}
+        {evidence.candidate.reasoning_chain?.length ? (
+          <section>
+            <h3 className="mb-2 font-medium text-sm">推理链</h3>
+            <ol className="list-decimal space-y-1 pl-5 text-sm">
+              {evidence.candidate.reasoning_chain.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          </section>
+        ) : null}
         <section>
-          <h3 className="mb-2 font-medium text-sm">完整数据流</h3>
+          <h3 className="mb-2 font-medium text-sm">{lowConfidence ? "已记录数据流（待补全）" : "完整数据流"}</h3>
           <ol className="space-y-2">
-            {evidence.candidate.flow.map((step, index) => (
+            {(evidence.candidate.flow ?? []).map((step, index) => (
               <li
                 className="rounded-md border p-2"
                 key={`${step.file}:${step.line}:${step.symbol}:${step.propagation}`}
@@ -186,7 +254,7 @@ function FindingCodeAuditEvidenceCard({
         <section>
           <h3 className="mb-2 font-medium text-sm">阻断条件检查</h3>
           <ul className="space-y-2">
-            {evidence.candidate.controls_checked.map((control) => (
+            {(evidence.candidate.controls_checked ?? []).map((control) => (
               <li className="text-sm" key={`${control.file}:${control.line}:${control.control}`}>
                 <span className="font-mono text-xs">
                   {control.file}:{control.line}
@@ -195,13 +263,19 @@ function FindingCodeAuditEvidenceCard({
               </li>
             ))}
           </ul>
-          <p className="mt-2 whitespace-pre-wrap text-sm">初筛说明：{evidence.candidate.why_unobstructed}</p>
-          <p className="mt-2 whitespace-pre-wrap text-sm">独立复核：{evidence.review.blocking_conditions}</p>
+          <p className="mt-2 whitespace-pre-wrap text-sm">阻断分析：{evidence.candidate.why_unobstructed}</p>
+          <p className="mt-2 text-sm">
+            结论：无有效阻断{" "}
+            {evidence.candidate.no_effective_block && !lowConfidence ? "（静态分析支持）" : "（待确认）"} · 可利用路径{" "}
+            {evidence.candidate.exploitable && !lowConfidence ? "（静态分析支持）" : "（待确认）"} ·
+            动态验证尚未进行，Finding 待确认。
+          </p>
         </section>
         <section className="space-y-2">
-          <h3 className="font-medium text-sm">可利用性确认</h3>
-          <p className="whitespace-pre-wrap text-sm">{evidence.review.exploitability}</p>
-          <p className="whitespace-pre-wrap text-sm text-muted-foreground">复核结论：{evidence.review.reason}</p>
+          <h3 className="font-medium text-sm">可利用条件（静态分析）</h3>
+          <p className="whitespace-pre-wrap text-sm">
+            {evidence.candidate.exploitability || "旧版证据未记录可利用条件。"}
+          </p>
         </section>
         {evidence.candidate.evidence_excerpt ? (
           <pre className="max-h-48 overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
@@ -412,6 +486,7 @@ function FindingDetailInner() {
                 {finding.code_audit_evidence ? (
                   <FindingCodeAuditEvidenceCard
                     evidence={finding.code_audit_evidence}
+                    findingClass={finding.vulnclass}
                     status={finding.status}
                     ui={ui}
                   />

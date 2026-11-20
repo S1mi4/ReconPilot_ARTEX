@@ -37,14 +37,6 @@ const (
 	maxDiscoveryLLMTokens    = 2400
 )
 
-var buildMetadataPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)<packaging>\s*([a-z0-9_.-]{1,80})\s*</packaging>`),
-	regexp.MustCompile(`(?i)<artifactId>\s*([a-z0-9_.-]{1,100})\s*</artifactId>`),
-	regexp.MustCompile(`(?i)<module>\s*([a-z0-9_./-]{1,120})\s*</module>`),
-	regexp.MustCompile(`(?i)(?:mainClass|mainClassName|start-class)\s*(?:=|:)\s*["']?([a-z0-9_.$/-]{1,160})`),
-	regexp.MustCompile(`(?i)(?:id|group)\s*(?:\(\s*)?["']((?:org\.springframework\.boot|io\.quarkus|io\.micronaut|org\.gretty|war|application)[a-z0-9_.-]{0,120})["']`),
-}
-
 type discoveryEntry struct {
 	name string
 	dir  bool
@@ -54,14 +46,16 @@ type discoveryEntry struct {
 }
 
 type serviceDiscoveryMetadata struct {
-	Path       string   `json:"path"`
-	Name       string   `json:"name"`
-	JavaFiles  int      `json:"java_files,omitempty"`
-	BuildFiles []string `json:"build_files,omitempty"`
-	Tokens     []string `json:"metadata_tokens,omitempty"`
-	Signals    []string `json:"signals,omitempty"`
-	Package    string   `json:"package_kind,omitempty"`
-	Strong     string   `json:"strong_service_evidence,omitempty"`
+	Path        string         `json:"path"`
+	Name        string         `json:"name"`
+	Languages   []string       `json:"languages"`
+	SourceFiles map[string]int `json:"source_files,omitempty"`
+	JavaFiles   int            `json:"java_files,omitempty"`
+	BuildFiles  []string       `json:"build_files,omitempty"`
+	Tokens      []string       `json:"metadata_tokens,omitempty"`
+	Signals     []string       `json:"signals,omitempty"`
+	Package     string         `json:"package_kind,omitempty"`
+	Strong      string         `json:"strong_service_evidence,omitempty"`
 }
 
 type discoveryCandidateOutput struct {
@@ -187,15 +181,15 @@ func (s *Server) runTaskCodebaseDiscovery(taskID int64, version taskCodebaseVers
 		log.Printf("[codebase-discovery] task %d version %s start failed: %v", taskID, version.ID, err)
 		return
 	}
+	log.Printf("[codebase-discovery] task %d version %s started", taskID, version.ID)
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 	defer cancel()
-	metadata, err := s.scanCodebaseServiceMetadata(ctx, taskID, version)
+	candidates, note, err := s.discoverCodebaseServices(ctx, taskID, version)
 	if err != nil {
 		_ = s.m.pg.FailTaskCodebaseDiscovery(taskID, version.ID, "代码库元数据扫描失败")
 		log.Printf("[codebase-discovery] task %d version %s scan failed: %v", taskID, version.ID, err)
 		return
 	}
-	candidates, note := s.classifyCodebaseServiceMetadata(ctx, taskID, metadata)
 	if err := s.m.pg.CompleteTaskCodebaseDiscovery(taskID, pgdb.TaskCodebaseVersionRef{
 		ID: version.ID, CodebaseID: version.CodebaseID, CreatedAt: version.CreatedAt,
 	}, candidates); err != nil {
@@ -204,8 +198,39 @@ func (s *Server) runTaskCodebaseDiscovery(taskID int64, version taskCodebaseVers
 		return
 	}
 	if note != "" {
-		_, _ = s.m.pg.Exec(`UPDATE task_codebase_discovery_runs SET error=$3 WHERE task_id=$1 AND version_id=$2`, taskID, version.ID, note)
+		_ = s.m.pg.SetTaskCodebaseDiscoveryNote(taskID, version.ID, note)
 	}
+	persistedCandidateCount, confirmedCount, pendingCount, err := s.m.pg.TaskCodebaseDiscoveryCounts(taskID, version.ID)
+	if err != nil {
+		log.Printf("[codebase-discovery] task %d version %s completed candidate_decisions=%d persisted_summary_unavailable", taskID, version.ID, len(candidates))
+		return
+	}
+	log.Printf("[codebase-discovery] task %d version %s completed candidates=%d confirmed=%d pending=%d", taskID, version.ID, persistedCandidateCount, confirmedCount, pendingCount)
+}
+
+func (s *Server) discoverCodebaseServices(ctx context.Context, taskID int64, version taskCodebaseVersion) ([]pgdb.CodeServiceDiscoveryCandidate, string, error) {
+	metadata, err := s.scanCodebaseServiceMetadata(ctx, taskID, version)
+	if err != nil {
+		return nil, "", err
+	}
+	if version.Kind == "directory" {
+		candidates := make([]pgdb.CodeServiceDiscoveryCandidate, 0, len(metadata))
+		for _, service := range metadata {
+			evidence, err := json.Marshal(service)
+			if err != nil {
+				return nil, "", err
+			}
+			candidates = append(candidates, pgdb.CodeServiceDiscoveryCandidate{
+				RelativePath: service.Path, Name: service.Name, Languages: service.Languages,
+				Decision: "service", Source: "discovery", SourceDirectory: true,
+				Reason: service.Strong, Evidence: evidence,
+			})
+		}
+		log.Printf("[codebase-discovery] task %d version %s rule=src_parent candidates=%d", taskID, version.ID, len(candidates))
+		return candidates, "", nil
+	}
+	candidates, note := s.classifyCodebaseServiceMetadataForVersion(ctx, taskID, version.ID, metadata)
+	return candidates, note, nil
 }
 
 func (s *Server) loadTaskCodebaseVersion(taskID, versionID string) (taskCodebaseVersion, error) {
@@ -249,11 +274,7 @@ func (s *Server) scanCodebaseServiceMetadata(ctx context.Context, taskID int64, 
 		if err := ensureTaskCodebaseDirectories(contentRoot, false); err != nil {
 			return nil, err
 		}
-		entries, err := readDirectoryDiscoveryEntries(ctx, contentRoot)
-		if err != nil {
-			return nil, err
-		}
-		return nameCodebaseRoot(analyzeSourceDiscoveryEntries(entries, ""), version.Name, false), nil
+		return scanSourceServiceDirectories(ctx, contentRoot, version.Name)
 	case "artifact":
 		artifact := filepath.Join(root, filepath.FromSlash(version.Name))
 		artifactInfo, err := os.Lstat(artifact)
@@ -277,13 +298,125 @@ func (s *Server) scanCodebaseServiceMetadata(ctx context.Context, taskID int64, 
 			}
 			return nameCodebaseRoot(analyzeArchiveDiscoveryEntries(entries), version.Name, true), nil
 		case "class":
-			return []serviceDiscoveryMetadata{{Path: ".", Name: strings.TrimSuffix(filepath.Base(version.Name), filepath.Ext(version.Name)), Package: "class", Signals: []string{"single_java_class_no_application_metadata"}}}, nil
+			return []serviceDiscoveryMetadata{{Path: ".", Name: strings.TrimSuffix(filepath.Base(version.Name), filepath.Ext(version.Name)), Languages: []string{"java"}, Package: "class", Signals: []string{"single_java_class_no_application_metadata"}}}, nil
 		default:
 			return nil, fmt.Errorf("unsupported codebase format %q", version.Format)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported codebase kind %q", version.Kind)
 	}
+}
+
+// A source service is the direct parent of a directory named src, keeping only
+// the outermost match so nested sub-module src trees do not each become a
+// service. Language metadata comes from file paths and never changes the
+// service decision.
+func scanSourceServiceDirectories(ctx context.Context, root, rootName string) ([]serviceDiscoveryMetadata, error) {
+	services := make(map[string]*serviceDiscoveryMetadata)
+	languages := taskCodeAuditLanguages()
+	err := filepath.WalkDir(root, func(filename string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if filename == root {
+			return nil
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		rel := filepath.ToSlash(relative)
+		if _, err := safeTaskCodebasePath(rel); err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == "src" {
+				parent := path.Dir(rel)
+				name := path.Base(parent)
+				if parent == "." {
+					name = rootName
+				}
+				services[parent] = &serviceDiscoveryMetadata{
+					Path: parent, Name: name, Strong: "包含直接子目录 src",
+					Signals: []string{"src_parent"}, SourceFiles: make(map[string]int),
+				}
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		// Attribute the file to the outermost enclosing src tree so nested
+		// sub-module sources count towards the service that survives pruning.
+		sourceRoot := ""
+		for ancestor := path.Dir(rel); ancestor != "."; ancestor = path.Dir(ancestor) {
+			if path.Base(ancestor) == "src" {
+				sourceRoot = ancestor
+			}
+		}
+		if sourceRoot == "" {
+			return nil
+		}
+		service := services[path.Dir(sourceRoot)]
+		if service == nil {
+			return nil
+		}
+		sourcePath := "src/" + strings.TrimPrefix(rel, sourceRoot+"/")
+		for _, language := range languages {
+			if language.DiscoveryFile(sourcePath, nil).Source {
+				service.SourceFiles[language.Language()]++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]serviceDiscoveryMetadata, 0, len(services))
+	for _, service := range services {
+		for language := range service.SourceFiles {
+			service.Languages = append(service.Languages, language)
+		}
+		if len(service.Languages) == 0 {
+			// An explicit unknown avoids the legacy fallback to Java.
+			service.Languages = []string{"unknown"}
+		}
+		sort.Strings(service.Languages)
+		service.JavaFiles = service.SourceFiles["java"]
+		result = append(result, *service)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return dropNestedServiceDirectories(result), nil
+}
+
+// dropNestedServiceDirectories keeps only outermost service directories. A src
+// nested inside another service's tree (a sub-module, src under src, or a test
+// tree) belongs to its enclosing service instead of being a service of its own.
+func dropNestedServiceDirectories(services []serviceDiscoveryMetadata) []serviceDiscoveryMetadata {
+	if len(services) < 2 {
+		return services
+	}
+	paths := make(map[string]bool, len(services))
+	for _, service := range services {
+		paths[service.Path] = true
+	}
+	result := services[:0]
+	for _, service := range services {
+		nested := false
+		for ancestor := path.Dir(service.Path); ancestor != "."; ancestor = path.Dir(ancestor) {
+			if paths[ancestor] {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			result = append(result, service)
+		}
+	}
+	return result
 }
 
 func nameCodebaseRoot(candidates []serviceDiscoveryMetadata, codebaseName string, trimExtension bool) []serviceDiscoveryMetadata {
@@ -300,73 +433,6 @@ func nameCodebaseRoot(candidates []serviceDiscoveryMetadata, codebaseName string
 		}
 	}
 	return candidates
-}
-
-func readDirectoryDiscoveryEntries(ctx context.Context, root string) ([]discoveryEntry, error) {
-	entries := make([]discoveryEntry, 0)
-	count := 0
-	err := filepath.WalkDir(root, func(filename string, item fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if filename == root {
-			return nil
-		}
-		if item.Type()&os.ModeSymlink != 0 {
-			if item.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(root, filename)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if !safeDiscoveryArchivePath(rel) {
-			return nil
-		}
-		if isExcludedDiscoveryPath(rel) {
-			if item.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		count++
-		if count > maxDiscoveryEntries {
-			return errors.New("discovery entry limit exceeded")
-		}
-		entry := discoveryEntry{name: rel, dir: item.IsDir(), mode: item.Type()}
-		if !entry.dir {
-			info, err := item.Info()
-			if err != nil {
-				return err
-			}
-			if !info.Mode().IsRegular() {
-				return nil
-			}
-			entry.mode = info.Mode()
-			entry.size = info.Size()
-			full := filename
-			entry.read = func(limit int64) ([]byte, error) {
-				file, err := os.Open(full)
-				if err != nil {
-					return nil, err
-				}
-				defer file.Close()
-				return io.ReadAll(io.LimitReader(file, limit+1))
-			}
-		}
-		entries = append(entries, entry)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return entries, nil
 }
 
 func readZipDiscoveryEntries(ctx context.Context, filename, format string) ([]discoveryEntry, error) {
@@ -401,6 +467,28 @@ func readZipDiscoveryEntries(ctx context.Context, filename, format string) ([]di
 				defer reader.Close()
 				return io.ReadAll(io.LimitReader(reader, limit+1))
 			}
+			// The archive closes before analysis. Retain only bounded build or
+			// Java package metadata; source bodies are never buffered for discovery.
+			limit := int64(0)
+			if (isBuildMetadata(name) && !strings.EqualFold(path.Ext(name), ".py")) || strings.EqualFold(path.Base(name), "MANIFEST.MF") {
+				limit = maxDiscoveryMetadataFile
+			} else if isNestedJavaPackage(name) && !isBundledDependencyPath(name) {
+				limit = maxNestedPackageBytes
+			}
+			if limit > 0 {
+				data, readErr := entry.read(limit)
+				entry.read = func(readLimit int64) ([]byte, error) {
+					if readErr != nil {
+						return nil, readErr
+					}
+					if int64(len(data)) > readLimit {
+						return nil, errors.New("metadata file exceeds limit")
+					}
+					return data, nil
+				}
+			} else {
+				entry.read = nil
+			}
 			entries = append(entries, entry)
 			if format == "zip" && isNestedJavaPackage(name) && !isBundledDependencyPath(name) {
 				packageEntries := nestedPackageEvidence{kind: strings.TrimPrefix(strings.ToLower(path.Ext(name)), "."), signals: []string{"package_metadata_unavailable"}}
@@ -411,6 +499,9 @@ func readZipDiscoveryEntries(ctx context.Context, filename, format string) ([]di
 						}
 					}
 				}
+				// Synthetic entries retain the package evidence without retaining
+				// every nested archive's bytes until the whole ZIP has been scanned.
+				entries[len(entries)-1].read = nil
 				entries = append(entries, discoveryEntry{name: name + "/.package-kind-" + packageEntries.kind, dir: true},
 					discoveryEntry{name: name + "/.package-evidence-" + strings.Join(packageEntries.signals, ","), dir: true})
 			}
@@ -481,7 +572,7 @@ func readTarDiscoveryEntries(ctx context.Context, filename string) ([]discoveryE
 					discoveryEntry{name: name + "/.package-kind-" + strings.TrimPrefix(strings.ToLower(path.Ext(name)), "."), dir: true},
 					discoveryEntry{name: name + "/.package-evidence-package_metadata_unavailable", dir: true})
 				continue
-			} else if isBuildMetadata(name) && header.Size <= maxDiscoveryMetadataFile {
+			} else if isBuildMetadata(name) && !strings.EqualFold(path.Ext(name), ".py") && header.Size <= maxDiscoveryMetadataFile {
 				data, readErr := io.ReadAll(io.LimitReader(reader, maxDiscoveryMetadataFile+1))
 				if readErr != nil {
 					return nil, readErr
@@ -623,7 +714,7 @@ func analyzePackageDiscoveryEntries(entries []discoveryEntry, name, format strin
 		}
 	}
 	return []serviceDiscoveryMetadata{{Path: ".", Name: strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)),
-		Package: packageInfo.kind, Signals: uniqueSorted(packageInfo.signals), Strong: strong}}
+		Languages: []string{"java"}, Package: packageInfo.kind, Signals: uniqueSorted(packageInfo.signals), Strong: strong}}
 }
 
 func analyzeArchiveDiscoveryEntries(entries []discoveryEntry) []serviceDiscoveryMetadata {
@@ -660,9 +751,20 @@ func entriesForPackage(entries []discoveryEntry, packagePath string) []discovery
 }
 
 func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []serviceDiscoveryMetadata {
+	var candidates []serviceDiscoveryMetadata
+	for _, language := range taskCodeAuditLanguages() {
+		candidates = append(candidates, analyzeSourceDiscoveryEntriesWithLanguage(entries, rootName, language)...)
+	}
+	return uniqueDiscoveryCandidates(candidates)
+}
+
+func analyzeSourceDiscoveryEntriesWithLanguage(entries []discoveryEntry, rootName string, language taskCodeAuditLanguageAdapter) []serviceDiscoveryMetadata {
 	byPath := map[string]*serviceDiscoveryMetadata{".": {Path: "."}}
+	topLevelPaths := map[string]bool{}
+	sourceFilesByPath := map[string]int{}
 	metadataFiles := map[string]map[string]bool{}
 	tokens := map[string]map[string]bool{}
+	metadataSignals := map[string][]string{}
 	nestedPackages := make([]serviceDiscoveryMetadata, 0)
 	for _, entry := range entries {
 		name := entry.name
@@ -679,6 +781,7 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 		}
 		parts := strings.Split(name, "/")
 		if len(parts) > 1 {
+			topLevelPaths[parts[0]] = true
 			if _, exists := byPath[parts[0]]; !exists {
 				byPath[parts[0]] = &serviceDiscoveryMetadata{Path: parts[0], Name: parts[0]}
 			}
@@ -687,47 +790,40 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 			continue
 		}
 		ext := strings.ToLower(path.Ext(name))
-		ancestors := []string{"."}
-		if len(parts) > 1 {
-			ancestors = append(ancestors, parts[0])
-		}
-		if ext == ".java" && !isGeneratedJavaPath(name) {
-			for _, parent := range ancestors {
-				byPath[parent].JavaFiles++
+		fileInfo := language.DiscoveryFile(name, nil)
+		if fileInfo.Source {
+			sourceFilesByPath["."]++
+			for depth := 1; depth < len(parts); depth++ {
+				parent := strings.Join(parts[:depth], "/")
+				sourceFilesByPath[parent]++
 			}
 		}
-		if isBuildMetadata(name) {
+		if fileInfo.Build {
 			parent := path.Dir(name)
-			if parent != "." && !strings.Contains(parent, "/") {
-				if metadataFiles[parent] == nil {
-					metadataFiles[parent] = map[string]bool{}
-				}
-				metadataFiles[parent][path.Base(name)] = true
-			} else if parent == "." {
-				if metadataFiles["."] == nil {
-					metadataFiles["."] = map[string]bool{}
-				}
-				metadataFiles["."][path.Base(name)] = true
+			if byPath[parent] == nil {
+				byPath[parent] = &serviceDiscoveryMetadata{Path: parent, Name: path.Base(parent)}
 			}
-			if entry.read != nil {
+			if metadataFiles[parent] == nil {
+				metadataFiles[parent] = map[string]bool{}
+			}
+			metadataFiles[parent][path.Base(name)] = true
+			metadataSignals[parent] = append(metadataSignals[parent], fileInfo.Signals...)
+			// Script names can be build markers without making their bodies metadata.
+			if entry.read != nil && !(language.Language() == "python" && ext == ".py") {
 				data, err := entry.read(maxDiscoveryMetadataFile)
 				if err == nil && int64(len(data)) <= maxDiscoveryMetadataFile {
-					fileTokens := extractBuildMetadataTokens(string(data))
-					for _, candidatePath := range []string{parent} {
-						if candidatePath != "." && strings.Contains(candidatePath, "/") {
-							continue
-						}
-						if tokens[candidatePath] == nil {
-							tokens[candidatePath] = map[string]bool{}
-						}
-						for _, token := range fileTokens {
-							tokens[candidatePath][token] = true
-						}
+					metadata := language.DiscoveryFile(name, data)
+					if tokens[parent] == nil {
+						tokens[parent] = map[string]bool{}
 					}
+					for _, token := range metadata.Tokens {
+						tokens[parent][token] = true
+					}
+					metadataSignals[parent] = append(metadataSignals[parent], metadata.Signals...)
 				}
 			}
 		}
-		if isNestedJavaPackage(name) && !isBundledDependencyPath(name) {
+		if language.Language() == "java" && isNestedJavaPackage(name) && !isBundledDependencyPath(name) {
 			packageInfo := nestedPackageEvidence{kind: strings.TrimPrefix(ext, "."), signals: []string{"package_metadata_unavailable"}}
 			if entry.read != nil && entry.size > 0 && entry.size <= maxNestedPackageBytes {
 				data, err := entry.read(maxNestedPackageBytes)
@@ -738,15 +834,19 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 				}
 			}
 			nestedPackages = append(nestedPackages, serviceDiscoveryMetadata{Path: name, Name: strings.TrimSuffix(path.Base(name), ext),
-				Package: packageInfo.kind, Signals: packageInfo.signals, Strong: packageInfo.strong})
+				Languages: []string{"java"}, Package: packageInfo.kind, Signals: packageInfo.signals, Strong: packageInfo.strong})
 		}
 	}
-	paths := make([]string, 0, len(byPath))
-	for candidatePath, item := range byPath {
-		if candidatePath != "." && strings.Contains(candidatePath, "/") {
-			continue
-		}
-		if item.JavaFiles == 0 && item.Strong == "" {
+	candidatePaths := map[string]bool{".": true}
+	for candidatePath := range topLevelPaths {
+		candidatePaths[candidatePath] = true
+	}
+	for candidatePath := range metadataFiles {
+		candidatePaths[candidatePath] = true
+	}
+	paths := make([]string, 0, len(candidatePaths))
+	for candidatePath := range candidatePaths {
+		if sourceFilesByPath[candidatePath] == 0 && len(metadataFiles[candidatePath]) == 0 {
 			continue
 		}
 		paths = append(paths, candidatePath)
@@ -758,8 +858,16 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 	result := make([]serviceDiscoveryMetadata, 0, len(paths))
 	for _, candidatePath := range paths {
 		item := byPath[candidatePath]
+		if item == nil {
+			item = &serviceDiscoveryMetadata{Path: candidatePath, Name: path.Base(candidatePath)}
+		}
 		if item.Name == "" {
 			item.Name = rootName
+		}
+		item.Languages = []string{language.Language()}
+		item.SourceFiles = map[string]int{language.Language(): sourceFilesByPath[candidatePath]}
+		if language.Language() == "java" {
+			item.JavaFiles = sourceFilesByPath[candidatePath]
 		}
 		for file := range metadataFiles[candidatePath] {
 			item.BuildFiles = append(item.BuildFiles, file)
@@ -769,16 +877,17 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 		}
 		item.BuildFiles = uniqueSorted(item.BuildFiles)
 		item.Tokens = uniqueSorted(item.Tokens)
-		item.Signals = append(item.Signals, buildSignals(item.Tokens)...)
-		item.Signals = uniqueSorted(item.Signals)
+		item.Signals = append(item.Signals, metadataSignals[candidatePath]...)
+		signals, strong := language.DiscoveryEvidence(item.Tokens, item.Signals)
+		item.Signals = signals
 		if item.Strong == "" {
-			item.Strong = strongBuildEvidence(item.Signals)
+			item.Strong = strong
 		}
 		result = append(result, *item)
 	}
 	result = append(result, nestedPackages...)
 	for _, entry := range entries {
-		if !entry.dir || !strings.Contains(entry.name, "/.package-kind-") {
+		if language.Language() != "java" || !entry.dir || !strings.Contains(entry.name, "/.package-kind-") {
 			continue
 		}
 		packagePath := strings.SplitN(entry.name, "/.package-kind-", 2)[0]
@@ -786,7 +895,7 @@ func analyzeSourceDiscoveryEntries(entries []discoveryEntry, rootName string) []
 		if packagePath == "" || !safeDiscoveryArchivePath(packagePath) {
 			continue
 		}
-		info := serviceDiscoveryMetadata{Path: packagePath, Name: strings.TrimSuffix(path.Base(packagePath), path.Ext(packagePath)), Package: format}
+		info := serviceDiscoveryMetadata{Path: packagePath, Name: strings.TrimSuffix(path.Base(packagePath), path.Ext(packagePath)), Languages: []string{"java"}, Package: format}
 		for _, evidenceEntry := range entriesForPackage(entries, packagePath) {
 			if strings.Contains(path.Base(evidenceEntry.name), ".package-evidence-") {
 				signals := strings.TrimPrefix(path.Base(evidenceEntry.name), ".package-evidence-")
@@ -823,6 +932,15 @@ func uniqueDiscoveryCandidates(candidates []serviceDiscoveryMetadata) []serviceD
 		if candidate.Strong != "" {
 			current.Strong = candidate.Strong
 		}
+		current.Languages = uniqueSorted(append(current.Languages, candidate.Languages...))
+		if current.SourceFiles == nil && candidate.SourceFiles != nil {
+			current.SourceFiles = make(map[string]int)
+		}
+		for language, count := range candidate.SourceFiles {
+			if previous, exists := current.SourceFiles[language]; !exists || count > previous {
+				current.SourceFiles[language] = count
+			}
+		}
 		current.BuildFiles = uniqueSorted(append(current.BuildFiles, candidate.BuildFiles...))
 		current.Tokens = uniqueSorted(append(current.Tokens, candidate.Tokens...))
 		current.Signals = uniqueSorted(append(current.Signals, candidate.Signals...))
@@ -837,77 +955,6 @@ func uniqueDiscoveryCandidates(candidates []serviceDiscoveryMetadata) []serviceD
 		result = result[:maxCodeServiceCandidates]
 	}
 	return result
-}
-
-func isBuildMetadata(name string) bool {
-	base := strings.ToLower(path.Base(name))
-	switch base {
-	case "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts":
-		return true
-	default:
-		return false
-	}
-}
-
-func extractBuildMetadataTokens(body string) []string {
-	tokens := make([]string, 0)
-	seen := map[string]bool{}
-	for _, pattern := range buildMetadataPatterns {
-		matches := pattern.FindAllStringSubmatch(body, 32)
-		for _, match := range matches {
-			if len(match) < 2 {
-				continue
-			}
-			value := strings.TrimSpace(match[1])
-			if value == "" || len(value) > 160 {
-				continue
-			}
-			token := strings.ToLower(value)
-			if !seen[token] {
-				seen[token] = true
-				tokens = append(tokens, token)
-			}
-		}
-	}
-	if len(tokens) > 24 {
-		tokens = tokens[:24]
-	}
-	return tokens
-}
-
-func buildSignals(tokens []string) []string {
-	joined := strings.ToLower(strings.Join(tokens, " "))
-	var signals []string
-	for marker, signal := range map[string]string{
-		"spring-boot-maven-plugin": "spring_boot_maven_plugin",
-		"org.springframework.boot": "spring_boot_gradle_plugin",
-		"quarkus-maven-plugin":     "quarkus_maven_plugin",
-		"io.quarkus":               "quarkus_gradle_plugin",
-		"micronaut-maven-plugin":   "micronaut_maven_plugin",
-		"io.micronaut":             "micronaut_gradle_plugin",
-		"packaging=war":            "war_packaging",
-	} {
-		if strings.Contains(joined, marker) {
-			signals = append(signals, signal)
-		}
-	}
-	return signals
-}
-
-func strongBuildEvidence(signals []string) string {
-	for _, signal := range signals {
-		switch signal {
-		case "spring_boot_maven_plugin", "spring_boot_gradle_plugin":
-			return "Spring Boot application build plugin"
-		case "quarkus_maven_plugin", "quarkus_gradle_plugin":
-			return "Quarkus application build plugin"
-		case "micronaut_maven_plugin", "micronaut_gradle_plugin":
-			return "Micronaut application build plugin"
-		case "war_packaging":
-			return "WAR web application packaging"
-		}
-	}
-	return ""
 }
 
 func strongPackageEvidence(format string, signals []string) string {
@@ -935,16 +982,33 @@ func safeDiscoveryArchivePath(name string) bool {
 
 func isExcludedDiscoveryPath(name string) bool {
 	lower := strings.ToLower(strings.ReplaceAll(name, "\\", "/"))
-	if strings.Contains(lower, "/target/dependency/") || strings.HasPrefix(lower, "target/dependency/") {
-		return true
-	}
 	parts := strings.Split(lower, "/")
+	insideSource := false
 	for i, part := range parts {
+		if part == "src" || part == "java" {
+			insideSource = true
+		}
 		switch part {
-		case ".git", ".svn", "node_modules", "vendor", "web-inf/lib", "boot-inf/lib", "target/dependency":
+		case ".git", ".svn", "node_modules":
 			return true
+		case "vendor":
+			if !insideSource {
+				return true
+			}
+		case "dependency":
+			if !insideSource && i > 0 && parts[i-1] == "target" {
+				return true
+			}
+		case ".venv", ".tox", ".nox", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", "site-packages", "dist-packages", ".eggs":
+			return true
+		case "venv", "env", "cache", "__pycache__", "__pypackages__", "third_party", "third-party":
+			// These are also valid Java package names. Preserve them inside source
+			// trees while pruning dependency and environment directories elsewhere.
+			if !insideSource {
+				return true
+			}
 		case "lib", "libs":
-			if i == 0 || (i > 0 && (parts[i-1] == "web-inf" || parts[i-1] == "boot-inf")) {
+			if i > 0 && (parts[i-1] == "web-inf" || parts[i-1] == "boot-inf") {
 				return true
 			}
 		}
@@ -956,15 +1020,6 @@ func isBundledDependencyPath(name string) bool {
 	lower := strings.ToLower(strings.ReplaceAll(name, "\\", "/"))
 	return strings.Contains(lower, "web-inf/lib/") || strings.Contains(lower, "boot-inf/lib/") ||
 		strings.HasPrefix(lower, "lib/") || strings.HasPrefix(lower, "libs/") || strings.Contains(lower, "/vendor/")
-}
-
-func isGeneratedJavaPath(name string) bool {
-	for _, part := range strings.Split(strings.ToLower(name), "/") {
-		if part == "target" || part == "build" || part == "generated" || part == "generated-sources" {
-			return true
-		}
-	}
-	return false
 }
 
 func uniqueSorted(values []string) []string {
@@ -982,6 +1037,10 @@ func uniqueSorted(values []string) []string {
 }
 
 func (s *Server) classifyCodebaseServiceMetadata(ctx context.Context, taskID int64, metadata []serviceDiscoveryMetadata) ([]pgdb.CodeServiceDiscoveryCandidate, string) {
+	return s.classifyCodebaseServiceMetadataForVersion(ctx, taskID, "", metadata)
+}
+
+func (s *Server) classifyCodebaseServiceMetadataForVersion(ctx context.Context, taskID int64, versionID string, metadata []serviceDiscoveryMetadata) ([]pgdb.CodeServiceDiscoveryCandidate, string) {
 	result := make([]pgdb.CodeServiceDiscoveryCandidate, 0, len(metadata))
 	ambiguous := make([]serviceDiscoveryMetadata, 0)
 	for _, candidate := range metadata {
@@ -996,13 +1055,13 @@ func (s *Server) classifyCodebaseServiceMetadata(ctx context.Context, taskID int
 		}
 		if candidate.Package == "class" {
 			encoded, _ := json.Marshal(candidate)
-			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name,
+			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name, Languages: append([]string(nil), candidate.Languages...),
 				Decision: "uncertain", Source: "discovery", Reason: "单个 CLASS 文件不能证明它是独立服务，等待人工确认", Evidence: encoded})
 			continue
 		}
 		if candidate.Strong != "" {
 			encoded, _ := json.Marshal(candidate)
-			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name,
+			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name, Languages: append([]string(nil), candidate.Languages...),
 				Decision: "service", Source: "discovery", Reason: candidate.Strong, Evidence: encoded})
 		} else {
 			ambiguous = append(ambiguous, candidate)
@@ -1011,15 +1070,18 @@ func (s *Server) classifyCodebaseServiceMetadata(ctx context.Context, taskID int
 	if len(ambiguous) == 0 {
 		return result, ""
 	}
+	log.Printf("[codebase-discovery] task %d version %s invoking agent=codebase_discovery llm_candidates=%d", taskID, versionID, len(ambiguous))
 	classifications, err := s.classifyAmbiguousCodeServiceMetadata(ctx, taskID, ambiguous)
 	if err != nil {
+		log.Printf("[codebase-discovery] task %d version %s agent=codebase_discovery LLM classification failed: %s", taskID, versionID, safeDiscoveryErrorSummary(err))
 		for _, candidate := range ambiguous {
 			encoded, _ := json.Marshal(candidate)
-			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name,
-				Decision: "uncertain", Source: "discovery", Reason: "缺少可用模型，等待人工确认", Evidence: encoded})
+			result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name, Languages: append([]string(nil), candidate.Languages...),
+				Decision: "uncertain", Source: "discovery", Reason: "模型判断失败，等待人工确认", Evidence: encoded})
 		}
-		return result, "部分候选没有经过模型判断，等待人工确认"
+		return result, "部分候选未能完成模型判断，等待人工确认"
 	}
+	log.Printf("[codebase-discovery] task %d version %s agent=codebase_discovery LLM classification completed classified=%d", taskID, versionID, len(classifications))
 	for _, candidate := range ambiguous {
 		classified, ok := classifications[candidate.Path]
 		decision, source, reason := "uncertain", "llm", "模型未返回该候选的有效判断，等待人工确认"
@@ -1038,10 +1100,33 @@ func (s *Server) classifyCodebaseServiceMetadata(ctx context.Context, taskID int
 			}
 		}
 		encoded, _ := json.Marshal(candidate)
-		result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name,
+		result = append(result, pgdb.CodeServiceDiscoveryCandidate{RelativePath: candidate.Path, Name: candidate.Name, Languages: append([]string(nil), candidate.Languages...),
 			Decision: decision, Source: source, Reason: reason, Evidence: encoded})
 	}
 	return result, ""
+}
+
+var (
+	discoveryBearerPattern      = regexp.MustCompile(`(?i)bearer\s+[^\s,;]+`)
+	discoverySecretPattern      = regexp.MustCompile(`(?i)(api[_-]?key|authorization|token|password|secret)(["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
+	discoveryURLPasswordPattern = regexp.MustCompile(`(?i)(https?://[^:/\s]+:)[^@/\s]+@`)
+)
+
+func safeDiscoveryErrorSummary(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	message := strings.TrimSpace(err.Error())
+	message = discoveryBearerPattern.ReplaceAllString(message, "Bearer <REDACTED>")
+	message = discoverySecretPattern.ReplaceAllString(message, "$1$2<REDACTED>")
+	message = discoveryURLPasswordPattern.ReplaceAllString(message, "$1<REDACTED>@")
+	if len(message) > 400 {
+		message = trimAuditText(message, 400) + "…" // rune-safe truncation
+	}
+	if message == "" {
+		return "unspecified error"
+	}
+	return message
 }
 
 func (s *Server) classifyAmbiguousCodeServiceMetadata(ctx context.Context, taskID int64, metadata []serviceDiscoveryMetadata) (map[string]discoveryCandidateOutput, error) {

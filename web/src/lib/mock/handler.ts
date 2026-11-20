@@ -1322,6 +1322,13 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       source_task_ids: sourceTaskIDs,
       company_ids: companyIDs,
       share_global_assets: b.share_global_assets === true,
+      assessment_mode: b.assessment_mode === true,
+      assessment_phase: b.assessment_mode === true ? "material_check" : "",
+      draft: b.assessment_mode === true && b.draft !== false,
+      assessment_config:
+        b.assessment_mode === true && b.assessment_config && typeof b.assessment_config === "object"
+          ? (b.assessment_config as Task["assessment_config"])
+          : undefined,
     };
     // Validate the attached preview schedule before mutating task state.
     const numericTaskID = nextMockTaskAssetID;
@@ -1350,6 +1357,67 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     mockTasks.unshift(created);
     mockActiveTask = id;
     return created;
+  }
+  if (seg[0] === "tasks" && seg[2] === "draft" && seg.length === 3 && m === "PATCH") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    if (!task.draft) throw new Error("task is not in draft state");
+    if (typeof b.name === "string") task.name = b.name;
+    if (typeof b.remark === "string") task.remark = b.remark;
+    if (typeof b.description === "string") task.description = b.description;
+    if (typeof b.goal === "string") task.goal = b.goal;
+    if (b.assessment_config && typeof b.assessment_config === "object") {
+      task.assessment_config = b.assessment_config as Task["assessment_config"];
+    }
+    task.material_check = undefined;
+    task.assessment_phase = "material_check";
+    return publicMockTask(task);
+  }
+  if (seg[0] === "tasks" && seg[2] === "material-check" && seg.length === 3 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    const cfg = task.assessment_config ?? { execution_mode: "dynamic" };
+    const execMode = cfg.execution_mode === "offline" ? "offline" : "dynamic";
+    const envs = cfg.environments ?? [];
+    const envReady = execMode === "offline" || envs.some((e) => Boolean(e.url?.trim()));
+    const blockers = envReady ? [] : ["联调模式需要至少配置 1 个有效目标环境地址"];
+    const report: NonNullable<Task["material_check"]> = {
+      checked_at: new Date().toISOString(),
+      execution_mode: execMode,
+      standard_version: execMode === "offline" ? "whitebox-offline-v1" : "whitebox-dynamic-v1",
+      ready: blockers.length === 0,
+      source_acknowledged: Boolean(cfg.source_acknowledged),
+      java_code_db_required: false,
+      java_code_db_ready: true,
+      llm_ready: true,
+      summary: blockers.length === 0 ? "材料检查全部通过" : blockers[0],
+      blockers,
+      items: [
+        { key: "codebases", status: "pass", summary: "代码库就绪", blocking: false },
+        {
+          key: "environment",
+          status: execMode === "offline" ? "not_applicable" : envReady ? "pass" : "fail",
+          summary: execMode === "offline" ? "离线审计模式" : envReady ? "环境已校验" : blockers[0],
+          blocking: !envReady,
+        },
+      ],
+    };
+    task.material_check = report;
+    return { task: publicMockTask(task), report };
+  }
+  if (seg[0] === "tasks" && seg[2] === "start" && seg.length === 3 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    if (!task.draft) throw new Error("任务已启动");
+    const ack = b.source_acknowledged === true || Boolean(task.assessment_config?.source_acknowledged);
+    if (!ack) throw new Error("outbound source code acknowledgment is required");
+    task.draft = false;
+    task.assessment_phase = "profiling";
+    if (task.assessment_config) task.assessment_config.source_acknowledged = true;
+    return { task: publicMockTask(task), round: { id: 1, round_no: 1 }, report: task.material_check };
+  }
+  if (seg[0] === "tasks" && seg[2] === "codebases" && seg.length === 4 && m === "DELETE") {
+    return { deleted_versions: 1, codebase_id: seg[3] };
   }
   if (path === "/task-categories" && m === "GET") return { categories: mockTaskCategorySnapshot() };
   if (path === "/task-categories" && m === "POST") {

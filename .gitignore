@@ -44,6 +44,13 @@ Thumbs.db
 
 # 内嵌前端的单二进制产物
 /artex
+/java-code-db.jar
+/java-code-db.jar.*
+/server/java_code_db_embedded.jar.gz
+/integrations/java-code-db/target/
+/integrations/java-code-db/.javacodedb/
+# 本地实验用的大体积 Java 靶场样本（jar/zip），不入库
+/artifacts/
 # 一键更新在可执行文件旁留下的中间产物（暂存件 / 备份 / 失败版本 / 升级标记）
 /artex.new
 /artex.new.sha256

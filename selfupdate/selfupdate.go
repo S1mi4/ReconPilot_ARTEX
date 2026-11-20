@@ -41,12 +41,16 @@ const maxAttempts = 3
 // 刻意不用 CWD：服务化运行时工作目录可能是 / 或任意路径，用 CWD 会让暂存件落到
 // 别处，换装逻辑直接失效。
 type Paths struct {
-	Dir     string // 可执行文件所在目录
-	Current string // 当前运行的二进制        artex      / artex.exe
-	New     string // 暂存的新版本            artex.new  / artex.new.exe
-	Sum     string // 新版本的 sha256（hex）  artex.new.sha256 / artex.new.exe.sha256
-	Old     string // 换装前备份的旧版本      artex.old  / artex.old.exe
-	Marker  string // 升级状态标记            artex.upgrade.json
+	Dir           string // 可执行文件所在目录
+	Current       string // 当前运行的二进制        artex      / artex.exe
+	New           string // 暂存的新版本            artex.new  / artex.new.exe
+	Sum           string // 新版本的 sha256（hex）  artex.new.sha256 / artex.new.exe.sha256
+	Old           string // 换装前备份的旧版本      artex.old  / artex.old.exe
+	JavaCodeDB    string // 当前 JavaCodeDB 引擎 JAR
+	NewJavaCodeDB string // 暂存的新 JavaCodeDB 引擎 JAR
+	JavaCodeDBSum string // 暂存 JAR 的 SHA-256
+	OldJavaCodeDB string // 换装前备份的 JavaCodeDB 引擎 JAR
+	Marker        string // 升级状态标记            artex.upgrade.json
 }
 
 // ResolvePaths 按当前可执行文件推导全部升级路径。
@@ -68,21 +72,27 @@ func ResolvePaths() (Paths, error) {
 
 	join := func(suffix string) string { return filepath.Join(dir, stem+suffix+ext) }
 	return Paths{
-		Dir:     dir,
-		Current: exe,
-		New:     join(".new"),
-		Sum:     join(".new") + ".sha256",
-		Old:     join(".old"),
-		Marker:  filepath.Join(dir, stem+".upgrade.json"),
+		Dir:           dir,
+		Current:       exe,
+		New:           join(".new"),
+		Sum:           join(".new") + ".sha256",
+		Old:           join(".old"),
+		JavaCodeDB:    filepath.Join(dir, "java-code-db.jar"),
+		NewJavaCodeDB: filepath.Join(dir, "java-code-db.jar.new"),
+		JavaCodeDBSum: filepath.Join(dir, "java-code-db.jar.new.sha256"),
+		OldJavaCodeDB: filepath.Join(dir, "java-code-db.jar.old"),
+		Marker:        filepath.Join(dir, stem+".upgrade.json"),
 	}, nil
 }
 
 // marker 记录一次换装的进度，用来在新版起不来时触发自动回滚。
 type marker struct {
-	From     string `json:"from"`     // 升级前的版本
-	To       string `json:"to"`       // 目标版本
-	Attempts int    `json:"attempts"` // 换装后已尝试启动的次数
-	StagedAt int64  `json:"staged_at"`
+	From              string `json:"from"`     // 升级前的版本
+	To                string `json:"to"`       // 目标版本
+	Attempts          int    `json:"attempts"` // 换装后已尝试启动的次数
+	StagedAt          int64  `json:"staged_at"`
+	JavaCodeDBUpdated bool   `json:"javacodedb_updated,omitempty"`
+	HadJavaCodeDB     bool   `json:"had_javacodedb,omitempty"`
 }
 
 func readMarker(path string) (marker, bool) {
@@ -110,6 +120,12 @@ func writeMarker(path string, m marker) error {
 func cleanStaged(p Paths) {
 	_ = os.Remove(p.New)
 	_ = os.Remove(p.Sum)
+	if p.NewJavaCodeDB != "" {
+		_ = os.Remove(p.NewJavaCodeDB)
+	}
+	if p.JavaCodeDBSum != "" {
+		_ = os.Remove(p.JavaCodeDBSum)
+	}
 }
 
 // CompareVersions 比较两个版本号，返回 -1/0/1（a<b / a==b / a>b）。

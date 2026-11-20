@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,13 +38,13 @@ const (
 // 其余阶段传 -1。
 type Progress func(ph Phase, pct int, msg string)
 
-// Stage 下载指定 Release 的当前平台发布包，校验后把新二进制暂存为 artex.new。
+// Stage 下载指定 Release 的当前平台发布包，校验后暂存 ARTEX 和 JavaCodeDB JAR。
 //
-// 走的是完整 zip 而不是裸二进制，理由有两个：现有 Release 的 SHA256SUMS 本来就
+// 走的是完整 zip 而不是裸二进制，理由有两个：Release 的 SHA256SUMS 本来就
 // 只覆盖 zip，走 zip 不需要改 CI，也能兼容已经发布出去的历史版本；zip 里还带着
 // skills/，为将来同步内置 skill 留了口子。代价只是多下载 skills 那几百 KB。
 //
-// 函数返回即代表暂存完成，调用方随后优雅关闭并以 ExitRestart 退出。
+// 函数返回即代表 ARTEX 与 JavaCodeDB 均已暂存，调用方随后优雅关闭并以 ExitRestart 退出。
 func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion string, prog Progress) error {
 	if prog == nil {
 		prog = func(Phase, int, string) {}
@@ -81,9 +82,16 @@ func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion s
 	// （跨设备 rename 会失败，而 /tmp 常常是独立挂载点）。
 	zipPath := p.New + ".zip.part"
 	binPath := p.New + ".part"
+	javaCodeDBPath := ""
+	if p.NewJavaCodeDB != "" {
+		javaCodeDBPath = p.NewJavaCodeDB + ".part"
+	}
 	defer func() {
 		_ = os.Remove(zipPath)
 		_ = os.Remove(binPath)
+		if javaCodeDBPath != "" {
+			_ = os.Remove(javaCodeDBPath)
+		}
 	}()
 
 	prog(PhaseDownload, 0, fmt.Sprintf("下载 %s（%s）…", name, humanSize(asset.Size)))
@@ -101,8 +109,27 @@ func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion s
 	if err := extractBinary(zipPath, binPath); err != nil {
 		return err
 	}
+	if javaCodeDBPath != "" {
+		packageRoot := strings.TrimSuffix(name, ".zip")
+		if packageRoot == name {
+			return fmt.Errorf("发布包名称无效：%s", name)
+		}
+		if err := extractJavaCodeDBJar(zipPath, javaCodeDBPath, packageRoot); err != nil {
+			return err
+		}
+	}
 	if err := smokeTest(binPath); err != nil {
 		return fmt.Errorf("新版本无法在当前系统上运行: %w", err)
+	}
+
+	if javaCodeDBPath != "" {
+		sum, err := fileSHA256(javaCodeDBPath)
+		if err != nil {
+			return fmt.Errorf("计算 JavaCodeDB JAR 校验和: %w", err)
+		}
+		if err := os.WriteFile(p.JavaCodeDBSum, []byte(sum), 0o644); err != nil {
+			return fmt.Errorf("写入 JavaCodeDB JAR 校验和: %w", err)
+		}
 	}
 
 	// 暂存件自己的 sha256 单独存一份：下次启动换装前还要再校验一次，
@@ -116,14 +143,30 @@ func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion s
 	}
 	if err := os.Rename(binPath, p.New); err != nil {
 		_ = os.Remove(p.Sum)
+		_ = os.Remove(p.JavaCodeDBSum)
 		return fmt.Errorf("暂存新版本: %w", err)
 	}
+	if javaCodeDBPath != "" {
+		if err := os.Rename(javaCodeDBPath, p.NewJavaCodeDB); err != nil {
+			_ = os.Remove(p.New)
+			_ = os.Remove(p.Sum)
+			_ = os.Remove(p.JavaCodeDBSum)
+			return fmt.Errorf("暂存 JavaCodeDB JAR: %w", err)
+		}
+	}
 
-	if err := writeMarker(p.Marker, marker{
-		From:     currentVersion,
-		To:       strings.TrimPrefix(rel.TagName, "v"),
-		StagedAt: time.Now().Unix(),
-	}); err != nil {
+	upgrade := marker{
+		From:              currentVersion,
+		To:                strings.TrimPrefix(rel.TagName, "v"),
+		StagedAt:          time.Now().Unix(),
+		JavaCodeDBUpdated: javaCodeDBPath != "",
+	}
+	if upgrade.JavaCodeDBUpdated {
+		if info, err := os.Lstat(p.JavaCodeDB); err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+			upgrade.HadJavaCodeDB = true
+		}
+	}
+	if err := writeMarker(p.Marker, upgrade); err != nil {
 		// 标记只影响自动回滚能力，暂存件本身已就位，不因此中断升级。
 		prog(PhaseStaged, -1, "警告：写入升级标记失败，本次升级将没有自动回滚保护")
 	}
@@ -285,6 +328,43 @@ func extractBinary(zipPath, dst string) error {
 		return f.Sync()
 	}
 	return fmt.Errorf("发布包里没有找到 %s", want)
+}
+
+// extractJavaCodeDBJar extracts the sidecar that must be updated with ARTEX.
+// The enclosing release ZIP has already passed the published SHA-256 check.
+func extractJavaCodeDBJar(zipPath, dst, packageRoot string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("打开发布包: %w", err)
+	}
+	defer zr.Close()
+	for _, entry := range zr.File {
+		if entry.FileInfo().IsDir() || entry.Name != path.Join(packageRoot, "java-code-db.jar") {
+			continue
+		}
+		if entry.UncompressedSize64 == 0 || entry.UncompressedSize64 > maxBinarySize || entry.Mode()&os.ModeSymlink != 0 {
+			return errors.New("发布包内的 JavaCodeDB JAR 大小无效")
+		}
+		rc, err := entry.Open()
+		if err != nil {
+			return fmt.Errorf("读取 JavaCodeDB JAR: %w", err)
+		}
+		defer rc.Close()
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("写出 JavaCodeDB JAR: %w", err)
+		}
+		n, copyErr := io.Copy(f, io.LimitReader(rc, maxBinarySize+1))
+		closeErr := f.Close()
+		if copyErr != nil || closeErr != nil {
+			return errors.Join(copyErr, closeErr)
+		}
+		if n == 0 || n > maxBinarySize {
+			return errors.New("发布包内的 JavaCodeDB JAR 大小无效")
+		}
+		return nil
+	}
+	return fmt.Errorf("发布包里没有找到 %s/java-code-db.jar", packageRoot)
 }
 
 // checkWritable 提前确认目录可写。没有这一步，非 root 运行、或二进制被放在系统

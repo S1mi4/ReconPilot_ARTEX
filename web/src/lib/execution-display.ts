@@ -2,6 +2,14 @@ import type { TFunction } from "i18next";
 
 export type ToolDetailPart = { kind: "command" | "output"; text: string; failed?: boolean };
 
+export function isWhiteboxAuditWorker(worker: string): boolean {
+  return worker === "whitebox_audit" || worker === "whitebox_java_audit";
+}
+
+export function executionWorkerLabel(worker: string): string {
+  return isWhiteboxAuditWorker(worker) ? "白盒审计" : worker;
+}
+
 // toolInputText renders a tool_use input for display. For Bash it pulls the shell
 // command out of the raw input JSON ({"command":…,"description":…}) so the UI shows
 // the command itself instead of JSON; other tools fall back to the raw text.
@@ -29,6 +37,16 @@ export function toolInputText(tool: string, raw: string): string {
   return raw;
 }
 
+function prettyStructuredText(raw: string): string {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return JSON.stringify(parsed, null, 2);
+  } catch {
+    // Tool output is often plain source or text rather than JSON.
+  }
+  return raw;
+}
+
 // Cache raw data, then format display labels using the current language.
 // Commands, tool results and AI text never enter the translation dictionary.
 export function formatToolDetail(
@@ -42,7 +60,8 @@ export function formatToolDetail(
       const label = translate(part.kind === "command" ? "chatUI.command" : "chatUI.output");
       const status = part.kind === "output" ? (outputIsError ? " ✕" : " ✓") : "";
       const body = part.failed ? translate("chatUI.loadFailed") : part.text || translate("chatUI.empty");
-      return `【${label}${status}】\n${part.kind === "command" ? toolInputText(toolName, body) : body}`;
+      const text = part.kind === "command" ? toolInputText(toolName, body) : body;
+      return `【${label}${status}】\n${toolName === "Bash" && part.kind === "command" ? text : prettyStructuredText(text)}`;
     })
     .join("\n\n");
 }

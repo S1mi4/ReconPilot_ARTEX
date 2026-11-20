@@ -126,6 +126,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		}
 	}()
 	s.cancelTaskChat(taskID, agent.AbortTaskDeleted)
+	s.cancelTaskChat(taskCodeAuditAgentChatBusyKey(taskID), agent.AbortTaskDeleted)
 	drainCtx, cancel := context.WithTimeout(s.ctx, taskDeleteDrainTimeout)
 	defer cancel()
 	if err := s.waitTaskQuiescent(drainCtx, taskID); err != nil {
@@ -436,9 +437,13 @@ func validateArchivePath(dataDir, candidate string) error {
 }
 
 func (s *Server) listTaskArchives(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-	result, err := s.m.pg.ListTaskArchives(r.URL.Query().Get("q"), r.URL.Query().Get("state"), page, size)
+	result, err := s.m.pg.ListTaskArchives(projectID, r.URL.Query().Get("q"), r.URL.Query().Get("state"), page, size)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -447,12 +452,16 @@ func (s *Server) listTaskArchives(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	id, ok := pathInt(r, "id")
 	if !ok {
 		writeErr(w, 400, "归档 id 无效")
 		return
 	}
-	item, err := s.m.pg.GetTaskArchive(id)
+	item, err := s.m.pg.GetProjectTaskArchive(projectID, id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

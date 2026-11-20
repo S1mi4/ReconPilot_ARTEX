@@ -426,11 +426,16 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL 
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
 -- 流式开关；补旧库。默认 true = 保持既有的流式行为，旧配置无感升级。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS streaming    BOOLEAN NOT NULL DEFAULT true;
--- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)和 Jev System One；补旧库。
--- 每次启动执行,幂等:先删旧 CHECK 再建含三值的新 CHECK。
+-- 放开 format 约束以容纳 OpenAI Responses API 和 Jev System One；补旧库。
+-- 每次启动执行,幂等:先删旧 CHECK 再建含支持 provider 的新 CHECK。
+-- 历史 codeagent 格式已废弃(CodeAgent 一律经 cc-auth-proxy 以 openai 接入):
+-- 残留行先归一为 openai,否则重加约束会因旧数据违反 CHECK 而启动失败。
+UPDATE llm_profiles SET format='openai' WHERE format='codeagent';
 ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_format_check;
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_format_check
     CHECK (format IN ('openai','anthropic','openai-responses','jev'));
+-- 移除「CodeAgent 自动接入」标记列(功能已废弃;新库不再创建,旧库残留一并清掉)。
+ALTER TABLE llm_profiles DROP COLUMN IF EXISTS auto_managed;
 
 -- 输出上限及其字段名；补旧库。默认 0 / '' = 不发送上限、沿用 max_tokens 字段名，
 -- 旧配置行为完全不变。
@@ -692,6 +697,7 @@ CREATE TABLE IF NOT EXISTS task_code_services (
     codebase_id       TEXT NOT NULL,
     relative_path     TEXT NOT NULL,
     name              TEXT NOT NULL,
+    languages         TEXT[] NOT NULL DEFAULT ARRAY['java']::text[],
     decision          TEXT NOT NULL CHECK (decision IN ('pending','confirmed','rejected')),
     decision_source   TEXT NOT NULL DEFAULT 'discovery'
                       CHECK (decision_source IN ('discovery','llm','manual')),
@@ -704,6 +710,7 @@ CREATE TABLE IF NOT EXISTS task_code_services (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (task_id, codebase_id, relative_path)
 );
+ALTER TABLE task_code_services ADD COLUMN IF NOT EXISTS languages TEXT[] NOT NULL DEFAULT ARRAY['java']::text[];
 CREATE INDEX IF NOT EXISTS idx_task_code_services_pending
     ON task_code_services(task_id, updated_at DESC) WHERE decision='pending';
 CREATE INDEX IF NOT EXISTS idx_task_code_services_asset ON task_code_services(asset_id)
@@ -768,7 +775,7 @@ CREATE TABLE IF NOT EXISTS task_code_audit_runs (
     chunks_total          INTEGER NOT NULL DEFAULT 0,
     chunks_completed      INTEGER NOT NULL DEFAULT 0,
     next_file_index       INTEGER NOT NULL DEFAULT 0,
-    budget_tokens         INTEGER NOT NULL DEFAULT 120000,
+    budget_tokens         INTEGER NOT NULL DEFAULT 0,
     used_tokens           INTEGER NOT NULL DEFAULT 0,
     candidate_count       INTEGER NOT NULL DEFAULT 0,
     summary               TEXT NOT NULL DEFAULT '',
@@ -778,6 +785,8 @@ CREATE TABLE IF NOT EXISTS task_code_audit_runs (
     completed_at          TIMESTAMPTZ,
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE task_code_audit_runs ALTER COLUMN budget_tokens SET DEFAULT 0;
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS coverage JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_task
     ON task_code_audit_runs(task_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_queue
@@ -791,6 +800,7 @@ CREATE TABLE IF NOT EXISTS task_code_audit_candidates (
     candidate_key     TEXT NOT NULL,
     review_status     TEXT NOT NULL DEFAULT 'pending_review',
     candidate         JSONB NOT NULL,
+    candidate_variants JSONB NOT NULL DEFAULT '[]'::jsonb,
     reviewer_summary  TEXT NOT NULL DEFAULT '',
     verification_summary TEXT NOT NULL DEFAULT '',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -798,9 +808,23 @@ CREATE TABLE IF NOT EXISTS task_code_audit_candidates (
     UNIQUE (run_id, candidate_key)
 );
 ALTER TABLE task_code_audit_candidates ADD COLUMN IF NOT EXISTS verification_summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_code_audit_candidates ADD COLUMN IF NOT EXISTS candidate_variants JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_code_audit_candidates DROP CONSTRAINT IF EXISTS task_code_audit_candidates_review_status_check;
+-- One-time migration of legacy candidates: it only runs while the column still has
+-- the legacy 'pending_review' default, so later startups never rewrite rows.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema=current_schema() AND table_name='task_code_audit_candidates'
+                 AND column_name='review_status' AND column_default LIKE '%pending_review%') THEN
+        UPDATE task_code_audit_candidates SET review_status='incomplete',
+            reviewer_summary='旧版候选未完成结构化证据登记；请重新运行白盒审计。'
+        WHERE review_status='pending_review';
+    END IF;
+END $$;
+ALTER TABLE task_code_audit_candidates ALTER COLUMN review_status SET DEFAULT 'incomplete';
 ALTER TABLE task_code_audit_candidates ADD CONSTRAINT task_code_audit_candidates_review_status_check
-    CHECK (review_status IN ('pending_review','rejected','published','dismissed'));
+    CHECK (review_status IN ('pending_review','incomplete','rejected','published','dismissed'));
 CREATE INDEX IF NOT EXISTS idx_task_code_audit_candidates_run
     ON task_code_audit_candidates(run_id, created_at, id);
 
@@ -2151,6 +2175,15 @@ BEGIN
         );
     END IF;
 END $$;
+-- draft：两阶段创建草稿锁（设计文档 §3.2 / §10 第 2 步）。
+-- true=仅创建任务身份与草稿配置（可先上传代码库/补全环境/运行材料检查），
+-- 显式启动并校验材料与确认门禁通过前严禁进入执行队列/Planner/Worker。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS draft BOOLEAN NOT NULL DEFAULT false;
+-- assessment_config：白盒驱动评估结构化配置 JSONB（execution_mode、业务概况/重点、
+-- 环境地址/接入方式、测试身份、范围说明、操作约束、外发源码确认等）。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assessment_config JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- material_check：最近一次材料检查报告 JSONB 快照；上传新代码或修改草稿配置后失效重置。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS material_check JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- 评估轮次：绑定本轮代码版本、环境版本、范围与标准版本，以及完成记录。
 -- 完成后出现新代码/部署版本应开新轮次，历史轮次保持原范围和结果不被覆盖。

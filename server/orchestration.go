@@ -68,6 +68,11 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolListTasks(),
 		s.toolListLLMProfiles(),
 		s.toolSpawnTask(),
+		s.toolGetTaskDraft(),
+		s.toolUpdateTaskDraft(),
+		s.toolAttachTaskCodebase(),
+		s.toolCheckTaskMaterials(),
+		s.toolStartTask(),
 		s.toolPauseTask(),
 		s.toolGetTaskGraph(),
 		s.toolListTaskFindings(),
@@ -191,7 +196,21 @@ func (s *Server) toolListTasks() actool.CoreTool {
 				status := s.deriveTaskStatus(t)
 				lifecycle := t.lifecycleSnapshot()
 				dur := taskRunSeconds(lifecycle.ActiveRunSeconds, lifecycle.RunSegmentStartedAt, time.Now().Unix(), status, lifecycle.Paused, lifecycle.Queued)
-				row := map[string]any{"id": t.ID, "description": t.Description, "goal": t.Goal, "status": status, "run_seconds": dur}
+				row := map[string]any{
+					"id":          t.ID,
+					"description": lifecycle.Description,
+					"goal":        lifecycle.Goal,
+					"status":      status,
+					"run_seconds": dur,
+				}
+				if lifecycle.Name != "" {
+					row["name"] = lifecycle.Name
+				}
+				if lifecycle.AssessmentMode {
+					row["assessment_mode"] = true
+					row["assessment_phase"] = lifecycle.AssessmentPhase
+					row["draft"] = lifecycle.Draft
+				}
 				if t.ParentRef != "" {
 					row["parent_ref"] = t.ParentRef
 				}
@@ -230,149 +249,483 @@ func (s *Server) toolListLLMProfiles() actool.CoreTool {
 		})
 }
 
+func (s *Server) resolveToolProjectID(ctx context.Context, parentRef string, explicitProjectID int64) (int64, error) {
+	if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
+		if pt, ok := s.m.Task(strconv.FormatInt(ri.TaskID, 10)); ok {
+			if explicitProjectID > 0 && explicitProjectID != pt.ProjectID {
+				return 0, fmt.Errorf("不能跨项目操作任务")
+			}
+			return pt.ProjectID, nil
+		}
+	}
+	if ri := agent.RunInfoFrom(ctx); ri.SessionID != "" {
+		if convID, err := strconv.ParseInt(ri.SessionID, 10, 64); err == nil && convID > 0 {
+			if pid := s.projectOfConversation(convID); pid > 0 {
+				if explicitProjectID > 0 && explicitProjectID != pid {
+					return 0, fmt.Errorf("不能跨项目操作任务")
+				}
+				return pid, nil
+			}
+		}
+	}
+	if parentRef != "" {
+		if pt, ok := s.m.Task(parentRef); ok {
+			if explicitProjectID > 0 && explicitProjectID != pt.ProjectID {
+				return 0, fmt.Errorf("不能跨项目操作任务")
+			}
+			return pt.ProjectID, nil
+		}
+	}
+	if explicitProjectID > 0 {
+		if p, err := s.m.pg.Projects().Get(explicitProjectID); err == nil && p != nil {
+			return p.ID, nil
+		}
+		return 0, fmt.Errorf("project #%d 不存在", explicitProjectID)
+	}
+	return 0, fmt.Errorf("无法确定所属项目：请在任务/项目会话上下文中调用或显式传入 project_id")
+}
+
+func (s *Server) requireToolTask(ctx context.Context, taskID string) (*Task, error) {
+	taskID = strings.TrimSpace(taskID)
+	t, ok := s.m.Task(taskID)
+	if !ok {
+		return nil, fmt.Errorf("task #%s 不存在", taskID)
+	}
+	if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
+		if pt, ok := s.m.Task(strconv.FormatInt(ri.TaskID, 10)); ok && pt.ProjectID != t.ProjectID {
+			return nil, fmt.Errorf("无权跨项目访问任务 #%s", taskID)
+		}
+	} else if ri.SessionID != "" {
+		if convID, err := strconv.ParseInt(ri.SessionID, 10, 64); err == nil && convID > 0 {
+			if pid := s.projectOfConversation(convID); pid > 0 && pid != t.ProjectID {
+				return nil, fmt.Errorf("无权跨项目访问任务 #%s", taskID)
+			}
+		}
+	}
+	return t, nil
+}
+
+// toolSpawnTask creates either a legacy exploration task or (when assessment_mode=true)
+// a persisted whitebox-driven assessment draft via the exact same unified creation flow
+// as POST /api/tasks.
 func (s *Server) toolSpawnTask() actool.CoreTool {
 	return wrTool("spawn_task",
-		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。",
+		"新建任务：传统模式(assessment_mode=false, 默认)直接启动目标驱动探索；白盒驱动评估模式(assessment_mode=true)创建持久化草稿(draft=true, goal 可留空)，随后用 attach_task_codebase / update_task_draft / check_task_materials / start_task 完成两阶段检查与显式启动。",
 		objSchema(map[string]any{
-			"description":            strParam("任务描述(简短标题)"),
-			"goal":                   strParam("任务目标(要达成什么)"),
+			"name":                   strParam("可选：任务名称"),
+			"description":            strParam("任务描述或业务概况(简短说明)"),
+			"goal":                   strParam("传统模式必填目标；当 assessment_mode=true 时可留空"),
+			"assessment_mode":        map[string]any{"type": "boolean", "description": "是否启用白盒驱动评估两阶段草稿模式；默认 false。启用后只建草稿，需挂载材料检查并通过 start_task 显式启动"},
+			"project_id":             map[string]any{"type": "integer", "description": "可选：所属项目 id（若在任务/项目会话中会自动继承）"},
 			"parent_ref":             strParam("可选：父任务 id(做父子关联)"),
-			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("可选：只读继承的来源任务 id 列表(最多 %d 个)。子任务可只读引用这些任务已探明的资产/结论作为起点；与 parent_ref 的纯父子指针不同，这是内容继承。", db.MaxTaskSourceCount)},
-			"llm_profile_id":         map[string]any{"type": "integer", "description": "可选：指定本子任务 planner/worker 用的 LLM 配置 id(见 list_llm_profiles)；留空则继承父任务、再回退全局激活配置"},
-			"no_result_seconds":      map[string]any{"type": "integer", "description": "可选：累计实际运行这些秒后仅检查一次，不足达标漏洞数时停止。0=关闭，正数最低60秒；暂停和排队不计时"},
-			"no_result_min_findings": map[string]any{"type": "integer", "description": "无成果止损最少独立漏洞数，默认1；误报不计"},
-			"no_result_min_severity": map[string]any{"type": "string", "enum": []string{"", "low", "medium", "high", "critical"}, "description": "计数的最低漏洞等级（含以上），空=不限"},
-			"timeout_seconds":        map[string]any{"type": "integer", "description": "可选：任务级超时(秒)。到点后触发优雅收尾并进入 timeout 终态；留空或 0 = 不限时"},
-			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "可选：planner 心跳触发间隔(秒)。距上轮规划结束/任务开始满该值且期间无触发 → 触发一轮规划(兜底死锁 + 唤醒去监督飞行中的 worker)。留空或 0 = 默认 600(10min)；"},
-			"seed_first_intent":      map[string]any{"type": "boolean", "description": "可选：对于简单任务可开启，创建时直接下发一条种子意图(内容=描述+目标)让 worker 免等首轮 planner 直接开跑测试；默认 false(走标准先规划再执行)。"},
-		}, "description", "goal"),
+			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("可选：只读继承的来源任务 id 列表(最多 %d 个)", db.MaxTaskSourceCount)},
+			"company_ids":            map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：关联企业 id 列表"},
+			"llm_profile_id":         map[string]any{"type": "integer", "description": "可选：指定本任务用的 LLM 配置 id(见 list_llm_profiles)"},
+			"no_result_seconds":      map[string]any{"type": "integer", "description": "可选：累计运行无成果止损阈值(秒)；0=关闭，正数>=60"},
+			"no_result_min_findings": map[string]any{"type": "integer", "description": "无成果止损最少独立漏洞数，默认1"},
+			"no_result_min_severity": map[string]any{"type": "string", "enum": []string{"", "low", "medium", "high", "critical"}, "description": "计数的最低漏洞等级"},
+			"timeout_seconds":        map[string]any{"type": "integer", "description": "可选：任务级超时(秒)；0=不限时"},
+			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "可选：心跳触发间隔(秒)"},
+			"seed_first_intent":      map[string]any{"type": "boolean", "description": "仅传统模式：直接下发首条种子意图"},
+			"execution_mode":         map[string]any{"type": "string", "enum": []string{"dynamic", "offline"}, "description": "白盒评估执行模式：dynamic(默认联调)/offline(显式离线审计)"},
+			"business_overview":      strParam("白盒评估业务说明"),
+			"business_focus":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "白盒评估重点业务/模块关注列表"},
+			"environments":           map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "目标环境列表，例如 [{\"name\":\"staging\",\"url\":\"http://127.0.0.1:8080\"}]"},
+			"env_access":             map[string]any{"type": "object", "description": "环境接入方式，如 {\"mode\":\"direct\",\"notes\":\"...\"}"},
+			"identities":             map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "测试身份参考列表（严禁放明文密码/私钥/token，请只填 role/username/credential_ref/auth_type）"},
+			"scope_notes":            strParam("额外测试范围说明"),
+			"operation_constraints":  map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "操作约束列表，如 [{\"kind\":\"deny\",\"text\":\"禁止压测\"}]"},
+			"source_acknowledged":    map[string]any{"type": "boolean", "description": "是否已确认源码可外发给 LLM（真正启动时必选）"},
+			"assessment_config":      map[string]any{"type": "object", "description": "可选：完整结构化 AssessmentConfig 对象"},
+		}, "description"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				Description          string          `json:"description"`
-				Goal                 string          `json:"goal"`
-				ParentRef            string          `json:"parent_ref"`
-				SourceTaskIDs        []string        `json:"source_task_ids"`
-				LLMProfileID         json.RawMessage `json:"llm_profile_id"`
-				NoResultSeconds      int             `json:"no_result_seconds"`
-				NoResultMinFindings  int             `json:"no_result_min_findings"`
-				NoResultMinSeverity  string          `json:"no_result_min_severity"`
-				TimeoutSeconds       int             `json:"timeout_seconds"`
-				PlanHeartbeatSeconds int             `json:"plan_heartbeat_seconds"`
-				SeedFirstIntent      bool            `json:"seed_first_intent"`
+				Name                 string                          `json:"name"`
+				Description          string                          `json:"description"`
+				Goal                 string                          `json:"goal"`
+				AssessmentMode       bool                            `json:"assessment_mode"`
+				ProjectID            int64                           `json:"project_id"`
+				ParentRef            string                          `json:"parent_ref"`
+				SourceTaskIDs        []string                        `json:"source_task_ids"`
+				CompanyIDs           []int64                         `json:"company_ids"`
+				LLMProfileID         json.RawMessage                 `json:"llm_profile_id"`
+				NoResultSeconds      int                             `json:"no_result_seconds"`
+				NoResultMinFindings  int                             `json:"no_result_min_findings"`
+				NoResultMinSeverity  string                          `json:"no_result_min_severity"`
+				TimeoutSeconds       int                             `json:"timeout_seconds"`
+				PlanHeartbeatSeconds int                             `json:"plan_heartbeat_seconds"`
+				SeedFirstIntent      bool                            `json:"seed_first_intent"`
+				ExecutionMode        string                          `json:"execution_mode"`
+				BusinessOverview     string                          `json:"business_overview"`
+				BusinessFocus        []string                        `json:"business_focus"`
+				Environments         []db.AssessmentEnvironmentInput `json:"environments"`
+				EnvAccess            *db.AssessmentEnvAccessInput    `json:"env_access"`
+				Identities           []db.AssessmentIdentityInput    `json:"identities"`
+				ScopeNotes           string                          `json:"scope_notes"`
+				OperationConstraints []db.AssessmentConstraintInput  `json:"operation_constraints"`
+				SourceAcknowledged   bool                            `json:"source_acknowledged"`
+				AssessmentConfig     *db.AssessmentConfig            `json:"assessment_config"`
 			}
-			_ = json.Unmarshal(in, &a)
-			if strings.TrimSpace(a.Description) == "" {
-				a.Description = "未命名任务"
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数解析失败: " + err.Error()), nil
 			}
-			if strings.TrimSpace(a.Goal) == "" {
-				return actool.Errorf("goal 为必填"), nil
+			if !a.AssessmentMode && strings.TrimSpace(a.Goal) == "" {
+				return actool.Errorf("goal 为必填（若需无 goal 的白盒驱动评估，请传入 assessment_mode=true）"), nil
 			}
-			if a.TimeoutSeconds < 0 {
-				a.TimeoutSeconds = 0
-			}
-			// 只读继承来源任务：数量上限 + 每个 id 有效/去重/存在，校验规则与 HTTP 建任务一致。
-			if len(a.SourceTaskIDs) > db.MaxTaskSourceCount {
-				return actool.Errorf(fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount)), nil
-			}
-			sourceIDs := make([]int64, 0, len(a.SourceTaskIDs))
-			seenSources := map[int64]bool{}
-			for _, raw := range a.SourceTaskIDs {
-				id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-				if err != nil || id <= 0 || seenSources[id] {
-					return actool.Errorf("关联任务 id 无效或重复"), nil
-				}
-				if _, ok := s.m.Task(strconv.FormatInt(id, 10)); !ok {
-					return actool.Errorf(fmt.Sprintf("关联任务 #%d 不存在", id)), nil
-				}
-				seenSources[id] = true
-				sourceIDs = append(sourceIDs, id)
-			}
-			// LLM profile resolution: explicit id > inherit parent's pin > active(nil).
-			var pin *int64
-			if id := parseProfileID(a.LLMProfileID); id > 0 {
-				if _, ok := s.loadProfileConfig(id); !ok {
-					return actool.Errorf(fmt.Sprintf("LLM 配置 #%d 不存在或未设置 API Key", id)), nil
-				}
-				pin = &id
-			} else if a.ParentRef != "" {
-				if pt, ok := s.m.Task(a.ParentRef); ok {
-					pin = pt.LLMProfileID
-				}
-			}
-			var llmIDs []int64
-			if pin != nil {
-				llmIDs = []int64{*pin}
-			}
-			name := ""
-			autoTitleEnabled := s.m.pg.GetBool(db.SettingTaskAutoTitle, false)
-			if autoTitleEnabled {
-				if err := ctx.Err(); err != nil {
-					return actool.Errorf(err.Error()), nil
-				}
-				active, activeErr := s.m.pg.ActiveProfile()
-				if activeErr != nil {
-					log.Printf("[auto-title] active profile lookup failed: %v", activeErr)
-				} else if active == nil {
-					log.Printf("[auto-title] no active profile")
-				} else if prov, _, providerOK := s.providerForProfile(active.ID); providerOK {
-					titleCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-					defer cancel()
-					generated, titleErr := agent.GenerateAutoTitle(titleCtx, prov, a.Description+"\n"+a.Goal)
-					if err := ctx.Err(); err != nil {
-						return actool.Errorf(err.Error()), nil
-					}
-					if titleErr == nil {
-						name = generated
-					} else {
-						log.Printf("[auto-title] task title generation failed: %v", titleErr)
-					}
-				} else {
-					log.Printf("[auto-title] task provider unavailable for active profile %d", active.ID)
-				}
-			}
-			if autoTitleEnabled {
-				if err := ctx.Err(); err != nil {
-					return actool.Errorf(err.Error()), nil
-				}
-			}
-			// 子任务必须落在父任务所属项目里：项目是最高级分层，spawn 不能跨项目。
-			projectID := int64(0)
-			if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
-				if pt, ok := s.m.Task(strconv.FormatInt(ri.TaskID, 10)); ok {
-					projectID = pt.ProjectID
-				}
-			}
-			if projectID == 0 && a.ParentRef != "" {
-				if pt, ok := s.m.Task(a.ParentRef); ok {
-					projectID = pt.ProjectID
-				}
-			}
-			if projectID == 0 {
-				return actool.Errorf("无法确定所属项目：spawn_task 只能从某个任务内部调用"), nil
-			}
-			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
-				ProjectID:       projectID,
-				Name:            name,
-				SourceTaskIDs:   sourceIDs,
-				LLMProfileIDs:   llmIDs,
-				NoResultSeconds: a.NoResultSeconds, NoResultMinFindings: a.NoResultMinFindings, NoResultMinSeverity: a.NoResultMinSeverity,
-				TimeoutSeconds:       a.TimeoutSeconds,
-				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
-			})
+
+			projectID, err := s.resolveToolProjectID(ctx, a.ParentRef, a.ProjectID)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			if a.ParentRef != "" {
-				t.ParentRef = a.ParentRef
-				if id, e := strconv.ParseInt(t.ID, 10, 64); e == nil {
-					_ = s.m.PG().SetParentRef(id, a.ParentRef)
+
+			var llmIDs []int64
+			if id := parseProfileID(a.LLMProfileID); id > 0 {
+				llmIDs = []int64{id}
+			} else if a.ParentRef != "" {
+				if pt, ok := s.m.Task(a.ParentRef); ok && pt.LLMProfileID != nil {
+					llmIDs = []int64{*pt.LLMProfileID}
 				}
 			}
-			// 共享的建后流程,与 HTTP 建任务(server.go createTask)复用同一段 launchTask:
-			// seed + 后台可见地做目标分解(第0轮/LLM步骤/逐条goal) + engine.Run。
-			// seed_first_intent 默认 false(标准先规划再执行);简单任务可开启直接下发一 work 测试。
-			s.launchTask(t, a.Description+" "+a.Goal, a.SeedFirstIntent)
-			return actool.Text(fmt.Sprintf("task created: %s", t.ID)), nil
+
+			name := strings.TrimSpace(a.Name)
+			if !a.AssessmentMode && name == "" && s.m.pg.GetBool(db.SettingTaskAutoTitle, false) {
+				if active, activeErr := s.m.pg.ActiveProfile(); activeErr == nil && active != nil {
+					if prov, _, providerOK := s.providerForProfile(active.ID); providerOK {
+						titleCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+						defer cancel()
+						if generated, titleErr := agent.GenerateAutoTitle(titleCtx, prov, a.Description+"\n"+a.Goal); titleErr == nil {
+							name = generated
+						}
+					}
+				}
+			}
+
+			var cfg db.AssessmentConfig
+			if a.AssessmentConfig != nil {
+				cfg = *a.AssessmentConfig
+			}
+			if a.ExecutionMode != "" {
+				cfg.ExecutionMode = a.ExecutionMode
+			}
+			if a.BusinessOverview != "" {
+				cfg.BusinessOverview = a.BusinessOverview
+			}
+			if len(a.BusinessFocus) > 0 {
+				cfg.BusinessFocus = a.BusinessFocus
+			}
+			if len(a.Environments) > 0 {
+				cfg.Environments = a.Environments
+			}
+			if a.EnvAccess != nil {
+				cfg.EnvAccess = a.EnvAccess
+			}
+			if len(a.Identities) > 0 {
+				cfg.Identities = a.Identities
+			}
+			if a.ScopeNotes != "" {
+				cfg.ScopeNotes = a.ScopeNotes
+			}
+			if len(a.OperationConstraints) > 0 {
+				cfg.OperationConstraints = a.OperationConstraints
+			}
+			if a.SourceAcknowledged {
+				cfg.SourceAcknowledged = true
+			}
+
+			seedFlag := a.SeedFirstIntent
+			req := createTaskReq{
+				Name:                 name,
+				Description:          a.Description,
+				Goal:                 a.Goal,
+				LLMProfileIDs:        llmIDs,
+				SourceTaskIDs:        a.SourceTaskIDs,
+				CompanyIDs:           a.CompanyIDs,
+				NoResultSeconds:      a.NoResultSeconds,
+				NoResultMinFindings:  a.NoResultMinFindings,
+				NoResultMinSeverity:  a.NoResultMinSeverity,
+				TimeoutSeconds:       a.TimeoutSeconds,
+				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				SeedFirstIntent:      &seedFlag,
+				AssessmentMode:       a.AssessmentMode,
+				AssessmentConfig:     cfg,
+			}
+			t, _, err := s.createTaskUnified(projectID, req, a.ParentRef)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !t.IsDraft() {
+				return actool.Text(fmt.Sprintf("task created: %s", t.ID)), nil
+			}
+			return jsonResult(map[string]any{
+				"task_id":          t.ID,
+				"draft":            true,
+				"assessment_mode":  true,
+				"assessment_phase": t.lifecycleSnapshot().AssessmentPhase,
+				"task":             taskDTO(t, s.resolvedTaskStatus(t)),
+				"next_steps": []string{
+					"使用 attach_task_codebase 挂载源码/目录/包（可多次挂载不同服务或仓库）",
+					"需要修改配置时使用 update_task_draft",
+					"使用 check_task_materials 运行材料检查并确认 ready=true",
+					"传入 source_acknowledged=true 调用 start_task 显式启动任务",
+				},
+			})
+		})
+}
+
+func (s *Server) toolGetTaskDraft() actool.CoreTool {
+	return roTool("get_task_draft",
+		"读取草稿或评估任务的结构化配置、已挂载代码库列表与最新材料检查报告，用于恢复草稿配置或核对启动前提。",
+		objSchema(map[string]any{
+			"task_id": strParam("任务 id"),
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID string `json:"task_id"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			latest, broken, listErr := s.loadTaskLatestCodebases(t.ID)
+			if listErr != nil {
+				return actool.Errorf(listErr.Error()), nil
+			}
+			codebases := make([]taskCodebaseVersion, 0, len(latest))
+			for _, item := range latest {
+				codebases = append(codebases, item.version)
+			}
+			return jsonResult(map[string]any{
+				"task":             taskDTO(t, s.resolvedTaskStatus(t)),
+				"codebases":        codebases,
+				"broken_manifests": broken,
+			})
+		})
+}
+
+func (s *Server) toolUpdateTaskDraft() actool.CoreTool {
+	return wrTool("update_task_draft",
+		"修改尚未启动的评估草稿任务（业务说明/重点、execution_mode、目标环境、测试身份、范围说明、操作约束、外发确认等），会自动清空旧的材料检查缓存。",
+		objSchema(map[string]any{
+			"task_id":               strParam("草稿任务 id"),
+			"name":                  strParam("可选：任务名称"),
+			"description":           strParam("可选：任务描述"),
+			"remark":                strParam("可选：备注"),
+			"execution_mode":        map[string]any{"type": "string", "enum": []string{"dynamic", "offline"}, "description": "执行模式：dynamic / offline"},
+			"business_overview":     strParam("业务说明"),
+			"business_focus":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "业务重点模块列表"},
+			"environments":          map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "环境列表"},
+			"env_access":            map[string]any{"type": "object", "description": "环境接入信息"},
+			"identities":            map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "测试身份参考列表（严禁明文密码/私钥/token）"},
+			"scope_notes":           strParam("测试范围说明"),
+			"operation_constraints": map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "操作约束列表"},
+			"source_acknowledged":   map[string]any{"type": "boolean", "description": "外发源码确认开关"},
+			"llm_profile_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：任务级 LLM 配置链"},
+			"company_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：关联企业列表"},
+			"source_task_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：来源任务列表"},
+			"worker_count":          map[string]any{"type": "integer", "description": "可选：并发 Worker 数"},
+			"timeout_seconds":       map[string]any{"type": "integer", "description": "可选：任务超时秒数"},
+			"assessment_config":     map[string]any{"type": "object", "description": "可选：整体覆盖 AssessmentConfig"},
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID               string                          `json:"task_id"`
+				Name                 *string                         `json:"name"`
+				Description          *string                         `json:"description"`
+				Remark               *string                         `json:"remark"`
+				ExecutionMode        *string                         `json:"execution_mode"`
+				BusinessOverview     *string                         `json:"business_overview"`
+				BusinessFocus        []string                        `json:"business_focus"`
+				Environments         []db.AssessmentEnvironmentInput `json:"environments"`
+				EnvAccess            *db.AssessmentEnvAccessInput    `json:"env_access"`
+				Identities           []db.AssessmentIdentityInput    `json:"identities"`
+				ScopeNotes           *string                         `json:"scope_notes"`
+				OperationConstraints []db.AssessmentConstraintInput  `json:"operation_constraints"`
+				SourceAcknowledged   *bool                           `json:"source_acknowledged"`
+				LLMProfileIDs        *[]int64                        `json:"llm_profile_ids"`
+				CompanyIDs           *[]int64                        `json:"company_ids"`
+				SourceTaskIDs        *[]string                       `json:"source_task_ids"`
+				WorkerCount          *int                            `json:"worker_count"`
+				TimeoutSeconds       *int                            `json:"timeout_seconds"`
+				AssessmentConfig     *db.AssessmentConfig            `json:"assessment_config"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数解析失败: " + err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			var rawKeys map[string]json.RawMessage
+			_ = json.Unmarshal(in, &rawKeys)
+
+			cfg := t.lifecycleSnapshot().AssessmentConfig
+			cfgTouched := false
+			if a.AssessmentConfig != nil {
+				cfg = *a.AssessmentConfig
+				cfgTouched = true
+			}
+			if a.ExecutionMode != nil {
+				cfg.ExecutionMode = *a.ExecutionMode
+				cfgTouched = true
+			}
+			if a.BusinessOverview != nil {
+				cfg.BusinessOverview = *a.BusinessOverview
+				cfgTouched = true
+			}
+			if _, ok := rawKeys["business_focus"]; ok {
+				cfg.BusinessFocus = a.BusinessFocus
+				cfgTouched = true
+			}
+			if _, ok := rawKeys["environments"]; ok {
+				cfg.Environments = a.Environments
+				cfgTouched = true
+			}
+			if _, ok := rawKeys["env_access"]; ok {
+				cfg.EnvAccess = a.EnvAccess
+				cfgTouched = true
+			}
+			if _, ok := rawKeys["identities"]; ok {
+				cfg.Identities = a.Identities
+				cfgTouched = true
+			}
+			if a.ScopeNotes != nil {
+				cfg.ScopeNotes = *a.ScopeNotes
+				cfgTouched = true
+			}
+			if _, ok := rawKeys["operation_constraints"]; ok {
+				cfg.OperationConstraints = a.OperationConstraints
+				cfgTouched = true
+			}
+			if a.SourceAcknowledged != nil {
+				cfg.SourceAcknowledged = *a.SourceAcknowledged
+				cfgTouched = true
+			}
+
+			req := updateTaskDraftReq{
+				Name:           a.Name,
+				Remark:         a.Remark,
+				Description:    a.Description,
+				LLMProfileIDs:  a.LLMProfileIDs,
+				CompanyIDs:     a.CompanyIDs,
+				SourceTaskIDs:  a.SourceTaskIDs,
+				WorkerCount:    a.WorkerCount,
+				TimeoutSeconds: a.TimeoutSeconds,
+			}
+			if cfgTouched {
+				req.AssessmentConfig = &cfg
+			}
+			updated, _, err := s.updateTaskDraftUnified(t.ID, req)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(map[string]any{
+				"task": taskDTO(updated, s.resolvedTaskStatus(updated)),
+			})
+		})
+}
+
+func (s *Server) toolAttachTaskCodebase() actool.CoreTool {
+	return wrTool("attach_task_codebase",
+		"给评估任务挂载本地源码目录、源码压缩包(ZIP/TAR/TGZ)或软件包(JAR/WAR/CLASS)，与网页上传代码库走完全一致的落盘快照、发现与材料校验流程。",
+		objSchema(map[string]any{
+			"task_id":     strParam("目标任务 id"),
+			"path":        strParam("本地文件或目录路径"),
+			"kind":        map[string]any{"type": "string", "enum": []string{"", "directory", "source_archive", "artifact"}, "description": "可选：类型提示；留空自动按路径判断"},
+			"codebase_id": strParam("可选：32位十六进制 codebase_id，传入则作为该代码库的新版本"),
+		}, "task_id", "path"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID     string `json:"task_id"`
+				Path       string `json:"path"`
+				Kind       string `json:"kind"`
+				CodebaseID string `json:"codebase_id"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !t.AssessmentMode {
+				return actool.Errorf(db.ErrTaskNotAssessmentMode.Error()), nil
+			}
+			ver, discoveryStatus, err := s.saveTaskCodebaseVersionFromPath(t.ID, a.Path, a.Kind, a.CodebaseID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(map[string]any{
+				"version":          ver,
+				"discovery_status": discoveryStatus,
+			})
+		})
+}
+
+func (s *Server) toolCheckTaskMaterials() actool.CoreTool {
+	return wrTool("check_task_materials",
+		"对白盒评估草稿任务执行启动前材料检查（代码可解包/文本真实性/JavaCodeDB/运行环境或离线模式/LLM 状态/缺口提示），返回结构化 MaterialCheckReport。",
+		objSchema(map[string]any{
+			"task_id": strParam("草稿任务 id"),
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID string `json:"task_id"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			updated, report, _, err := s.runTaskMaterialCheck(t.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(map[string]any{
+				"ready":  report.Ready,
+				"report": report,
+				"task":   taskDTO(updated, s.resolvedTaskStatus(updated)),
+			})
+		})
+}
+
+func (s *Server) toolStartTask() actool.CoreTool {
+	return wrTool("start_task",
+		"显式启动白盒评估草稿任务：重新核验材料检查全部通过且 source_acknowledged=true 后解除 draft 锁，开启第 1 轮评估并进入 profiling 阶段，不会启动旧的发散目标分解。",
+		objSchema(map[string]any{
+			"task_id":             strParam("草稿任务 id"),
+			"source_acknowledged": map[string]any{"type": "boolean", "description": "是否确认允许将源码发送至所选 LLM（必须为 true，或已在草稿配置中确认）"},
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID             string `json:"task_id"`
+				SourceAcknowledged bool   `json:"source_acknowledged"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			started, round, report, _, err := s.startAssessmentTaskUnified(t.ID, a.SourceAcknowledged)
+			if err != nil {
+				return jsonResult(map[string]any{
+					"started": false,
+					"error":   err.Error(),
+					"report":  report,
+				})
+			}
+			return jsonResult(map[string]any{
+				"started": true,
+				"task":    taskDTO(started, s.resolvedTaskStatus(started)),
+				"round":   round,
+				"report":  report,
+			})
 		})
 }
 
@@ -569,6 +922,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.migrateReporterWorkflow()       // 修复旧库残留的 reproduction 工具/提示词绑定
+	s.migrateReporterWhiteboxPrompt() // 为既有 reporter 提示词追加静态白盒报告规则
 	if s.m.pg.GetBool(settingBrowserScreenshot, false) {
 		// Re-apply the opt-in after startup seeding so an existing database gets
 		// both reporter visibility and the repaired Playwright launch arguments.
@@ -582,6 +936,29 @@ func (s *Server) seedOrchestrationTools() {
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
+}
+
+// migrateReporterWhiteboxPrompt adds the static-audit-specific reporting rules
+// to an existing reporter prompt without replacing administrator-authored text.
+func (s *Server) migrateReporterWhiteboxPrompt() {
+	reporter, err := s.m.pg.GetAgentByKey("reporter")
+	if err != nil || reporter == nil {
+		return
+	}
+	current, err := s.m.pg.CurrentPrompt(reporter.ID)
+	if err != nil {
+		log.Printf("[reporter] 读取提示词失败，未追加白盒审计规则: %v", err)
+		return
+	}
+	if strings.Contains(current, "【Java 白盒静态审计报告规则】") {
+		return
+	}
+	updated := strings.TrimSpace(current) + agent.ReporterWhiteboxAuditPolicy
+	if _, err := s.m.pg.ResetPromptToDefault(reporter.ID, updated); err != nil {
+		log.Printf("[reporter] 追加白盒静态审计规则失败: %v", err)
+		return
+	}
+	log.Printf("[reporter] 已为既有提示词追加 Java 白盒静态审计报告规则")
 }
 
 // migrateReporterWorkflow repairs databases created by the short-lived
@@ -645,7 +1022,7 @@ func (s *Server) migrateReporterWorkflow() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v8_finding_case_tools"
+	const flag = "tool_schema_refresh_v9_assessment_step2"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -1032,7 +1409,7 @@ func (s *Server) seedWorkerReadbackRebind() {
 // before Auto existed still give Auto its default toolset — without re-adding it
 // after a user deliberately unbinds.
 func (s *Server) seedAutoDefaultBindings() {
-	const flag = "auto_default_bindings_v3" // v3: 替换旧资产工具名，加入 insert_assets/add_company_scope
+	const flag = "auto_default_bindings_v4_assessment_step2" // v4: 加入草稿/材料检查/启动白盒评估工具
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

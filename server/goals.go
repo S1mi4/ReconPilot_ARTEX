@@ -27,12 +27,19 @@ type goalSpec struct {
 //
 // 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
 func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
+	if t == nil || t.IsDraft() {
+		return
+	}
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
-	s.seed(t, seedText)
-	if seedFirstIntent {
-		s.seedFirstIntent(t)
+	if !t.AssessmentMode {
+		s.seed(t, seedText)
+		if seedFirstIntent {
+			s.seedFirstIntent(t)
+		}
+	} else {
+		s.seedAssessmentEnvironmentAssets(t)
 	}
 	s.engine.decInflight(t.ID)
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
@@ -41,8 +48,17 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 }
 
 func (s *Server) startTaskEngine(t *Task) {
+	if t == nil || t.IsDraft() {
+		return
+	}
 	ctx := s.engine.execContextFor(s.ctx, t.ID)
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+		return
+	}
+	if t.AssessmentMode {
+		s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: "白盒驱动评估已启动，进入画像构建阶段（profiling），不运行传统目标拆解"})
+		s.engine.Run(s.ctx, t)
 		return
 	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
@@ -71,7 +87,7 @@ func (s *Server) occupiesConcurrencySlot(t *Task) bool {
 		return false
 	}
 	lifecycle := t.lifecycleSnapshot()
-	if lifecycle.Queued || lifecycle.Paused || isTerminalStatus(lifecycle.Status) {
+	if lifecycle.Draft || lifecycle.Queued || lifecycle.Paused || isTerminalStatus(lifecycle.Status) {
 		return false
 	}
 	// Deletion temporarily pauses the Engine but has not committed yet. Preserve
@@ -159,6 +175,9 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 	}
 	defer s.engine.decInflight(t.ID)
 	lifecycle := t.lifecycleSnapshot()
+	if lifecycle.Draft {
+		return false, db.ErrTaskNotDraft
+	}
 	if scheduled {
 		var managed bool
 		if err := s.m.pg.QueryRow(`SELECT schedule_paused FROM tasks WHERE id=$1`, t.ID).Scan(&managed); err != nil {
@@ -323,7 +342,7 @@ func (s *Server) reconcileConcurrency() {
 	if enabled {
 		for _, task := range s.m.List() {
 			lifecycle := task.lifecycleSnapshot()
-			if lifecycle.Queued || lifecycle.Paused || s.engine.IsPaused(task.ID) || s.engine.IsDeleting(task.ID) ||
+			if lifecycle.Draft || lifecycle.Queued || lifecycle.Paused || s.engine.IsPaused(task.ID) || s.engine.IsDeleting(task.ID) ||
 				isTerminalStatus(lifecycle.Status) || s.engine.ReadyFor(task) || s.engine.ActiveLLMCalls(task.ID) > 0 {
 				continue
 			}
@@ -347,7 +366,7 @@ func (s *Server) reconcileConcurrency() {
 	queued := []queuedTask{}
 	for _, task := range s.m.List() {
 		lifecycle := task.lifecycleSnapshot()
-		if lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		if !lifecycle.Draft && lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			queued = append(queued, queuedTask{task: task, lifecycle: lifecycle})
 		}
 	}

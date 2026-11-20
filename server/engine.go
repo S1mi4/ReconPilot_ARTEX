@@ -96,12 +96,14 @@ type Engine struct {
 
 	bc *Broadcaster // live activity pub/sub (SSE)
 
-	started  sync.Map // taskID -> bool, so Run is idempotent per task
-	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
-	llmCalls sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
-	paused   sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
-	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
-	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
+	started   sync.Map                 // taskID -> bool, so Run is idempotent per task
+	lastAct   sync.Map                 // taskID -> int64 unix, last planner/worker activity (heartbeat)
+	llmCalls  sync.Map                 // taskID -> *int64, actual planner/worker/main-agent LLM calls
+	paused    sync.Map                 // taskID -> bool, user-paused (planner + workers idle but loops alive)
+	auditMu   sync.Mutex               // guards auditRuns
+	auditRuns map[int64]auditRunHandle // running white-box audit runs, interrupted on pause/delete
+	deleting  sync.Map                 // taskID -> bool, delete barrier (no new task-owned writes)
+	dropCnt   sync.Map                 // taskID -> *int64, running count of dropped (unpersistable) activity records
 
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
@@ -189,6 +191,7 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 func (e *Engine) Pause(taskID string, cause error) {
 	e.paused.Store(taskID, true)
 	e.cancelExec(taskID, cause)
+	e.cancelAuditRuns(taskID, cause)
 }
 
 // BeginDelete installs an execution barrier before task data/files are removed.
@@ -204,6 +207,7 @@ func (e *Engine) BeginDelete(taskID string) bool {
 	e.paused.Store(taskID, true)
 	e.deleteMu.Unlock()
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.cancelAuditRuns(taskID, agent.AbortTaskDeleted)
 	return true
 }
 
@@ -261,6 +265,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Unlock()
 
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.cancelAuditRuns(taskID, agent.AbortTaskDeleted)
 	e.runtimeMu.Lock()
 	rt := e.runtimes[taskID]
 	if rt != nil {
@@ -796,6 +801,9 @@ func (e *Engine) ReadyFor(t *Task) bool {
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
+	if t == nil || t.IsDraft() {
+		return
+	}
 	slots, err := workerSlotsForTask(t, e.m.WorkerPools(), e.m.Workers())
 	if err != nil {
 		log.Printf("[engine] task %s worker pool invalid, using legacy workers: %v", t.ID, err)
@@ -945,6 +953,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
 		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
+		if t.AssessmentMode {
+			if t.IsDraft() {
+				return
+			}
+			t.drainTriggers()
+			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+				e.completeAssessmentIfEligible(t, "assessment 收尾")
+			}
+			return // 白盒驱动评估模式永不退化为发散式 goal-driven planner.Plan
+		}
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
@@ -1130,7 +1148,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
+	var toolUses atomic.Int64
 	emit := func(r db.Activity) {
+		if r.Kind == "tool_use" {
+			toolUses.Add(1)
+		}
 		if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 			e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
 		}
@@ -1291,6 +1313,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
 	state := "done"
+	blockedReason := ""
+	blockedSummary := ""
 	switch {
 	case err != nil:
 		state = "blocked"
@@ -1301,12 +1325,24 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
+	if state == "done" && wrote.Total() == 0 && toolUses.Load() == 0 {
+		state = "blocked"
+		blockedReason = db.IntentBlockedNoProgress
+		blockedSummary = "Worker 未调用任何工具，也未写回事实、资产或 Finding；意图已阻塞，等待规划器调整方向。"
+	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+	} else if state == "blocked" && blockedReason != "" {
+		if stateErr := t.Store.SetIntentBlockedReason(intent.ID, blockedReason); stateErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 阻塞原因落库失败: %v", name, t.ID, intent.ID, stateErr)
+		}
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
 		}
+	}
+	if blockedSummary != "" {
+		taskEmit(db.Activity{Kind: "result", IsError: true, Summary: blockedSummary, Detail: blockedSummary})
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)

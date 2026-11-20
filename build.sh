@@ -18,9 +18,15 @@
 #   ARTEX_SKIP_FRONTEND=1             Reuse server/webui/dist (for CI artifact builds).
 #   ARTEX_SKIP_NPM_CI=1               Skip npm ci while rebuilding the frontend.
 #   ARTEX_GOSUMDB=sum.golang.org      Go checksum database.
+#   ARTEX_JDK21_HOME=/path            JDK 21 home used to build JavaCodeDB.
+#   ARTEX_MAVEN_BIN=/path/to/mvn      Maven launcher used to build JavaCodeDB.
+#   ARTEX_SKIP_JAVACODEDB=1           Build without JavaCodeDB (binary/class audits stay disabled).
 set -euo pipefail
 
 cd "$(cd "$(dirname "$0")" && pwd)"
+
+# JDK 21 is auto-detected by scripts/build-java-code-db.sh; set ARTEX_JDK21_HOME to override.
+[ -z "${ARTEX_JDK21_HOME:-}" ] || export ARTEX_JDK21_HOME
 
 info() { printf '\033[36m[*]\033[0m %s\n' "$*"; }
 ok() { printf '\033[32m[+]\033[0m %s\n' "$*"; }
@@ -96,6 +102,18 @@ if [ -z "${ARTEX_BUILD_VERSION:-}" ]; then
   else
     ARTEX_BUILD_VERSION="dev"
   fi
+fi
+
+ARTEX_JAVACODEDB_ARTIFACT=""
+ARTEX_GO_TAGS="embedui"
+if [ "${ARTEX_SKIP_JAVACODEDB:-0}" = "1" ]; then
+  info "跳过 JavaCodeDB 构建（ARTEX_SKIP_JAVACODEDB=1）；二进制审计将不可用"
+else
+  info "构建 JavaCodeDB（JDK 21）"
+  ./scripts/build-java-code-db.sh "$PWD/java-code-db.jar"
+  ARTEX_JAVACODEDB_ARTIFACT="$PWD/java-code-db.jar"
+  [ -s "$ARTEX_JAVACODEDB_ARTIFACT" ] || die "JavaCodeDB JAR 构建失败"
+  ARTEX_GO_TAGS="embedui,javacodedb"
 fi
 # Release tags are commonly passed as v0.3.3; keep the binary version consistent.
 ARTEX_BUILD_VERSION="${ARTEX_BUILD_VERSION#v}"
@@ -173,6 +191,7 @@ package_binary() {
   rm -rf "$package_root" "$archive"
   mkdir -p "$package_root"
   cp "$binary" "$package_root/"
+  [ -z "$ARTEX_JAVACODEDB_ARTIFACT" ] || cp "$ARTEX_JAVACODEDB_ARTIFACT" "$package_root/java-code-db.jar"
   # 守护启动脚本是正式入口：页面上的一键更新要靠它在进程退出后重新拉起，
   # 直接跑 artex 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
   if [ "$goos" = "windows" ]; then
@@ -210,6 +229,7 @@ build_target() {
     output="${ARTEX_OUTPUT_DIR}/artex-${goos}-${goarch}/${binary_name}"
   fi
   mkdir -p "$(dirname "$output")"
+  [ -z "$ARTEX_JAVACODEDB_ARTIFACT" ] || cp "$ARTEX_JAVACODEDB_ARTIFACT" "$(dirname "$output")/java-code-db.jar"
 
   info "编译 ${goos}/${goarch}，版本 ${ARTEX_BUILD_VERSION}"
   GOSUMDB="$ARTEX_GOSUMDB" \
@@ -217,7 +237,7 @@ build_target() {
   GOOS="$goos" \
   GOARCH="$goarch" \
   go build \
-    -tags embedui \
+    -tags "$ARTEX_GO_TAGS" \
     -trimpath \
     -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
     -o "$output" \

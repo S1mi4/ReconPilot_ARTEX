@@ -375,6 +375,9 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	// total is the full match count ignoring limit/offset. Count first so an offset
 	// beyond the last row can return an empty page without an expensive scan.
 	total := 0
+	// present=current hides code_service assets that the newest codebase snapshot
+	// no longer contains (the task 测试资产 "代码服务" tab defaults to this view).
+	currentOnly := q.Get("present") == "current"
 
 	if dsl := q.Get("dsl"); dsl != "" {
 		if err := db.ValidateDSL(dsl); err != nil {
@@ -384,9 +387,16 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		// task_id scopes the DSL search to a task's assets (the task detail
 		// "测试资产" search); 0 means the global asset view.
 		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
-		total, err = as.CountDSL(dsl, typ, taskID)
-		if err == nil && offset < total {
-			assets, err = as.QueryDSL(dsl, typ, taskID, limit, offset)
+		if currentOnly {
+			total, err = as.CountDSLPresent(dsl, typ, taskID)
+			if err == nil && offset < total {
+				assets, err = as.QueryDSLPresent(dsl, typ, taskID, limit, offset)
+			}
+		} else {
+			total, err = as.CountDSL(dsl, typ, taskID)
+			if err == nil && offset < total {
+				assets, err = as.QueryDSL(dsl, typ, taskID, limit, offset)
+			}
 		}
 	} else {
 		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
@@ -398,9 +408,16 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 				assets, err = as.QueryByCompany(companyID, typ, limit, offset)
 			}
 		case taskID > 0:
-			total, err = as.CountByTask(taskID, typ)
-			if err == nil && offset < total {
-				assets, err = as.QueryByTask(taskID, typ, limit, offset)
+			if currentOnly {
+				total, err = as.CountByTaskCurrent(taskID, typ)
+				if err == nil && offset < total {
+					assets, err = as.QueryByTaskCurrent(taskID, typ, limit, offset)
+				}
+			} else {
+				total, err = as.CountByTask(taskID, typ)
+				if err == nil && offset < total {
+					assets, err = as.QueryByTask(taskID, typ, limit, offset)
+				}
 			}
 		default:
 			if typ == "" {
@@ -441,7 +458,11 @@ func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
 	var counts map[string]int
 	var err error
 	if taskID, _ := strconv.ParseInt(r.URL.Query().Get("task_id"), 10, 64); taskID > 0 {
-		counts, err = as.CountsByTypeForTask(taskID)
+		if r.URL.Query().Get("present") == "current" {
+			counts, err = as.CountsByTypeForTaskCurrent(taskID)
+		} else {
+			counts, err = as.CountsByTypeForTask(taskID)
+		}
 	} else {
 		counts, err = as.CountsByType()
 	}

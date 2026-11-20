@@ -35,8 +35,8 @@ type Config struct {
 	// through the chat/completions provider path.
 	Jev     bool
 	BaseURL string
-	APIKey  string
-	Model   string
+	APIKey               string
+	Model                string
 	// Proxy routes all LLM requests through the given proxy URL (http/https/socks5,
 	// optionally with user:pass@ credentials). Empty means direct — it does NOT
 	// fall back to the standard *_PROXY environment variables.

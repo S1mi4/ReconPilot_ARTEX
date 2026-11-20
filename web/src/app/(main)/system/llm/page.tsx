@@ -2,6 +2,7 @@
 import * as React from "react";
 
 import {
+  CircleDashedIcon,
   Loader2Icon,
   PlugZapIcon,
   PlusIcon,
@@ -99,6 +100,16 @@ function healthOf(p: LLMProfile, m: LLMPoolMember | undefined, ui: UITranslate):
     };
   }
   return { label: ui("screen.296de0e31f8c22"), cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" };
+}
+
+function formatLabel(format: LLMProfile["format"]) {
+  if (format === "jev") return "Jev / System One";
+  return format;
+}
+
+function apiKeyPlaceholder(format: LLMProfile["format"], keyHint: string, ui: UITranslate) {
+  if (keyHint) return ui("screen.d717c6180a8bd7", { v0: keyHint });
+  return "sk-…";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -456,7 +467,7 @@ function ProfileSheet({
         reasoning_effort: toStore(effort),
         priority: Number(priority) || 0,
         pool_exclude: poolExclude,
-        streaming,
+        streaming: streaming,
         max_tokens: Math.max(0, Number(maxTokens) || 0),
         // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
         // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
@@ -624,7 +635,7 @@ function ProfileSheet({
             <Input
               id="p-api-key"
               type="password"
-              placeholder={keyHint ? ui("screen.d717c6180a8bd7", { v0: keyHint }) : "sk-…"}
+              placeholder={apiKeyPlaceholder(format, keyHint, ui)}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
             />
@@ -919,7 +930,7 @@ export default function LLMPage() {
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="truncate font-medium text-sm">{p.name}</span>
                           <Badge variant="outline" className="uppercase">
-                            {p.format === "jev" ? "Jev / System One" : p.format}
+                            {formatLabel(p.format)}
                           </Badge>
                           <Badge variant="outline" className={cn("ml-auto", h.cls)} title={h.hint}>
                             {h.label}

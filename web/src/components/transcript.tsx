@@ -26,7 +26,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { localizedError } from "@/i18n/errors";
 import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api } from "@/lib/api";
-import { formatToolDetail, type ToolDetailPart, toolInputText } from "@/lib/execution-display";
+import { executionWorkerLabel, formatToolDetail, type ToolDetailPart, toolInputText } from "@/lib/execution-display";
 import type { Activity, InterceptPending } from "@/lib/types";
 
 // ---- per-agent lane color (planner + work#1/#2/#3 …) ---------------------------
@@ -374,10 +374,14 @@ function ToolBlock({
     : ok
       ? "text-emerald-600 dark:text-emerald-400"
       : "text-red-600 dark:text-red-400";
-  const rawCmd =
-    use && use.summary.startsWith(toolName) ? use.summary.slice(toolName.length).trimStart() : (use?.summary ?? "");
+  const rawCmd = use
+    ? use.summary.startsWith(toolName)
+      ? use.summary.slice(toolName.length).trimStart()
+      : use.summary
+    : "";
   const cmd = toolInputText(toolName, rawCmd);
-  // status only — the full result lives behind the expand (【输出】), not previewed inline
+  const outputPreview = result?.summary ?? "";
+  // Show a compact result preview inline; the full input/output pair loads on expand.
   const statusText = running ? translate("chatUI.executing") : ok ? "✓" : translate("chatUI.executionFailed");
 
   // key over the seqs we'd load; changes when the result (or command) arrives.
@@ -460,9 +464,18 @@ function ToolBlock({
           {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
         </span>
         <ToolIcon className={"mt-0.5 size-3.5 shrink-0 " + (running ? "text-sky-600 dark:text-sky-400" : statusTone)} />
-        {showWorker && <span className={chip(group.worker)}>{group.worker}</span>}
+        {showWorker && <span className={chip(group.worker)}>{executionWorkerLabel(group.worker)}</span>}
         <span className="shrink-0 font-medium text-sky-600 dark:text-sky-400">{toolName}</span>
-        {cmd && <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground">{cmd}</span>}
+        {cmd && (
+          <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground" title={cmd}>
+            {cmd}
+          </span>
+        )}
+        {outputPreview && (
+          <span className="min-w-0 max-w-[40%] truncate font-mono text-muted-foreground" title={outputPreview}>
+            ↳ {outputPreview}
+          </span>
+        )}
         <span className={"ml-auto shrink-0 font-medium " + statusTone}>{statusText}</span>
       </button>
       {open && (
@@ -531,7 +544,7 @@ function MessageBlock({
           {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
         </span>
         <Icon className={"mt-0.5 size-3.5 shrink-0 " + tone} />
-        {showWorker && <span className={chip(group.worker)}>{group.worker}</span>}
+        {showWorker && <span className={chip(group.worker)}>{executionWorkerLabel(group.worker)}</span>}
         <span className={"min-w-0 flex-1 truncate " + tone}>
           {body}
           {hasThinking && (
@@ -698,7 +711,7 @@ function ExecView({
   focusedSeq?: number;
 }) {
   const { t: translate } = useLiveTranslation();
-  const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
+  const showWorker = new Set(activity.map((a) => executionWorkerLabel(a.worker))).size > 1;
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
   // its own (conversation-scoped) fetcher instead.
   const getDetail = React.useCallback(

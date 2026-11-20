@@ -23,13 +23,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	pgdb "github.com/Autumn-27/artex/db"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const (
 	maxTaskCodebaseUpload       = 512 << 20
-	maxTaskCodebaseFiles        = 20000
+	maxTaskCodebaseFiles        = 50000
 	maxTaskCodebaseArchiveFiles = 50000
 	maxTaskCodebaseExpandedSize = int64(8 << 30)
 )
@@ -48,8 +50,24 @@ type taskCodebaseVersion struct {
 }
 
 type taskCodebaseUploadFile struct {
-	header *multipart.FileHeader
-	path   string
+	header    *multipart.FileHeader
+	localPath string
+	localSize int64
+	path      string
+}
+
+func (f taskCodebaseUploadFile) open() (io.ReadCloser, error) {
+	if f.header != nil {
+		return f.header.Open()
+	}
+	return os.Open(f.localPath)
+}
+
+func (f taskCodebaseUploadFile) size() int64 {
+	if f.header != nil {
+		return f.header.Size
+	}
+	return f.localSize
 }
 
 type taskCodebaseUpload struct {
@@ -171,7 +189,248 @@ func (s *Server) taskCodebasesUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	discoveryStatus := s.enqueueTaskCodebaseDiscovery(taskID, version)
+	s.onTaskCodebaseUploaded(taskID, version)
 	writeJSON(w, http.StatusCreated, map[string]any{"version": version, "discovery_status": discoveryStatus})
+}
+
+func (s *Server) onTaskCodebaseUploaded(taskID string, version taskCodebaseVersion) {
+	if s.m == nil {
+		return
+	}
+	task, ok := s.m.Task(taskID)
+	if !ok || !task.AssessmentMode {
+		return
+	}
+	if task.IsDraft() {
+		s.m.InvalidateTaskMaterialCheck(taskID)
+		return
+	}
+	if taskNum, err := strconv.ParseInt(taskID, 10, 64); err == nil && taskNum > 0 && s.m.pg != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"codebase_id": version.CodebaseID,
+			"version_id":  version.ID,
+			"name":        version.Name,
+		})
+		_, _ = s.m.pg.RecordAssessmentEvent(taskNum, "code_version_change", payload)
+	}
+}
+
+// DELETE /api/tasks/{id}/codebases/{cid} removes a mistakenly attached codebase
+// while a whitebox-driven assessment task is still in draft state.
+func (s *Server) taskCodebasesDelete(w http.ResponseWriter, r *http.Request) {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
+	if !ok {
+		return
+	}
+	taskID := strconv.FormatInt(taskNum, 10)
+	task, ok := s.m.Task(taskID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if !task.IsDraft() {
+		writeErr(w, http.StatusConflict, "仅草稿任务允许删除已挂载的代码库")
+		return
+	}
+	cid := strings.TrimSpace(r.PathValue("cid"))
+	if !validCodebaseVersionID(cid) {
+		writeErr(w, http.StatusBadRequest, "codebase_id 无效")
+		return
+	}
+	rootPath := s.m.taskCodebaseRoot(taskID)
+	entries, err := os.ReadDir(rootPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			writeErr(w, http.StatusNotFound, "代码库不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "无法读取代码库版本")
+		return
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !validCodebaseVersionID(entry.Name()) {
+			continue
+		}
+		versionDir := filepath.Join(rootPath, entry.Name())
+		data, err := os.ReadFile(filepath.Join(versionDir, taskCodebaseManifestName))
+		if err != nil {
+			continue
+		}
+		var ver taskCodebaseVersion
+		if json.Unmarshal(data, &ver) != nil {
+			continue
+		}
+		if ver.CodebaseID == "" {
+			ver.CodebaseID = taskCodebaseIdentityID(taskID, ver.Kind, ver.Name)
+		}
+		if ver.CodebaseID == cid || ver.ID == cid {
+			if err := os.RemoveAll(versionDir); err != nil {
+				writeErr(w, http.StatusInternalServerError, "删除代码库失败: "+err.Error())
+				return
+			}
+			removed++
+		}
+	}
+	if removed == 0 {
+		writeErr(w, http.StatusNotFound, "代码库不存在")
+		return
+	}
+	s.m.InvalidateTaskMaterialCheck(taskID)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted_versions": removed, "codebase_id": cid})
+}
+
+func (s *Server) saveTaskCodebaseVersionFromPath(taskID, rawPath, kindHint, codebaseID string) (taskCodebaseVersion, string, error) {
+	var zero taskCodebaseVersion
+	if _, ok := validCodebaseTaskID(taskID); !ok {
+		return zero, "", fmt.Errorf("%w: invalid task id", errInvalidTaskCodebase)
+	}
+	if codebaseID != "" && !validCodebaseVersionID(codebaseID) {
+		return zero, "", fmt.Errorf("%w: codebase_id must be a 32-character hexadecimal identifier", errInvalidTaskCodebase)
+	}
+	cleaned := strings.TrimSpace(rawPath)
+	if cleaned == "" {
+		return zero, "", fmt.Errorf("%w: path is required", errInvalidTaskCodebase)
+	}
+	absPath, err := filepath.Abs(cleaned)
+	if err != nil {
+		return zero, "", fmt.Errorf("%w: invalid path: %v", errInvalidTaskCodebase, err)
+	}
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		return zero, "", fmt.Errorf("%w: %v", errInvalidTaskCodebase, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return zero, "", fmt.Errorf("%w: symlinks are not allowed", errInvalidTaskCodebase)
+	}
+
+	var upload taskCodebaseUpload
+	upload.codebaseID = codebaseID
+	kindHint = strings.ToLower(strings.TrimSpace(kindHint))
+	if info.IsDir() {
+		if kindHint != "" && kindHint != "directory" {
+			return zero, "", fmt.Errorf("%w: directory path requires directory kind", errInvalidTaskCodebase)
+		}
+		rootName := filepath.Base(absPath)
+		safeRoot, err := safeTaskCodebasePath(rootName)
+		if err != nil {
+			return zero, "", fmt.Errorf("%w: invalid root directory name", errInvalidTaskCodebase)
+		}
+		var total int64
+		var files []taskCodebaseUploadFile
+		err = filepath.WalkDir(absPath, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if p == absPath {
+				return nil
+			}
+			linfo, err := os.Lstat(p)
+			if err != nil {
+				return err
+			}
+			if linfo.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%w: symlinks are not allowed (%s)", errInvalidTaskCodebase, p)
+			}
+			if d.IsDir() {
+				if d.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !linfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: non-regular file not allowed (%s)", errInvalidTaskCodebase, p)
+			}
+			relFromRoot, err := filepath.Rel(absPath, p)
+			if err != nil {
+				return err
+			}
+			relPath := path.Join(safeRoot, filepath.ToSlash(relFromRoot))
+			safeRel, err := safeTaskCodebasePath(relPath)
+			if err != nil {
+				return fmt.Errorf("%w: invalid relative path %q", errInvalidTaskCodebase, relPath)
+			}
+			if len(files) >= maxTaskCodebaseFiles {
+				return fmt.Errorf("%w: upload exceeds %d files", errInvalidTaskCodebase, maxTaskCodebaseFiles)
+			}
+			if linfo.Size() < 0 || linfo.Size() > maxTaskCodebaseUpload-total {
+				return fmt.Errorf("%w: upload exceeds size limit", errInvalidTaskCodebase)
+			}
+			total += linfo.Size()
+			files = append(files, taskCodebaseUploadFile{
+				localPath: p,
+				localSize: linfo.Size(),
+				path:      safeRel,
+			})
+			return nil
+		})
+		if err != nil {
+			return zero, "", err
+		}
+		if len(files) == 0 {
+			return zero, "", fmt.Errorf("%w: directory contains no files", errInvalidTaskCodebase)
+		}
+		upload.kind = "directory"
+		upload.name = safeRoot
+		upload.format = "directory"
+		upload.files = files
+	} else {
+		if !info.Mode().IsRegular() {
+			return zero, "", fmt.Errorf("%w: path must be a regular file or directory", errInvalidTaskCodebase)
+		}
+		base := filepath.Base(absPath)
+		safeBase, err := safeTaskCodebasePath(base)
+		if err != nil {
+			return zero, "", fmt.Errorf("%w: invalid file name", errInvalidTaskCodebase)
+		}
+		if info.Size() < 0 || info.Size() > maxTaskCodebaseUpload {
+			return zero, "", fmt.Errorf("%w: upload exceeds size limit", errInvalidTaskCodebase)
+		}
+		srcFmt, isSourceArchive := taskCodebaseSourceArchiveFormat(safeBase)
+		artFmt, isArtifact := taskCodebaseArtifactFormat(safeBase)
+		switch kindHint {
+		case "":
+			if isSourceArchive {
+				upload.kind = "source_archive"
+				upload.format = srcFmt
+				upload.name = taskCodebaseSourceArchiveName(safeBase)
+			} else if isArtifact {
+				upload.kind = "artifact"
+				upload.format = artFmt
+				upload.name = safeBase
+			} else {
+				return zero, "", fmt.Errorf("%w: unsupported archive or artifact format %q", errInvalidTaskCodebase, safeBase)
+			}
+		case "source_archive":
+			if !isSourceArchive {
+				return zero, "", fmt.Errorf("%w: source archive must be ZIP, TAR, TAR.GZ or TGZ", errInvalidTaskCodebase)
+			}
+			upload.kind = "source_archive"
+			upload.format = srcFmt
+			upload.name = taskCodebaseSourceArchiveName(safeBase)
+		case "artifact":
+			if !isArtifact {
+				return zero, "", fmt.Errorf("%w: unsupported artifact format", errInvalidTaskCodebase)
+			}
+			upload.kind = "artifact"
+			upload.format = artFmt
+			upload.name = safeBase
+		default:
+			return zero, "", fmt.Errorf("%w: invalid kind %q", errInvalidTaskCodebase, kindHint)
+		}
+		upload.files = []taskCodebaseUploadFile{{
+			localPath: absPath,
+			localSize: info.Size(),
+			path:      safeBase,
+		}}
+	}
+	version, err := s.saveTaskCodebaseVersion(taskID, upload)
+	if err != nil {
+		return zero, "", err
+	}
+	discoveryStatus := s.enqueueTaskCodebaseDiscovery(taskID, version)
+	s.onTaskCodebaseUploaded(taskID, version)
+	return version, discoveryStatus, nil
 }
 
 var errInvalidTaskCodebase = errors.New("invalid task codebase")
@@ -401,7 +660,7 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 		if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 			return version, err
 		}
-		src, err := item.header.Open()
+		src, err := item.open()
 		if err != nil {
 			return version, err
 		}
@@ -422,7 +681,7 @@ func (s *Server) saveTaskCodebaseVersion(taskID string, upload taskCodebaseUploa
 		if closeSrcErr != nil {
 			return version, closeSrcErr
 		}
-		if written != item.header.Size || written > maxTaskCodebaseUpload-totalSize {
+		if written != item.size() || written > maxTaskCodebaseUpload-totalSize {
 			return version, fmt.Errorf("%w: upload size changed while saving", errInvalidTaskCodebase)
 		}
 		totalSize += written
@@ -498,6 +757,7 @@ func (s *Server) enqueueTaskCodebaseDiscovery(taskID string, version taskCodebas
 		log.Printf("[codebase-discovery] task %s version %s queue failed: %v", taskID, version.ID, err)
 		return "failed"
 	}
+	log.Printf("[codebase-discovery] task %s version %s queued", taskID, version.ID)
 	go func() {
 		defer s.engine.decInflight(taskID)
 		s.runTaskCodebaseDiscovery(numericTaskID, version)
@@ -839,6 +1099,14 @@ func drainTaskCodebaseArchiveTail(reader io.Reader, remaining int64) error {
 }
 
 func safeTaskCodebaseArchivePath(raw string, isDir bool) (string, error) {
+	if !utf8.ValidString(raw) {
+		// Windows 上的压缩工具在不置 UTF-8 标志位时会把中文文件名按 GBK 写进归档，
+		// Go 原样保留这些字节，既不是合法 UTF-8 也过不了路径校验 —— 这里按 GBK 兜底解码。
+		if dec, err := simplifiedchinese.GBK.NewDecoder().String(raw); err == nil &&
+			utf8.ValidString(dec) && !strings.ContainsRune(dec, utf8.RuneError) {
+			raw = dec
+		}
+	}
 	if isDir {
 		raw = strings.TrimSuffix(raw, "/")
 		for strings.HasPrefix(raw, "./") {

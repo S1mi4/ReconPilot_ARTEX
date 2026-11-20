@@ -72,10 +72,15 @@ type TaskDTO struct {
 	ShareGlobalAssets  bool               `json:"share_global_assets"`
 	WorkerCount        int                `json:"worker_count"` // 本任务 Worker 数;0=用全局默认
 
-	NoResultSeconds     int    `json:"no_result_seconds"`
-	NoResultMinFindings int    `json:"no_result_min_findings"`
-	NoResultMinSeverity string `json:"no_result_min_severity"`
-	StopReason          string `json:"stop_reason"`
+	NoResultSeconds     int                     `json:"no_result_seconds"`
+	NoResultMinFindings int                     `json:"no_result_min_findings"`
+	NoResultMinSeverity string                  `json:"no_result_min_severity"`
+	StopReason          string                  `json:"stop_reason"`
+	AssessmentMode      bool                    `json:"assessment_mode"`
+	AssessmentPhase     string                  `json:"assessment_phase"`
+	Draft               bool                    `json:"draft"`
+	AssessmentConfig    *db.AssessmentConfig    `json:"assessment_config,omitempty"`
+	MaterialCheck       *db.MaterialCheckReport `json:"material_check,omitempty"`
 }
 
 type ProxyReconnectDTO struct {
@@ -142,8 +147,8 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CategoryName:      lifecycle.CategoryName,
 		Pinned:            lifecycle.PinnedAt > 0,
 		PinnedAt:          completedRFC(lifecycle.PinnedAt),
-		Description:       t.Description,
-		Goal:              t.Goal,
+		Description:       lifecycle.Description,
+		Goal:              lifecycle.Goal,
 		Status:            status,
 		CreatedAt:         rfc3339(time.Unix(t.CreatedAt, 0)),
 		CreatedUnix:       t.CreatedAt,
@@ -176,6 +181,23 @@ func taskDTO(t *Task, status string) TaskDTO {
 		NoResultMinFindings: t.NoResultMinFindings,
 		NoResultMinSeverity: t.NoResultMinSeverity,
 		StopReason:          lifecycle.StopReason,
+		AssessmentMode:      lifecycle.AssessmentMode,
+		AssessmentPhase:     lifecycle.AssessmentPhase,
+		Draft:               lifecycle.Draft,
+		AssessmentConfig: func() *db.AssessmentConfig {
+			if !lifecycle.AssessmentMode {
+				return nil
+			}
+			cfg := lifecycle.AssessmentConfig
+			return &cfg
+		}(),
+		MaterialCheck: func() *db.MaterialCheckReport {
+			if !lifecycle.AssessmentMode || (lifecycle.MaterialCheck.CheckedAt == nil && lifecycle.MaterialCheck.ExecutionMode == "" && !lifecycle.MaterialCheck.Ready && len(lifecycle.MaterialCheck.Blockers) == 0 && len(lifecycle.MaterialCheck.Items) == 0) {
+				return nil
+			}
+			rep := lifecycle.MaterialCheck
+			return &rep
+		}(),
 	}
 }
 

@@ -76,6 +76,11 @@ type Task struct {
 	// executing/reconciliation/completed；''=未启用）。阶段与运行状态
 	//（paused/queued/failed 等）分离，见设计文档 §3.3。
 	AssessmentPhase string `json:"assessment_phase"`
+	// Draft 为两阶段创建的草稿锁：true=允许挂载代码库/编辑结构化输入/执行材料检查，
+	// 严禁启动运行引擎、Planner 或 Worker；显式启动后翻转为 false。
+	Draft            bool                `json:"draft"`
+	AssessmentConfig AssessmentConfig    `json:"assessment_config,omitempty"`
+	MaterialCheck    MaterialCheckReport `json:"material_check,omitempty"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -218,6 +223,11 @@ type TaskCreateOptions struct {
 	Remark string
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
+	// AssessmentMode/Draft/AssessmentConfig 用于白盒驱动评估两阶段创建与启动。
+	AssessmentMode   bool
+	AssessmentPhase  string
+	Draft            bool
+	AssessmentConfig AssessmentConfig
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -225,6 +235,26 @@ type TaskCreateOptions struct {
 func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOptions) (*Task, error) {
 	if opts.ProjectID <= 0 {
 		return nil, ErrProjectRequired
+	}
+	if opts.Draft && !opts.AssessmentMode {
+		return nil, errors.New("draft tasks require assessment_mode=true")
+	}
+	if opts.AssessmentMode {
+		if err := NormalizeAndValidateAssessmentConfig(&opts.AssessmentConfig); err != nil {
+			return nil, err
+		}
+		if opts.AssessmentPhase == "" {
+			if opts.Draft {
+				opts.AssessmentPhase = AssessmentPhaseMaterialCheck
+			}
+		} else if !IsValidAssessmentPhase(opts.AssessmentPhase) {
+			return nil, fmt.Errorf("invalid assessment_phase %q", opts.AssessmentPhase)
+		}
+		if description == "" && opts.AssessmentConfig.BusinessOverview != "" {
+			description = opts.AssessmentConfig.BusinessOverview
+		}
+	} else if opts.AssessmentPhase != "" {
+		return nil, errors.New("assessment_phase requires assessment_mode=true")
 	}
 	if err := NormalizeNoResultOptions(&opts); err != nil {
 		return nil, err
@@ -251,8 +281,12 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 	// it, and the seeded target asset is anchored to it as lineage (the asset graph
 	// is global and shared, not isolated per task). Being a fact (not a special 'begin' kind) lets every
 	// intent uniformly connect to a fact node, including the first ones.
+	originSummary := "任务起点：" + description
+	if goal != "" {
+		originSummary += "；目标：" + goal
+	}
 	originPayload, _ := json.Marshal(map[string]any{
-		"summary":     "任务起点：" + description + "；目标：" + goal,
+		"summary":     originSummary,
 		"description": description,
 		"goal":        goal,
 	})
@@ -302,12 +336,18 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		NoResultSeconds: opts.NoResultSeconds, NoResultMinFindings: opts.NoResultMinFindings, NoResultMinSeverity: opts.NoResultMinSeverity,
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled, ShareGlobalAssets: opts.ShareGlobalAssets, WorkerCount: opts.WorkerCount, Remark: opts.Remark,
+		AssessmentMode: opts.AssessmentMode, AssessmentPhase: opts.AssessmentPhase, Draft: opts.Draft, AssessmentConfig: opts.AssessmentConfig,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(project_id, name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_project_assets, no_result_seconds, no_result_min_findings, no_result_min_severity)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-RETURNING id, status, paused, created_at`, opts.ProjectID, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(project_id, name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_project_assets, no_result_seconds, no_result_min_findings, no_result_min_severity, assessment_mode, assessment_phase, draft, assessment_config)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb)
+RETURNING id, status, paused, created_at`, opts.ProjectID, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity, opts.AssessmentMode, opts.AssessmentPhase, opts.Draft, marshalAssessmentConfig(opts.AssessmentConfig)).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
+	}
+	if opts.AssessmentMode && len(opts.AssessmentConfig.OperationConstraints) > 0 {
+		if err := syncAssessmentConstraintsTx(tx, expID, opts.AssessmentConfig.OperationConstraints); err != nil {
+			return nil, err
+		}
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
 		return nil, err
@@ -443,14 +483,17 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, project_id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_project_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, assessment_mode, COALESCE(assessment_phase,'')`
+description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_project_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, assessment_mode, COALESCE(assessment_phase,''), draft, COALESCE(assessment_config::text,'{}'), COALESCE(material_check::text,'{}')`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.AssessmentMode, &t.AssessmentPhase); err != nil {
+	var configRaw, checkRaw string
+	if err := sc.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.AssessmentMode, &t.AssessmentPhase, &t.Draft, &configRaw, &checkRaw); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
+	t.AssessmentConfig = decodeAssessmentConfig(configRaw)
+	t.MaterialCheck = decodeMaterialCheck(checkRaw)
 	return &t, nil
 }
 
@@ -566,7 +609,7 @@ func (d *DB) StartTaskRunSegment(id int64) (int64, *time.Time, error) {
 	var started *time.Time
 	err := d.QueryRow(`UPDATE tasks
 SET run_segment_started_at=COALESCE(run_segment_started_at, now())
-WHERE id=$1 AND deleted_at IS NULL AND status IN ('created','running') AND NOT paused AND NOT queued
+WHERE id=$1 AND deleted_at IS NULL AND status IN ('created','running') AND NOT paused AND NOT queued AND NOT draft
 RETURNING active_run_seconds, run_segment_started_at`, id).Scan(&active, &started)
 	if err == sql.ErrNoRows {
 		err = d.QueryRow(`SELECT active_run_seconds, run_segment_started_at FROM tasks WHERE id=$1`, id).Scan(&active, &started)

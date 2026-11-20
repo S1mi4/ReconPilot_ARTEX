@@ -187,6 +187,7 @@ func (s *Server) pauseProxyTask(taskID string, cause error) {
 		return
 	}
 	s.cancelTaskChat(taskID, agent.AbortChatPausedWithTask)
+	s.cancelTaskChat(taskCodeAuditAgentChatBusyKey(taskID), agent.AbortChatPausedWithTask)
 	s.ensureProxySupervisor()
 	s.signalProxySupervisor()
 }

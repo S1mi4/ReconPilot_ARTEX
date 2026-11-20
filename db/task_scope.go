@@ -366,24 +366,26 @@ FROM target t GROUP BY t.type ORDER BY t.type`, taskID, expID)
 // connector nodes (roots pulled in only to link subdomains, and the companies
 // above them) carry InScope=false and are rendered gray.
 type CoverageGraphNode struct {
-	Key         string `json:"key"`
-	Kind        string `json:"kind"` // company|root_domain|subdomain|ip|service|app|endpoint
-	Label       string `json:"label"`
-	Tested      bool   `json:"tested"`
-	InScope     bool   `json:"in_scope"`
-	AssetID     int64  `json:"asset_id,omitempty"` // 0 for company / synthetic root
-	CompanyID   int64  `json:"company_id,omitempty"`
-	Domain      string `json:"domain,omitempty"`
-	RootDomain  string `json:"root_domain,omitempty"`
-	IP          string `json:"ip,omitempty"`
-	URL         string `json:"url,omitempty"`
-	Port        int    `json:"port,omitempty"`
-	ServiceType string `json:"service_type,omitempty"`
-	AppName     string `json:"app_name,omitempty"`
-	PageTitle   string `json:"page_title,omitempty"`
-	StatusCode  int    `json:"status_code,omitempty"`
-	Zone        string `json:"zone,omitempty"` // internet|boundary|internal
-	ZoneReason  string `json:"zone_reason,omitempty"`
+	Key          string `json:"key"`
+	Kind         string `json:"kind"` // company|root_domain|subdomain|ip|service|app|endpoint|code_service
+	Label        string `json:"label"`
+	Tested       bool   `json:"tested"`
+	InScope      bool   `json:"in_scope"`
+	AssetID      int64  `json:"asset_id,omitempty"` // 0 for company / synthetic root
+	CompanyID    int64  `json:"company_id,omitempty"`
+	Domain       string `json:"domain,omitempty"`
+	RootDomain   string `json:"root_domain,omitempty"`
+	IP           string `json:"ip,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Port         int    `json:"port,omitempty"`
+	ServiceType  string `json:"service_type,omitempty"`
+	ServiceName  string `json:"service_name,omitempty"`
+	RelativePath string `json:"relative_path,omitempty"`
+	AppName      string `json:"app_name,omitempty"`
+	PageTitle    string `json:"page_title,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	Zone         string `json:"zone,omitempty"` // internet|boundary|internal
+	ZoneReason   string `json:"zone_reason,omitempty"`
 }
 
 // CoverageGraphEdge is a child→parent containment link (endpoint→service→
@@ -471,6 +473,7 @@ func (s *AssetStore) BuildCoverageGraph(taskID, _ int64) (*CoverageGraphData, er
 SELECT a.id, a.type, COALESCE(a.company_id,0),
        COALESCE(a.domain,''), COALESCE(a.root_domain,''), COALESCE(a.ip,''),
        COALESCE(a.url,''), COALESCE(a.port,0), COALESCE(a.service_type,''),
+       COALESCE(a.service_name,''), COALESCE(a.extra->>'relative_path',''),
        COALESCE(a.app_name,''), COALESCE(a.page_title,''), COALESCE(a.status_code,0),
        (a.id IN (SELECT asset_id FROM tested)) AS tested
 FROM assets a JOIN target t ON t.id = a.id
@@ -506,7 +509,7 @@ ORDER BY a.id`, taskID)
 		var companyID int64
 		if err := rows.Scan(&n.AssetID, &n.Kind, &companyID,
 			&n.Domain, &n.RootDomain, &n.IP, &n.URL, &n.Port, &n.ServiceType,
-			&n.AppName, &n.PageTitle, &n.StatusCode, &n.Tested); err != nil {
+			&n.ServiceName, &n.RelativePath, &n.AppName, &n.PageTitle, &n.StatusCode, &n.Tested); err != nil {
 			return nil, err
 		}
 		n.Key = assetKey(n.AssetID)
@@ -636,6 +639,13 @@ WHERE type='root_domain' AND domain=$2 AND id IN (SELECT id FROM target) LIMIT 1
 // coverageNodeLabel picks the human label for a coverage-graph node.
 func coverageNodeLabel(n *CoverageGraphNode) string {
 	switch n.Kind {
+	case "code_service":
+		if n.ServiceName != "" {
+			return n.ServiceName
+		}
+		if n.RelativePath != "" {
+			return n.RelativePath
+		}
 	case "endpoint", "service":
 		if n.URL != "" {
 			return n.URL

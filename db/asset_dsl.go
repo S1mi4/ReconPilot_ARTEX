@@ -482,6 +482,16 @@ func ValidateDSL(dsl string) error {
 // type), for server-side pagination — same WHERE as QueryDSL, without LIMIT/OFFSET.
 // taskID > 0 scopes the count to assets attached to that task.
 func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
+	return s.countDSL(dsl, typ, taskID, false)
+}
+
+// CountDSLPresent is CountDSL without code_service assets that are absent from
+// the task's newest codebase snapshot.
+func (s *AssetStore) CountDSLPresent(dsl, typ string, taskID int64) (int, error) {
+	return s.countDSL(dsl, typ, taskID, true)
+}
+
+func (s *AssetStore) countDSL(dsl, typ string, taskID int64, currentOnly bool) (int, error) {
 	node, err := ParseDSL(dsl)
 	if err != nil {
 		return 0, err
@@ -501,6 +511,9 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 		args = append(args, taskID)
 		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
 	}
+	if currentOnly {
+		where += " AND " + currentCodeServiceOnly
+	}
 	var n int
 	err = s.db.QueryRow("SELECT count(*) FROM assets WHERE "+where, args...).Scan(&n)
 	return n, err
@@ -511,6 +524,16 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 // taskID > 0 scopes results to assets attached to that task and hydrates each
 // row's per-task source metadata (as QueryByTask does).
 func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) ([]*Asset, error) {
+	return s.queryDSL(dsl, typ, taskID, limit, offset, false)
+}
+
+// QueryDSLPresent is QueryDSL without code_service assets that are absent from
+// the task's newest codebase snapshot.
+func (s *AssetStore) QueryDSLPresent(dsl, typ string, taskID int64, limit, offset int) ([]*Asset, error) {
+	return s.queryDSL(dsl, typ, taskID, limit, offset, true)
+}
+
+func (s *AssetStore) queryDSL(dsl, typ string, taskID int64, limit, offset int, currentOnly bool) ([]*Asset, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -535,6 +558,9 @@ func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) 
 	if taskID > 0 {
 		args = append(args, taskID)
 		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+	}
+	if currentOnly {
+		where += " AND " + currentCodeServiceOnly
 	}
 	args = append(args, limit, offset)
 	q := assetSelectCols + " WHERE " + where +

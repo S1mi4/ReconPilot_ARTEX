@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,6 +67,9 @@ type Server struct {
 	llmCfg    agent.Config // current LLM config (key not exposed)
 	llmOn     bool
 	llmProf   string // active LLM profile name (for llmrec tagging)
+
+	// javaCodeDBProbe allows deterministic test injection for Step-2 binary package checks.
+	javaCodeDBProbe func() taskJavaCodeDBConfig
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -127,17 +130,16 @@ type Server struct {
 
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
-	archiveWake          chan struct{}
-	archiveWG            sync.WaitGroup
-	auditWake            chan struct{}
-	auditWG              sync.WaitGroup
-	codeAuditReviewLocks sync.Map
-	credentialWake       chan struct{}
-	proxyReconnect       proxyReconnectSupervisor
-	proxyPoolWake        chan struct{}
-	proxyPoolWG          sync.WaitGroup
-	proxyPoolProbeSem    chan struct{}
-	proxyPoolTickMu      sync.Mutex
+	archiveWake       chan struct{}
+	archiveWG         sync.WaitGroup
+	auditWake         chan struct{}
+	auditWG           sync.WaitGroup
+	credentialWake    chan struct{}
+	proxyReconnect    proxyReconnectSupervisor
+	proxyPoolWake     chan struct{}
+	proxyPoolWG       sync.WaitGroup
+	proxyPoolProbeSem chan struct{}
+	proxyPoolTickMu   sync.Mutex
 	// proxyProbe is injectable for deterministic reconnect race tests. Production
 	// servers leave it nil and use probeEgress directly.
 	proxyProbe func(context.Context, string, string, []string, time.Duration) egressProbeResult
@@ -362,7 +364,7 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		if !lifecycle.Draft && !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
 		}
 	}
@@ -426,9 +428,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	if cfg.Jev || cfg.Provider() == "jev" {
 		return db.ErrJevProfileJudgeOnly
 	}
-	// cfg.Provider() returns one of the chat format strings
-	// (anthropic / openai / openai-responses), matching the DB CHECK constraint;
-	// Jev is intentionally handled by the dedicated intercept path.
+	// cfg.Provider() returns the persisted provider identifier, matching the DB
+	// format constraint; Jev is intentionally handled by its intercept path.
 	format := cfg.Provider()
 	var id int64
 	// 这个 legacy 端点的请求体不含轮询/收发/输出上限参数,故把库里已存的值原样带回 —
@@ -935,15 +936,22 @@ func (s *Server) Handler() http.Handler {
 	// 工作空间文件管理器（针对 workDir）
 	mux.HandleFunc("GET /api/tasks/{id}/codebases", s.taskCodebasesList)
 	mux.HandleFunc("POST /api/tasks/{id}/codebases", s.taskCodebasesUpload)
+	mux.HandleFunc("DELETE /api/tasks/{id}/codebases/{cid}", s.taskCodebasesDelete)
+	mux.HandleFunc("PATCH /api/tasks/{id}/draft", s.updateTaskDraftHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/material-check", s.materialCheckHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/start", s.startAssessmentTaskHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services/{serviceID}/audit-config", s.taskCodeAuditConfigHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/audits", s.taskCodeAuditStartHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-audits", s.taskCodeAuditsListHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-audits/{runID}", s.taskCodeAuditGetHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audit-agent/chat", s.taskCodeAuditAgentChatHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/code-audit-agent/chat/status", s.taskCodeAuditAgentChatStatusHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audit-agent/chat/stop", s.taskCodeAuditAgentChatStopHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/resume", s.taskCodeAuditResumeHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/retry", s.taskCodeAuditRetryHandler)
-	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/candidates/{candidateID}/review", s.taskCodeAuditCandidateReviewHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/code-audits/{runID}/stop", s.taskCodeAuditStopHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/files", s.taskFilesList)
 	mux.HandleFunc("GET /api/tasks/{id}/files/all", s.taskFilesAll)
 	mux.HandleFunc("GET /api/tasks/{id}/files/read", s.taskFilesServe)
@@ -1266,7 +1274,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	// never silently follows a globally-changed active task); empty = active.
 	taskParam := r.URL.Query().Get("task")
 	t := s.m.ResolveTask(taskParam)
-	if t == nil {
+	if t == nil || t.ProjectID != projectID {
 		if taskParam != "" && taskParam != "active" {
 			writeErr(w, 404, "task not found")
 			return
@@ -1330,15 +1338,23 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := s.requireProject(w, r, true)
+	if !ok {
+		return
+	}
 	active := ""
-	if t := s.m.ActiveTask(); t != nil {
+	if t := s.m.ActiveTask(); t != nil && t.ProjectID == projectID {
 		active = t.ID
 	}
-	list := s.m.List()
+	list := slices.DeleteFunc(s.m.List(), func(t *Task) bool { return t.ProjectID != projectID })
+	dtos := make([]TaskDTO, 0, len(list))
+	if len(list) == 0 {
+		writeJSON(w, 200, map[string]any{"tasks": dtos, "active": ""})
+		return
+	}
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	distinct, _ := s.m.pg.DistinctFindingStatsByTask()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
-	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
@@ -1406,7 +1422,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	}
 	// resume the engine for the opened task (idempotent — no-op if already running).
 	// 排队中的任务:仅设为活跃可查看,不启动引擎(维持并发上限,由 reconcile 补位)。
-	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued {
+	if t, ok := s.m.Task(req.ID); ok && !t.IsDraft() && !t.lifecycleSnapshot().Queued {
 		s.engine.Run(s.ctx, t)
 	}
 	writeJSON(w, 200, map[string]any{"active": req.ID})
@@ -1805,6 +1821,10 @@ type createTaskReq struct {
 	WorkerCount          int              `json:"worker_count,omitempty"`     // 本任务 Worker 数;0/省略=用全局默认;上限50
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// AssessmentMode/Draft/AssessmentConfig 用于白盒驱动评估两阶段创建与启动。
+	AssessmentMode   bool                `json:"assessment_mode,omitempty"`
+	Draft            *bool               `json:"draft,omitempty"`
+	AssessmentConfig db.AssessmentConfig `json:"assessment_config,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1817,108 +1837,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Description) == "" {
-		req.Description = "未命名任务"
-	}
-	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
-		req.LLMProfileIDs = []int64{*req.LLMProfileID}
-	}
-	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if err := db.NormalizeNoResultOptions(&db.TaskCreateOptions{NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity}); err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if req.TimeoutSeconds < 0 {
-		req.TimeoutSeconds = 0
-	}
-	if len(req.SourceTaskIDs) > db.MaxTaskSourceCount {
-		writeErr(w, 400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount))
-		return
-	}
-	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
-	seenSources := map[int64]bool{}
-	for _, raw := range req.SourceTaskIDs {
-		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-		if err != nil || id <= 0 || seenSources[id] {
-			writeErr(w, 400, "关联任务 id 无效或重复")
-			return
-		}
-		if _, ok := s.m.Task(strconv.FormatInt(id, 10)); !ok {
-			writeErr(w, 400, fmt.Sprintf("关联任务 #%d 不存在", id))
-			return
-		}
-		seenSources[id] = true
-		sourceIDs = append(sourceIDs, id)
-	}
-	companyIDs, err := db.NormalizeTaskCompanyIDs(req.CompanyIDs)
+	t, code, err := s.createTaskUnified(projectID, req, "")
 	if err != nil {
-		writeErr(w, 400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount))
+		writeErr(w, code, err.Error())
 		return
-	}
-	req.CompanyIDs = companyIDs
-	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
-	if err != nil {
-		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
-		return
-	}
-	var schedule *db.TaskScheduleInput
-	if req.Schedule != nil {
-		input := s.scheduleInput(projectID, *req.Schedule, nil)
-		input.TaskIDs = nil
-		if err := db.ValidateTaskScheduleInput(input); err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
-		schedule = &input
-	}
-	remark, err := normalizeRemark(req.Remark)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if req.WorkerCount < 0 {
-		writeErr(w, 400, "Worker 运行数量不能为负数")
-		return
-	}
-	if req.WorkerCount > db.MaxTaskWorkerCount {
-		writeErr(w, 400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount))
-		return
-	}
-	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
-		ProjectID: projectID,
-		Schedule:  schedule,
-		Name:      strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
-		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
-		NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity,
-		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
-		CoverageEnabled:   req.CoverageEnabled,
-		ShareGlobalAssets: req.ShareGlobalAssets,
-		Remark:            remark,
-		WorkerCount:       req.WorkerCount,
-		InterceptRules:    interceptRules,
-	})
-	if err != nil {
-		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
-			writeErr(w, 400, "任务分类不存在或无效")
-			return
-		}
-		if errors.Is(err, db.ErrTaskCompanyIDsInvalid) || errors.Is(err, db.ErrTaskCompanyNotFound) {
-			writeErr(w, 400, "关联企业不存在或无效")
-			return
-		}
-		writeErr(w, 500, err.Error())
-		return
-	}
-	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
-	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
-	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	if schedule == nil || schedule.StartImmediately {
-		s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
-	} else {
-		s.engine.Pause(t.ID, agent.AbortPausedBySchedule)
 	}
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
 }
@@ -2118,8 +2040,12 @@ func (s *Server) seedFirstIntent(t *Task) {
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
-	t, ok := s.m.Task(r.PathValue("id"))
+	projectID, ok := s.requireProject(w, r, true)
 	if !ok {
+		return
+	}
+	t, ok := s.m.Task(r.PathValue("id"))
+	if !ok || t.ProjectID != projectID {
 		writeErr(w, 404, "task not found")
 		return
 	}
@@ -3131,6 +3057,14 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 		return db.ActivitySessionFilter{Main: true, MainSeg: &seg}, true
 	case sess == "plan":
 		return db.ActivitySessionFilter{Worker: "planner"}, true
+	case sess == taskCodeAuditAgentKey || sess == taskCodeAuditActivityKey:
+		return db.ActivitySessionFilter{Worker: taskCodeAuditActivityKey}, true
+	case strings.HasPrefix(sess, "code_audit_run:"):
+		runID, err := strconv.ParseInt(strings.TrimPrefix(sess, "code_audit_run:"), 10, 64)
+		if err != nil || runID <= 0 {
+			return db.ActivitySessionFilter{}, false
+		}
+		return db.ActivitySessionFilter{Worker: taskCodeAuditWorkerActivityKey(runID)}, true
 	case strings.HasPrefix(sess, "intent:"):
 		id, err := strconv.ParseInt(strings.TrimPrefix(sess, "intent:"), 10, 64)
 		if err != nil {

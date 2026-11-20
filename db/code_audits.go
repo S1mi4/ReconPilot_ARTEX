@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -47,18 +50,26 @@ type TaskCodeAuditRun struct {
 	CompletedAt        *time.Time               `json:"completed_at,omitempty"`
 	UpdatedAt          time.Time                `json:"updated_at"`
 	Candidates         []TaskCodeAuditCandidate `json:"candidates,omitempty"`
+	Coverage           *TaskCodeAuditCoverage   `json:"coverage,omitempty"`
 }
 
 type TaskCodeAuditCandidate struct {
-	ID                  int64           `json:"id"`
-	RunID               int64           `json:"run_id"`
-	CandidateKey        string          `json:"candidate_key"`
-	ReviewStatus        string          `json:"review_status"`
-	Candidate           json.RawMessage `json:"candidate"`
-	ReviewerSummary     string          `json:"reviewer_summary"`
-	VerificationSummary string          `json:"verification_summary"`
-	CreatedAt           time.Time       `json:"created_at"`
-	UpdatedAt           time.Time       `json:"updated_at"`
+	ID                  int64                           `json:"id"`
+	RunID               int64                           `json:"run_id"`
+	CandidateKey        string                          `json:"candidate_key"`
+	ReviewStatus        string                          `json:"review_status"`
+	Candidate           json.RawMessage                 `json:"candidate"`
+	Variants            []TaskCodeAuditCandidateVariant `json:"variants,omitempty"`
+	ReviewerSummary     string                          `json:"reviewer_summary"`
+	VerificationSummary string                          `json:"verification_summary"`
+	CreatedAt           time.Time                       `json:"created_at"`
+	UpdatedAt           time.Time                       `json:"updated_at"`
+}
+
+type TaskCodeAuditCandidateVariant struct {
+	Candidate        json.RawMessage `json:"candidate"`
+	ValidationIssues []string        `json:"validation_issues,omitempty"`
+	AnalysisChunk    int             `json:"analysis_chunk,omitempty"`
 }
 
 type TaskCodeAuditCandidateReviewInput struct {
@@ -76,6 +87,24 @@ type TaskCodeAuditCandidateReviewInput struct {
 type TaskCodeAuditCandidateReviewResult struct {
 	Status    string `json:"status"`
 	FindingID int64  `json:"finding_id,omitempty"`
+}
+
+type TaskCodeAuditFindingInput struct {
+	CandidateKey      string
+	Candidate         json.RawMessage
+	VulnClass         string
+	Name              string
+	Severity          string
+	Summary           string
+	Evidence          string
+	CodeAuditEvidence json.RawMessage
+	AnalysisChunk     int
+}
+
+type TaskCodeAuditFindingResult struct {
+	Status         string `json:"status"`
+	FindingID      int64  `json:"finding_id,omitempty"`
+	ReportRequired bool   `json:"report_required"`
 }
 
 var (
@@ -117,19 +146,29 @@ const taskCodeAuditRunColumns = `run.id,run.task_id,run.code_service_id,service.
 run.scope_path,run.status,run.profile_id,run.profile_source,run.profile_name,run.profile_format,run.model,run.endpoint,
 run.source_acknowledged,run.files_total,run.files_analyzed,run.files_skipped,run.chunks_total,run.chunks_completed,
 run.next_file_index,run.budget_tokens,run.used_tokens,run.candidate_count,run.summary,run.error,run.created_at,
-run.started_at,run.completed_at,run.updated_at`
+run.started_at,run.completed_at,run.updated_at,run.coverage`
 
 func scanTaskCodeAuditRun(row interface{ Scan(...any) error }) (*TaskCodeAuditRun, error) {
 	var run TaskCodeAuditRun
 	var profileID sql.NullInt64
 	var started, completed sql.NullTime
+	var coverageJSON []byte
 	err := row.Scan(&run.ID, &run.TaskID, &run.CodeServiceID, &run.ServiceName, &run.CodebaseID, &run.VersionID,
 		&run.ScopePath, &run.Status, &profileID, &run.ProfileSource, &run.ProfileName, &run.ProfileFormat, &run.Model,
 		&run.Endpoint, &run.SourceAcknowledged, &run.FilesTotal, &run.FilesAnalyzed, &run.FilesSkipped, &run.ChunksTotal,
 		&run.ChunksCompleted, &run.NextFileIndex, &run.BudgetTokens, &run.UsedTokens, &run.CandidateCount,
-		&run.Summary, &run.Error, &run.CreatedAt, &started, &completed, &run.UpdatedAt)
+		&run.Summary, &run.Error, &run.CreatedAt, &started, &completed, &run.UpdatedAt, &coverageJSON)
 	if err != nil {
 		return nil, err
+	}
+	if len(coverageJSON) > 0 {
+		var coverage TaskCodeAuditCoverage
+		if err := json.Unmarshal(coverageJSON, &coverage); err != nil {
+			return nil, fmt.Errorf("decode task code audit coverage: %w", err)
+		}
+		if len(coverage.Files) > 0 || coverage.JavaBinary != nil || coverage.SweepCompleted || coverage.SweepChunksCompleted > 0 {
+			run.Coverage = &coverage
+		}
 	}
 	if profileID.Valid {
 		id := profileID.Int64
@@ -187,8 +226,11 @@ func (d *DB) ClaimNextTaskCodeAudit() (*TaskCodeAuditRun, error) {
 		return nil, nil
 	}
 	var runID, taskID int64
-	err = tx.QueryRow(`SELECT id,task_id FROM task_code_audit_runs WHERE status='queued'
-ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&runID, &taskID)
+	// One running audit per service: concurrent runs would share the same
+	// JavaCodeDB workspace (and its Lucene index lock).
+	err = tx.QueryRow(`SELECT id,task_id FROM task_code_audit_runs run WHERE run.status='queued'
+AND NOT EXISTS (SELECT 1 FROM task_code_audit_runs other WHERE other.status='running' AND other.code_service_id=run.code_service_id)
+ORDER BY run.created_at,run.id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&runID, &taskID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -220,20 +262,157 @@ WHERE id=$1 AND status='running'`, runID, progress.FilesTotal, progress.FilesAna
 }
 
 func (d *DB) AddTaskCodeAuditCandidate(runID int64, key string, candidate json.RawMessage, reviewerSummary string) error {
-	if !json.Valid(candidate) {
-		return errors.New("invalid code audit candidate JSON")
+	return d.AddTaskCodeAuditCandidateWithStatus(runID, key, "pending_review", candidate, reviewerSummary)
+}
+
+func (d *DB) AddTaskCodeAuditCandidateWithStatus(runID int64, key, status string, candidate json.RawMessage, reviewerSummary string) error {
+	var issues []string
+	if strings.TrimSpace(reviewerSummary) != "" {
+		issues = []string{strings.TrimSpace(reviewerSummary)}
 	}
-	result, err := d.Exec(`INSERT INTO task_code_audit_candidates(run_id,candidate_key,review_status,candidate,reviewer_summary)
-VALUES($1,$2,'pending_review',$3,$4) ON CONFLICT(run_id,candidate_key) DO NOTHING`, runID, key, string(candidate), reviewerSummary)
-	if err != nil {
-		return err
-	}
-	inserted, err := result.RowsAffected()
-	if err != nil || inserted == 0 {
-		return err
-	}
-	_, err = d.Exec(`UPDATE task_code_audit_runs SET candidate_count=candidate_count+1,updated_at=now() WHERE id=$1`, runID)
+	_, err := d.AddTaskCodeAuditCandidateVariant(runID, key, status, candidate, issues, 0)
 	return err
+}
+
+func (d *DB) AddTaskCodeAuditCandidateVariant(runID int64, key, status string, candidate json.RawMessage,
+	issues []string, analysisChunk int) (string, error) {
+	if status != "pending_review" && status != "incomplete" && status != "rejected" {
+		return "", errors.New("invalid code audit candidate status")
+	}
+	key = strings.TrimSpace(key)
+	if runID <= 0 || key == "" || !json.Valid(candidate) {
+		return "", errors.New("invalid code audit candidate JSON")
+	}
+	issues = uniqueTaskCodeAuditIssues(issues)
+	variant := TaskCodeAuditCandidateVariant{Candidate: append(json.RawMessage(nil), candidate...), ValidationIssues: issues, AnalysisChunk: analysisChunk}
+	variantJSON, err := json.Marshal(variant)
+	if err != nil {
+		return "", err
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var candidateID int64
+	var existingStatus string
+	var existingCandidate, existingVariants []byte
+	var existingSummary string
+	inserted, err := tx.Exec(`INSERT INTO task_code_audit_candidates
+(run_id,candidate_key,review_status,candidate,candidate_variants,reviewer_summary)
+VALUES($1,$2,$3,$4::jsonb,jsonb_build_array($5::jsonb),$6)
+ON CONFLICT(run_id,candidate_key) DO NOTHING`, runID, key, status, string(candidate), string(variantJSON),
+		formatTaskCodeAuditIssues(issues))
+	if err != nil {
+		return "", err
+	}
+	insertedCount, err := inserted.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if insertedCount > 0 {
+		if _, err := tx.Exec(`UPDATE task_code_audit_runs SET candidate_count=candidate_count+1,updated_at=now() WHERE id=$1`, runID); err != nil {
+			return "", err
+		}
+	}
+	err = tx.QueryRow(`SELECT id,review_status,candidate,candidate_variants,reviewer_summary
+FROM task_code_audit_candidates WHERE run_id=$1 AND candidate_key=$2 FOR UPDATE`, runID, key).
+		Scan(&candidateID, &existingStatus, &existingCandidate, &existingVariants, &existingSummary)
+	if err != nil {
+		return "", err
+	}
+	variants, err := appendTaskCodeAuditCandidateVariant(existingVariants, variant)
+	if err != nil {
+		return "", err
+	}
+	variantBytes, err := json.Marshal(variants)
+	if err != nil {
+		return "", err
+	}
+	mergedIssues := append([]string(nil), issues...)
+	for _, item := range variants {
+		mergedIssues = append(mergedIssues, item.ValidationIssues...)
+	}
+	mergedSummary := mergeTaskCodeAuditIssueSummary(existingSummary, formatTaskCodeAuditIssues(mergedIssues))
+	nextStatus := existingStatus
+	nextCandidate := existingCandidate
+	if existingStatus == "published" || existingStatus == "dismissed" || existingStatus == "rejected" {
+		mergedSummary = existingSummary
+	}
+	if existingStatus == "pending_review" && (status == "incomplete" || status == "rejected") {
+		nextStatus = status
+		nextCandidate = candidate
+	}
+	if _, err := tx.Exec(`UPDATE task_code_audit_candidates SET review_status=$2,candidate=$3::jsonb,
+candidate_variants=$4::jsonb,reviewer_summary=$5,updated_at=now() WHERE id=$1`, candidateID, nextStatus,
+		string(nextCandidate), string(variantBytes), mergedSummary); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return nextStatus, nil
+}
+
+func appendTaskCodeAuditCandidateVariant(existing []byte, incoming TaskCodeAuditCandidateVariant) ([]TaskCodeAuditCandidateVariant, error) {
+	variants := make([]TaskCodeAuditCandidateVariant, 0)
+	if len(existing) > 0 {
+		if err := json.Unmarshal(existing, &variants); err != nil {
+			return nil, err
+		}
+	}
+	for _, variant := range variants {
+		if sameTaskCodeAuditCandidateVariant(variant, incoming) {
+			return variants, nil
+		}
+	}
+	variants = append(variants, incoming)
+	return variants, nil
+}
+
+func sameTaskCodeAuditCandidateVariant(left, right TaskCodeAuditCandidateVariant) bool {
+	if left.AnalysisChunk != right.AnalysisChunk || !reflect.DeepEqual(left.ValidationIssues, right.ValidationIssues) {
+		return false
+	}
+	var leftCandidate, rightCandidate any
+	if json.Unmarshal(left.Candidate, &leftCandidate) != nil || json.Unmarshal(right.Candidate, &rightCandidate) != nil {
+		return string(left.Candidate) == string(right.Candidate)
+	}
+	return reflect.DeepEqual(leftCandidate, rightCandidate)
+}
+
+func uniqueTaskCodeAuditIssues(issues []string) []string {
+	seen := make(map[string]struct{}, len(issues))
+	out := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		issue = strings.TrimSpace(issue)
+		if issue == "" {
+			continue
+		}
+		if _, ok := seen[issue]; ok {
+			continue
+		}
+		seen[issue] = struct{}{}
+		out = append(out, issue)
+	}
+	return out
+}
+
+func formatTaskCodeAuditIssues(issues []string) string {
+	issues = uniqueTaskCodeAuditIssues(issues)
+	if len(issues) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		lines = append(lines, "• "+issue)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func mergeTaskCodeAuditIssueSummary(existing, incoming string) string {
+	lines := append(strings.Split(strings.TrimSpace(existing), "\n"), strings.Split(strings.TrimSpace(incoming), "\n")...)
+	return strings.Join(uniqueTaskCodeAuditIssues(lines), "\n")
 }
 
 func (d *DB) CompleteTaskCodeAudit(runID int64, progress TaskCodeAuditProgress) error {
@@ -272,7 +451,7 @@ func (d *DB) IncompleteTaskCodeAudit(runID int64, progress TaskCodeAuditProgress
 files_skipped=$4,chunks_total=$5,chunks_completed=$6,next_file_index=$7,used_tokens=$8,summary=$9,error=$10,
 completed_at=now(),updated_at=now() WHERE id=$1 AND status='running'`, runID, progress.FilesTotal,
 		progress.FilesAnalyzed, progress.FilesSkipped, progress.ChunksTotal, progress.ChunksCompleted,
-		progress.NextFileIndex, progress.UsedTokens, reason, progress.Summary)
+		progress.NextFileIndex, progress.UsedTokens, progress.Summary, reason)
 	if err != nil {
 		return err
 	}
@@ -286,6 +465,18 @@ completed_at=now(),updated_at=now() WHERE id=$1 AND status='running'`, runID, pr
 		}
 	}
 	return tx.Commit()
+}
+
+// StopQueuedTaskCodeAudit parks a run that has not been claimed yet as a
+// resumable "incomplete" run. It reports false when the run is no longer queued.
+func (d *DB) StopQueuedTaskCodeAudit(taskID, runID int64, reason string) (bool, error) {
+	result, err := d.Exec(`UPDATE task_code_audit_runs SET status='incomplete',error=$3,completed_at=now(),updated_at=now()
+WHERE task_id=$1 AND id=$2 AND status='queued'`, taskID, runID, reason)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
 }
 
 func (d *DB) FailTaskCodeAudit(runID int64, reason string) error {
@@ -408,18 +599,25 @@ ORDER BY run.created_at DESC,run.id DESC LIMIT 100`, taskID)
 		out[index].Candidates = []TaskCodeAuditCandidate{}
 	}
 	candidates, err := d.Query(`SELECT candidate.id,candidate.run_id,candidate.candidate_key,candidate.review_status,
-candidate.candidate,candidate.reviewer_summary,candidate.verification_summary,candidate.created_at,candidate.updated_at
+candidate.candidate,candidate.candidate_variants,candidate.reviewer_summary,candidate.verification_summary,candidate.created_at,candidate.updated_at
 FROM task_code_audit_candidates candidate JOIN task_code_audit_runs run ON run.id=candidate.run_id
-WHERE run.task_id=$1 ORDER BY candidate.id`, taskID)
+WHERE run.task_id=$1 ORDER BY CASE WHEN candidate.review_status='published' THEN
+CASE WHEN candidate.candidate->>'registration_tier'='B' THEN 1 ELSE 0 END ELSE 2 END,candidate.id`, taskID)
 	if err != nil {
 		return nil, err
 	}
 	defer candidates.Close()
 	for candidates.Next() {
 		var item TaskCodeAuditCandidate
+		var variants []byte
 		if err := candidates.Scan(&item.ID, &item.RunID, &item.CandidateKey, &item.ReviewStatus, &item.Candidate,
-			&item.ReviewerSummary, &item.VerificationSummary, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&variants, &item.ReviewerSummary, &item.VerificationSummary, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
+		}
+		if len(variants) > 0 {
+			if err := json.Unmarshal(variants, &item.Variants); err != nil {
+				return nil, err
+			}
 		}
 		if index, ok := byID[item.RunID]; ok {
 			out[index].Candidates = append(out[index].Candidates, item)
@@ -437,8 +635,9 @@ JOIN task_code_services service ON service.id=run.code_service_id WHERE run.task
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.Query(`SELECT id,run_id,candidate_key,review_status,candidate,reviewer_summary,verification_summary,created_at,updated_at
-FROM task_code_audit_candidates WHERE run_id=$1 ORDER BY id`, runID)
+	rows, err := d.Query(`SELECT id,run_id,candidate_key,review_status,candidate,candidate_variants,reviewer_summary,verification_summary,created_at,updated_at
+FROM task_code_audit_candidates WHERE run_id=$1 ORDER BY CASE WHEN review_status='published' THEN
+CASE WHEN candidate->>'registration_tier'='B' THEN 1 ELSE 0 END ELSE 2 END,id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -446,13 +645,207 @@ FROM task_code_audit_candidates WHERE run_id=$1 ORDER BY id`, runID)
 	run.Candidates = make([]TaskCodeAuditCandidate, 0)
 	for rows.Next() {
 		var candidate TaskCodeAuditCandidate
+		var variants []byte
 		if err := rows.Scan(&candidate.ID, &candidate.RunID, &candidate.CandidateKey, &candidate.ReviewStatus,
-			&candidate.Candidate, &candidate.ReviewerSummary, &candidate.VerificationSummary, &candidate.CreatedAt, &candidate.UpdatedAt); err != nil {
+			&candidate.Candidate, &variants, &candidate.ReviewerSummary, &candidate.VerificationSummary,
+			&candidate.CreatedAt, &candidate.UpdatedAt); err != nil {
 			return nil, err
+		}
+		if len(variants) > 0 {
+			if err := json.Unmarshal(variants, &candidate.Variants); err != nil {
+				return nil, err
+			}
 		}
 		run.Candidates = append(run.Candidates, candidate)
 	}
 	return run, rows.Err()
+}
+
+// RecordTaskCodeAuditFinding atomically persists a graded worker-produced
+// source-to-sink candidate as a pending Finding. It deliberately performs no
+// independent LLM review; source-code evidence validation remains the worker's
+// responsibility before this persistence boundary.
+func (d *DB) RecordTaskCodeAuditFinding(ctx context.Context, taskID, runID int64, input TaskCodeAuditFindingInput) (*TaskCodeAuditFindingResult, error) {
+	input.CandidateKey = strings.TrimSpace(input.CandidateKey)
+	input.Name = strings.TrimSpace(input.Name)
+	input.Summary = strings.TrimSpace(input.Summary)
+	input.Evidence = strings.TrimSpace(input.Evidence)
+	if taskID <= 0 || runID <= 0 || input.CandidateKey == "" || !json.Valid(input.Candidate) ||
+		!ValidTaskCodeAuditVulnClass(input.VulnClass) || !ValidSeverity(input.Severity) || input.Name == "" ||
+		input.Summary == "" || input.Evidence == "" || !json.Valid(input.CodeAuditEvidence) {
+		return nil, errors.New("invalid task code audit finding")
+	}
+	var auditEvidence struct {
+		CandidateKey     string          `json:"candidate_key"`
+		CodebaseID       string          `json:"codebase_id"`
+		VersionID        string          `json:"version_id"`
+		RelativePath     string          `json:"relative_path"`
+		Candidate        json.RawMessage `json:"candidate"`
+		RegistrationTier string          `json:"registration_tier"`
+		ValidationIssues []string        `json:"validation_issues"`
+	}
+	if err := json.Unmarshal(input.CodeAuditEvidence, &auditEvidence); err != nil ||
+		auditEvidence.CandidateKey != input.CandidateKey || auditEvidence.CodebaseID == "" ||
+		auditEvidence.VersionID == "" || auditEvidence.RelativePath == "" || !json.Valid(auditEvidence.Candidate) {
+		return nil, errors.New("task code audit evidence does not match the candidate")
+	}
+	verificationSummary := "worker 已完成 source-to-sink 污点分析；A 级 Finding 状态为待确认。"
+	if auditEvidence.RegistrationTier == "B" {
+		verificationSummary = "B 级低置信度 Finding；链路或可利用性待确认，报告 Agent 不自动排队。"
+	}
+	variantJSON, err := json.Marshal(TaskCodeAuditCandidateVariant{
+		Candidate: append(json.RawMessage(nil), input.Candidate...), AnalysisChunk: input.AnalysisChunk,
+		ValidationIssues: auditEvidence.ValidationIssues,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var runStatus, codebaseID, versionID, scopePath, relativePath, serviceDecision, latestVersion string
+	var explorationID int64
+	var assetID sql.NullInt64
+	var latestPresent bool
+	err = tx.QueryRowContext(ctx, `SELECT run.status,run.codebase_id,run.version_id,run.scope_path,service.relative_path,
+service.decision,service.latest_version_id,service.latest_present,service.asset_id,task.exploration_id
+FROM task_code_audit_runs run JOIN task_code_services service ON service.id=run.code_service_id
+JOIN tasks task ON task.id=run.task_id WHERE run.task_id=$1 AND run.id=$2
+FOR UPDATE OF run,service`, taskID, runID).Scan(&runStatus, &codebaseID, &versionID, &scopePath, &relativePath,
+		&serviceDecision, &latestVersion, &latestPresent, &assetID, &explorationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrTaskCodeAuditCandidateReviewConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	if runStatus != "running" || serviceDecision != "confirmed" || !latestPresent || latestVersion != versionID || !assetID.Valid ||
+		auditEvidence.CodebaseID != codebaseID || auditEvidence.VersionID != versionID || auditEvidence.RelativePath != relativePath {
+		return nil, ErrTaskCodeAuditCandidateReviewConflict
+	}
+
+	identityKey, err := taskCodeAuditIdentityKey(input.VulnClass, input.CodeAuditEvidence)
+	if err != nil {
+		return nil, err
+	}
+	lockKey := fmt.Sprintf("%d:%s:%s:%s", taskID, codebaseID, relativePath, identityKey)
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, lockKey); err != nil {
+		return nil, err
+	}
+	result := &TaskCodeAuditFindingResult{Status: "published"}
+	result.ReportRequired = auditEvidence.RegistrationTier != "B"
+
+	var candidateID int64
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO task_code_audit_candidates
+(run_id,candidate_key,review_status,candidate,candidate_variants,reviewer_summary,verification_summary)
+VALUES($1,$2,'published',$3::jsonb,jsonb_build_array($4::jsonb),'',$5)
+ON CONFLICT(run_id,candidate_key) DO NOTHING`, runID, input.CandidateKey, string(input.Candidate), string(variantJSON), verificationSummary)
+	if err != nil {
+		return nil, err
+	}
+	insertedCount, err := inserted.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if insertedCount > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE task_code_audit_runs SET candidate_count=candidate_count+1,updated_at=now() WHERE id=$1`, runID); err != nil {
+			return nil, err
+		}
+	}
+	var candidateStatus string
+	if err := tx.QueryRowContext(ctx, `SELECT id,review_status FROM task_code_audit_candidates
+WHERE run_id=$1 AND candidate_key=$2 FOR UPDATE`, runID, input.CandidateKey).Scan(&candidateID, &candidateStatus); err != nil {
+		return nil, err
+	}
+	if candidateStatus == "dismissed" || candidateStatus == "rejected" {
+		return &TaskCodeAuditFindingResult{Status: candidateStatus}, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE task_code_audit_candidates SET review_status='published',
+candidate=CASE WHEN review_status='published' AND COALESCE(candidate->>'registration_tier','A')='A'
+AND $2::jsonb->>'registration_tier'='B' THEN candidate ELSE $2::jsonb END,
+candidate_variants=CASE WHEN candidate_variants @> jsonb_build_array($3::jsonb) THEN candidate_variants
+ELSE candidate_variants || jsonb_build_array($3::jsonb) END,
+reviewer_summary='',verification_summary=CASE WHEN review_status='published' AND COALESCE(candidate->>'registration_tier','A')='A'
+AND $2::jsonb->>'registration_tier'='B' THEN verification_summary ELSE $4 END,updated_at=now() WHERE id=$1`,
+		candidateID, string(input.Candidate), string(variantJSON), verificationSummary); err != nil {
+		return nil, err
+	}
+
+	legacyIdentityKey, err := taskCodeAuditLegacyIdentityKey(input.VulnClass, input.CodeAuditEvidence)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := findTaskCodeAuditFindingTx(ctx, tx, taskID, identityKey, legacyIdentityKey, input.VulnClass, codebaseID, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		initialEvidence, _, err := mergeTaskCodeAuditFindingEvidence(nil, input.CodeAuditEvidence, identityKey, runID, time.Time{}, "")
+		if err != nil {
+			return nil, err
+		}
+		recorded, err := RecordFindingTx(ctx, tx, RecordFindingInput{
+			TaskID: taskID, ExplorationID: explorationID, VulnClass: input.VulnClass, Name: input.Name,
+			Severity: input.Severity, Summary: input.Summary, Evidence: input.Evidence, Worker: "whitebox_java_audit",
+			AssetIDs: []int64{assetID.Int64}, CodeAuditEvidence: initialEvidence,
+			VerifyLevel: "theoretical", ImpactObserved: "none",
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		result.FindingID = recorded.FindingID
+	} else {
+		result.FindingID = existing.id
+		var previousEvidence map[string]any
+		_ = json.Unmarshal(existing.codeAuditEvidence, &previousEvidence)
+		previousVersion := codeAuditEvidenceString(previousEvidence, "last_seen_version_id")
+		if previousVersion == "" {
+			previousVersion = codeAuditEvidenceString(previousEvidence, "version_id")
+		}
+		result.ReportRequired = auditEvidence.RegistrationTier != "B" &&
+			(previousVersion != versionID || codeAuditEvidenceString(previousEvidence, "registration_tier") == "B")
+		preserveEvidence := previousVersion == versionID && auditEvidence.RegistrationTier == "B" &&
+			codeAuditEvidenceString(previousEvidence, "registration_tier") != "B"
+		mergedEvidence, reopen, err := mergeTaskCodeAuditFindingEvidence(existing.codeAuditEvidence, input.CodeAuditEvidence,
+			identityKey, runID, existing.createdAt, existing.status)
+		if err != nil {
+			return nil, err
+		}
+		newStatus := existing.status
+		if reopen {
+			newStatus = FindingPending
+		}
+		// A re-observation refreshes the evidence only. Name, severity, summary and
+		// class may have been edited by a human and are never overwritten here.
+		payload, _ := json.Marshal(map[string]any{
+			"evidence":            map[string]any{"by": "whitebox_java_audit", "poc": input.Evidence},
+			"code_audit_evidence": mergedEvidence,
+		})
+		if preserveEvidence {
+			payload, _ = json.Marshal(map[string]any{"code_audit_evidence": mergedEvidence})
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE findings SET evidence=CASE WHEN $5 THEN evidence ELSE $2 END,code_audit_evidence=$3::jsonb,status=$4,
+verify_level=CASE WHEN verify_level IN ('unknown','theoretical') THEN 'theoretical' ELSE verify_level END
+WHERE id=$1`, existing.id, input.Evidence, string(mergedEvidence), newStatus, preserveEvidence); err != nil {
+			return nil, err
+		}
+		if existing.nodeID.Valid {
+			if _, err := tx.ExecContext(ctx, `UPDATE exploration_nodes SET payload=payload || $2::jsonb,updated_at=now()
+WHERE id=$1 AND kind='finding'`, existing.nodeID.Int64, string(payload)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := reconcileTaskCodeAuditFindingsTx(ctx, tx, runID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (d *DB) FinalizeTaskCodeAuditCandidateReview(ctx context.Context, taskID, runID, candidateID int64, input TaskCodeAuditCandidateReviewInput) (*TaskCodeAuditCandidateReviewResult, error) {
@@ -505,7 +898,7 @@ WHERE run.task_id=$1 AND run.id=$2 AND candidate.id=$3 FOR UPDATE OF candidate`,
 	if err != nil {
 		return nil, err
 	}
-	if status != "pending_review" || (runStatus != "completed" && runStatus != "incomplete") {
+	if status != "pending_review" || (runStatus != "running" && runStatus != "completed" && runStatus != "incomplete") {
 		return nil, ErrTaskCodeAuditCandidateReviewConflict
 	}
 	result := &TaskCodeAuditCandidateReviewResult{}
@@ -546,7 +939,11 @@ WHERE run.task_id=$1 AND run.id=$2 AND candidate.id=$3 FOR UPDATE OF candidate`,
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, lockKey); err != nil {
 		return nil, err
 	}
-	existing, err := findTaskCodeAuditFindingTx(ctx, tx, taskID, identityKey, codebaseID, acceptedEvidence.RelativePath)
+	legacyIdentityKey, err := taskCodeAuditLegacyIdentityKey(input.VulnClass, input.CodeAuditEvidence)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := findTaskCodeAuditFindingTx(ctx, tx, taskID, identityKey, legacyIdentityKey, input.VulnClass, codebaseID, acceptedEvidence.RelativePath)
 	if err != nil {
 		return nil, err
 	}
@@ -633,18 +1030,399 @@ type taskCodeAuditIdentityEvidence struct {
 	CodebaseID   string `json:"codebase_id"`
 	RelativePath string `json:"relative_path"`
 	Candidate    struct {
-		Source taskCodeAuditIdentityLocation `json:"source"`
-		Sink   taskCodeAuditIdentityLocation `json:"sink"`
+		Language   string                          `json:"language,omitempty"`
+		Anchors    []taskCodeAuditIdentityAnchor   `json:"anchors,omitempty"`
+		Source     taskCodeAuditIdentityLocation   `json:"source"`
+		Sink       taskCodeAuditIdentityLocation   `json:"sink"`
+		EntryPoint taskCodeAuditIdentityLocation   `json:"entry_point"`
+		Flow       []taskCodeAuditIdentityFlowStep `json:"flow"`
 	} `json:"candidate"`
 	Source taskCodeAuditIdentityLocation `json:"source"`
 	Sink   taskCodeAuditIdentityLocation `json:"sink"`
 	Key    string                        `json:"candidate_key"`
 }
 
+type taskCodeAuditIdentityFlowStep struct {
+	Symbol string `json:"symbol"`
+}
+
+type taskCodeAuditIdentityAnchor struct {
+	File   string `json:"file"`
+	Line   int    `json:"line"`
+	Symbol string `json:"symbol"`
+}
+
+// taskCodeAuditAnchorIdentity builds a line-independent identity from the
+// anchors a candidate cites. Anchors are deduplicated and sorted so a model
+// that lists them in a different order or shifts line numbers still maps to
+// the same candidate.
+func taskCodeAuditAnchorIdentity(category, language string, anchors []taskCodeAuditIdentityAnchor) (string, bool) {
+	seen := map[string]struct{}{}
+	var parts []string
+	for _, anchor := range anchors {
+		file := normalizeTaskCodeAuditIdentityPath(anchor.File)
+		symbol := normalizeTaskCodeAuditIdentitySymbolForLanguage(anchor.Symbol, language)
+		if strings.TrimSpace(anchor.File) == "" || symbol == "" {
+			continue
+		}
+		item := file + "\x00" + symbol
+		if _, exists := seen[item]; exists {
+			continue
+		}
+		seen[item] = struct{}{}
+		parts = append(parts, item)
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	sort.Strings(parts)
+	encoded, err := json.Marshal(append([]string{"anchors-v1", category, language}, parts...))
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), true
+}
+
+// TaskCodeAuditCandidateIdentityKey returns a stable per-chain key. It uses
+// normalized file and symbol anchors instead of line numbers so chunk overlap,
+// wording changes, and decompiler line shifts do not split one issue into
+// multiple candidates. Java command injection retains its more specific chain
+// identity.
+func TaskCodeAuditCandidateIdentityKey(vulnClass string, candidate json.RawMessage) (string, error) {
+	var value struct {
+		Language   string                          `json:"language,omitempty"`
+		Source     taskCodeAuditIdentityLocation   `json:"source"`
+		Sink       taskCodeAuditIdentityLocation   `json:"sink"`
+		EntryPoint taskCodeAuditIdentityLocation   `json:"entry_point"`
+		Flow       []taskCodeAuditIdentityFlowStep `json:"flow"`
+		Anchors    []taskCodeAuditIdentityAnchor   `json:"anchors"`
+	}
+	if err := json.Unmarshal(candidate, &value); err != nil {
+		return "", err
+	}
+	category := strings.ToUpper(strings.TrimSpace(vulnClass))
+	javaChain := value.Language == "" || value.Language == "java"
+	if category == "COMMAND_INJECTION" && javaChain {
+		source := normalizeTaskCodeAuditSourceIdentity(value.Source)
+		entryFile := normalizeTaskCodeAuditCommandPath(value.EntryPoint.File)
+		sinkFile := normalizeTaskCodeAuditCommandPath(value.Sink.File)
+		flowContext := normalizeTaskCodeAuditFlowContext(value.Flow)
+		if source != "" && entryFile != "" && sinkFile != "" && flowContext != "" {
+			parts := []string{"command-chain-v1", source, entryFile, sinkFile, flowContext}
+			encoded, err := json.Marshal(parts)
+			if err != nil {
+				return "", err
+			}
+			sum := sha256.Sum256(encoded)
+			return hex.EncodeToString(sum[:]), nil
+		}
+	}
+	locationKey := func(location taskCodeAuditIdentityLocation) string {
+		file := normalizeTaskCodeAuditIdentityPath(location.File)
+		symbol := normalizeTaskCodeAuditIdentitySymbolForLanguage(location.Symbol, value.Language)
+		parameter := strings.TrimSpace(location.Parameter)
+		if value.Language != "python" && value.Language != "c" {
+			parameter = strings.ToLower(parameter)
+		}
+		if symbol == "" {
+			symbol = parameter
+		}
+		if file == "" || symbol == "" {
+			return ""
+		}
+		return file + "\x00" + symbol + "\x00" + parameter
+	}
+	sourceKey, sinkKey := locationKey(value.Source), locationKey(value.Sink)
+	if sourceKey != "" && sinkKey != "" {
+		parts := []string{"source-sink-v2", category, value.Language, sourceKey, sinkKey}
+		if entryKey := locationKey(value.EntryPoint); entryKey != "" {
+			parts = append(parts, entryKey)
+		}
+		encoded, err := json.Marshal(parts)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(encoded)
+		return hex.EncodeToString(sum[:]), nil
+	}
+	if key, ok := taskCodeAuditAnchorIdentity(category, value.Language, value.Anchors); ok {
+		return key, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(candidate, &payload); err != nil {
+		return "", err
+	}
+	delete(payload, "analysis_chunk")
+	encoded, err := json.Marshal([]any{category, payload})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+var taskCodeAuditSourceFieldPattern = regexp.MustCompile(`(?i)(?:字段|field|parameter|property)\s*[:：]?\s*([A-Za-z_$][A-Za-z0-9_$]*)|\.([A-Za-z_$][A-Za-z0-9_$]*)\s*\(|([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:字段|field|parameter|property)`)
+
+func normalizeTaskCodeAuditSourceIdentity(source taskCodeAuditIdentityLocation) string {
+	symbol := strings.TrimSpace(source.Symbol)
+	if slash := strings.LastIndex(symbol, "/"); slash >= 0 {
+		symbol = symbol[slash+1:]
+	}
+	if bracket := strings.Index(symbol, "("); bracket >= 0 {
+		symbol = symbol[:bracket]
+	}
+	identifiers := taskCodeAuditSymbolIdentifier.FindAllString(symbol, -1)
+	if len(identifiers) > 2 {
+		identifiers = identifiers[len(identifiers)-2:]
+	}
+	field := ""
+	typedClass := ""
+	channel := normalizeTaskCodeAuditSourceChannel(source.Description)
+	descriptionField, accessorField := "", ""
+	for _, match := range taskCodeAuditSourceFieldPattern.FindAllStringSubmatch(source.Description, -1) {
+		for _, index := range []int{2, 1, 3} {
+			if match[index] != "" {
+				if index == 2 {
+					accessorField = match[index]
+				} else {
+					descriptionField = match[index]
+				}
+				break
+			}
+		}
+	}
+	if len(identifiers) >= 2 {
+		previous := identifiers[len(identifiers)-2]
+		if previous[0] >= 'A' && previous[0] <= 'Z' || strings.EqualFold(previous, "input") || strings.EqualFold(previous, "request") {
+			field = identifiers[len(identifiers)-1]
+			if previous[0] >= 'A' && previous[0] <= 'Z' {
+				typedClass = previous
+			}
+		}
+	} else if len(identifiers) == 1 && identifiers[0][0] >= 'a' && identifiers[0][0] <= 'z' {
+		field = identifiers[0]
+	}
+	// The source symbol may be an accessor, controller method, or request object.
+	// Prefer a concrete accessor from the description, and use a labelled field
+	// when the symbol itself is only a generic request variable.
+	if accessorField != "" {
+		field = accessorField
+	} else if descriptionField != "" && (field == "" || strings.EqualFold(field, "input") || strings.EqualFold(field, "request") || strings.EqualFold(field, "body")) {
+		field = descriptionField
+	}
+	if field == "" {
+		field = descriptionField
+	}
+	if field == "" {
+		field = strings.TrimSpace(source.Parameter)
+	}
+	if field != "" {
+		if channel != "" {
+			return channel + "." + strings.ToLower(field)
+		}
+	}
+	if field != "" && typedClass != "" {
+		return strings.ToLower(typedClass + "." + field)
+	}
+	class := auditSourceClassFromFile(source.File)
+	if field != "" && class != "" {
+		return strings.ToLower(class + "." + field)
+	}
+	if field != "" {
+		return strings.ToLower(field)
+	}
+	if len(identifiers) == 0 {
+		return ""
+	}
+	if len(identifiers) > 2 {
+		identifiers = identifiers[len(identifiers)-2:]
+	}
+	for index := range identifiers {
+		identifiers[index] = strings.ToLower(identifiers[index])
+	}
+	return strings.Join(identifiers, ".")
+}
+
+func normalizeTaskCodeAuditSourceChannel(description string) string {
+	value := strings.ToLower(strings.TrimSpace(description))
+	switch {
+	case strings.Contains(value, "请求体"), strings.Contains(value, "request body"), strings.Contains(value, "json body"):
+		return "body"
+	case strings.Contains(value, "请求头"), strings.Contains(value, "request header"), strings.Contains(value, "http header"):
+		return "header"
+	case strings.Contains(value, "查询参数"), strings.Contains(value, "query parameter"), strings.Contains(value, "query string"):
+		return "query"
+	case strings.Contains(value, "路径参数"), strings.Contains(value, "pathvariable"), strings.Contains(value, "path parameter"):
+		return "path"
+	case strings.Contains(value, "cookie"):
+		return "cookie"
+	case strings.Contains(value, "消息"), strings.Contains(value, "message body"), strings.Contains(value, "kafka"):
+		return "message"
+	default:
+		return ""
+	}
+}
+
+func auditSourceClassFromFile(file string) string {
+	file = strings.TrimSpace(strings.ReplaceAll(file, `\`, "/"))
+	if bang := strings.LastIndex(file, "!"); bang >= 0 {
+		file = file[bang+1:]
+	}
+	base := path.Base(file)
+	base = strings.TrimSuffix(base, path.Ext(base))
+	if inner := strings.LastIndex(base, "$"); inner >= 0 && inner+1 < len(base) {
+		base = base[inner+1:]
+	}
+	identifiers := taskCodeAuditSymbolIdentifier.FindAllString(base, -1)
+	if len(identifiers) == 0 {
+		return ""
+	}
+	return identifiers[len(identifiers)-1]
+}
+
+func normalizeTaskCodeAuditIdentityPath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, `\`, "/"))
+	if value == "" {
+		return ""
+	}
+	return strings.TrimPrefix(path.Clean(value), "./")
+}
+
+// Command-injection candidates commonly mix a basename returned by a worker
+// with an archive-qualified path saved by an earlier run. Identity is scoped to
+// one task code service, so the class basename keeps those representations
+// comparable while source-field and sink-class context distinguish chains.
+func normalizeTaskCodeAuditCommandPath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, `\`, "/"))
+	if value == "" {
+		return ""
+	}
+	return strings.ToLower(path.Base(value))
+}
+
+func normalizeTaskCodeAuditFlowContext(flow []taskCodeAuditIdentityFlowStep) string {
+	ignored := map[string]struct{}{
+		"start": {}, "exec": {}, "strip": {}, "list": {}, "of": {}, "builder": {}, "processbuilder": {},
+		"runtime": {}, "command": {}, "shell": {}, "target": {}, "process": {}, "input": {}, "output": {},
+		"carrierhost": {}, "getcarrierhost": {}, "host": {}, "get": {}, "set": {}, "valueof": {}, "tostring": {},
+	}
+	methods := make([]string, 0, len(flow))
+	seen := make(map[string]struct{}, len(flow))
+	for index, step := range flow {
+		if index == 0 {
+			continue // source wording is normalized separately and is not call-path context
+		}
+		symbol := strings.TrimSpace(step.Symbol)
+		if bracket := strings.Index(symbol, "("); bracket >= 0 {
+			symbol = symbol[:bracket]
+		}
+		identifiers := taskCodeAuditSymbolIdentifier.FindAllString(symbol, -1)
+		if len(identifiers) == 0 {
+			continue
+		}
+		method := ""
+		for index := len(identifiers) - 1; index >= 0; index-- {
+			candidate := identifiers[index]
+			lower := strings.ToLower(candidate)
+			if _, skip := ignored[lower]; skip || (candidate[0] >= 'A' && candidate[0] <= 'Z') {
+				continue
+			}
+			method = lower
+			break
+		}
+		if method == "" {
+			continue
+		}
+		if _, exists := seen[method]; exists {
+			continue
+		}
+		seen[method] = struct{}{}
+		methods = append(methods, method)
+	}
+	if len(methods) == 0 {
+		return ""
+	}
+	if len(methods) > 1 {
+		methods = methods[len(methods)-1:]
+	}
+	// The innermost application helper is the stable context nearest the sink.
+	// Wider flows often omit an intermediate method in one worker's summary.
+	return strings.Join(methods, ">")
+}
+
+// taskCodeAuditIdentityKey is the finding identity. Command injection uses the
+// normalized source/entry/sink-class/call-path chain key so equivalent chunk
+// variants and decompiler line shifts do not create a second Finding. Other
+// vulnerability classes retain symbol and parameter normalization.
 func taskCodeAuditIdentityKey(vulnClass string, evidence json.RawMessage) (string, error) {
+	return computeTaskCodeAuditIdentityKey(vulnClass, evidence, true)
+}
+
+// taskCodeAuditLegacyIdentityKey is the pre-normalization identity. Findings
+// recorded before the change still carry it, so lookups accept both.
+func taskCodeAuditLegacyIdentityKey(vulnClass string, evidence json.RawMessage) (string, error) {
+	return computeTaskCodeAuditIdentityKey(vulnClass, evidence, false)
+}
+
+var taskCodeAuditSymbolIdentifier = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
+
+func normalizeTaskCodeAuditIdentitySymbol(symbol string) string {
+	symbol = strings.TrimSpace(symbol)
+	if cut := strings.Index(symbol, "("); cut > 0 {
+		symbol = symbol[:cut]
+	}
+	if identifiers := taskCodeAuditSymbolIdentifier.FindAllString(symbol, -1); len(identifiers) > 0 {
+		return strings.ToLower(identifiers[len(identifiers)-1])
+	}
+	return strings.ToLower(symbol)
+}
+
+// Native identifiers retain case and qualification. Collapsing Handler/handler
+// or module_a.lookup/module_b.lookup could merge different Python/C findings.
+// The legacy Java normalization remains unchanged for existing identities.
+func normalizeTaskCodeAuditIdentitySymbolForLanguage(symbol, language string) string {
+	if language != "python" && language != "c" {
+		return normalizeTaskCodeAuditIdentitySymbol(symbol)
+	}
+	if cut := strings.Index(symbol, "("); cut >= 0 {
+		symbol = symbol[:cut]
+	}
+	return strings.Join(strings.Fields(symbol), "")
+}
+
+func computeTaskCodeAuditIdentityKey(vulnClass string, evidence json.RawMessage, normalize bool) (string, error) {
 	var value taskCodeAuditIdentityEvidence
 	if err := json.Unmarshal(evidence, &value); err != nil {
 		return "", err
+	}
+	if normalize && (value.Candidate.Language == "" || value.Candidate.Language == "java") && strings.ToUpper(strings.TrimSpace(vulnClass)) == "COMMAND_INJECTION" {
+		candidate := value.Candidate
+		if candidate.Source.File == "" && candidate.Source.Symbol == "" {
+			candidate.Source = value.Source
+		}
+		if candidate.Sink.File == "" && candidate.Sink.Symbol == "" {
+			candidate.Sink = value.Sink
+		}
+		candidateJSON, err := json.Marshal(candidate)
+		if err != nil {
+			return "", err
+		}
+		chainKey, err := TaskCodeAuditCandidateIdentityKey(vulnClass, candidateJSON)
+		if err != nil {
+			return "", err
+		}
+		identity := []string{strings.TrimSpace(value.CodebaseID), normalizeCodeAuditScopePath(value.RelativePath),
+			"COMMAND_INJECTION", "chain:" + chainKey}
+		if identity[0] == "" {
+			return "", errors.New("code audit identity is incomplete")
+		}
+		encoded, err := json.Marshal(identity)
+		if err != nil {
+			return "", err
+		}
+		digest := sha256.Sum256(encoded)
+		return hex.EncodeToString(digest[:]), nil
 	}
 	source, sink := value.Candidate.Source, value.Candidate.Sink
 	if source.File == "" && source.Symbol == "" {
@@ -657,6 +1435,12 @@ func taskCodeAuditIdentityKey(vulnClass string, evidence json.RawMessage) (strin
 		file := strings.TrimPrefix(path.Clean(strings.ReplaceAll(strings.TrimSpace(location.File), `\`, "/")), "./")
 		symbol := strings.TrimSpace(location.Symbol)
 		parameter := strings.TrimSpace(location.Parameter)
+		if normalize {
+			symbol = normalizeTaskCodeAuditIdentitySymbolForLanguage(symbol, value.Candidate.Language)
+			if value.Candidate.Language != "python" && value.Candidate.Language != "c" {
+				parameter = strings.ToLower(parameter)
+			}
+		}
 		if symbol == "" && parameter == "" {
 			symbol = strings.TrimSpace(location.Description)
 		}
@@ -710,10 +1494,11 @@ type taskCodeAuditFindingRow struct {
 	createdAt         time.Time
 }
 
-func findTaskCodeAuditFindingTx(ctx context.Context, tx *sql.Tx, taskID int64, identityKey, codebaseID, relativePath string) (*taskCodeAuditFindingRow, error) {
+func findTaskCodeAuditFindingTx(ctx context.Context, tx *sql.Tx, taskID int64, identityKey, legacyIdentityKey, vulnClass, codebaseID, relativePath string) (*taskCodeAuditFindingRow, error) {
 	var existing taskCodeAuditFindingRow
 	err := tx.QueryRowContext(ctx, `SELECT id,node_id,vulnclass,status,code_audit_evidence,created_at FROM findings
-WHERE task_id=$1 AND code_audit_evidence->>'identity_key'=$2 ORDER BY id LIMIT 1 FOR UPDATE`, taskID, identityKey).
+WHERE task_id=$1 AND code_audit_evidence->>'identity_key' IN ($2,$3)
+ORDER BY (code_audit_evidence->>'identity_key'=$2) DESC, id LIMIT 1 FOR UPDATE`, taskID, identityKey, legacyIdentityKey).
 		Scan(&existing.id, &existing.nodeID, &existing.vulnClass, &existing.status, &existing.codeAuditEvidence, &existing.createdAt)
 	if err == nil {
 		return &existing, nil
@@ -723,8 +1508,8 @@ WHERE task_id=$1 AND code_audit_evidence->>'identity_key'=$2 ORDER BY id LIMIT 1
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,node_id,vulnclass,status,code_audit_evidence,created_at FROM findings
 WHERE task_id=$1 AND code_audit_evidence->>'codebase_id'=$2 AND code_audit_evidence->>'relative_path'=$3
-AND code_audit_evidence ? 'candidate_key' AND NOT (code_audit_evidence ? 'identity_key') ORDER BY id FOR UPDATE`,
-		taskID, codebaseID, relativePath)
+AND upper(vulnclass)=upper($4) AND code_audit_evidence ? 'candidate_key' ORDER BY id FOR UPDATE`,
+		taskID, codebaseID, relativePath, vulnClass)
 	if err != nil {
 		return nil, err
 	}
@@ -735,8 +1520,9 @@ AND code_audit_evidence ? 'candidate_key' AND NOT (code_audit_evidence ? 'identi
 			&candidate.codeAuditEvidence, &candidate.createdAt); err != nil {
 			return nil, err
 		}
-		legacyKey, err := taskCodeAuditIdentityKey(candidate.vulnClass, candidate.codeAuditEvidence)
-		if err != nil || legacyKey != identityKey {
+		legacyKey, err := taskCodeAuditLegacyIdentityKey(candidate.vulnClass, candidate.codeAuditEvidence)
+		currentKey, currentErr := taskCodeAuditIdentityKey(candidate.vulnClass, candidate.codeAuditEvidence)
+		if (err != nil || legacyKey != legacyIdentityKey) && (currentErr != nil || currentKey != identityKey) {
 			continue
 		}
 		return &candidate, nil
@@ -793,7 +1579,18 @@ func mergeTaskCodeAuditFindingEvidence(existingRaw, incomingRaw json.RawMessage,
 	if existing != nil {
 		autoFixedVersion = codeAuditEvidenceString(existing, "fixed_in_version_id")
 	}
+	// Within a version, a later partial observation must not replace complete
+	// evidence. New versions use their own tier; an old A does not validate new code.
+	preserveComplete := existing != nil && codeAuditEvidenceString(existing, "version_id") == codeAuditEvidenceString(incoming, "version_id") &&
+		codeAuditEvidenceString(existing, "registration_tier") != "B" && codeAuditEvidenceString(incoming, "registration_tier") == "B"
+	// Clear stale reasons when B is promoted to A (omitempty omits the new list).
+	if !preserveComplete {
+		delete(merged, "validation_issues")
+	}
 	for key, value := range incoming {
+		if preserveComplete && (key == "candidate" || key == "candidate_key" || key == "registration_tier" || key == "validation_issues") {
+			continue
+		}
 		if key == "history" || key == "first_seen_version_id" {
 			continue
 		}
@@ -863,11 +1660,12 @@ func reconcileTaskCodeAuditFindingsTx(ctx context.Context, tx *sql.Tx, runID int
 	var codebaseID, relativePath, versionID, scopePath, runStatus, latestVersionID string
 	var latestPresent bool
 	var filesTotal, filesAnalyzed, filesSkipped, chunksTotal, chunksCompleted int
+	var coverageJSON []byte
 	err := tx.QueryRowContext(ctx, `SELECT run.task_id,run.code_service_id,run.codebase_id,service.relative_path,run.version_id,run.scope_path,
-run.status,run.files_total,run.files_analyzed,run.files_skipped,run.chunks_total,run.chunks_completed
+run.status,run.files_total,run.files_analyzed,run.files_skipped,run.chunks_total,run.chunks_completed,run.coverage
 FROM task_code_audit_runs run JOIN task_code_services service ON service.id=run.code_service_id
 WHERE run.id=$1 FOR UPDATE OF run`, runID).Scan(&taskID, &codeServiceID, &codebaseID, &relativePath, &versionID, &scopePath,
-		&runStatus, &filesTotal, &filesAnalyzed, &filesSkipped, &chunksTotal, &chunksCompleted)
+		&runStatus, &filesTotal, &filesAnalyzed, &filesSkipped, &chunksTotal, &chunksCompleted, &coverageJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -889,6 +1687,9 @@ ORDER BY completed_at DESC,id DESC LIMIT 1 FOR UPDATE`, codeServiceID, versionID
 		}
 		return reconcileTaskCodeAuditFindingsTx(ctx, tx, alternativeRunID)
 	}
+	if !taskCodeAuditCoverageAllowsReconciliation(coverageJSON, filesTotal) {
+		return nil
+	}
 	if err := tx.QueryRowContext(ctx, `SELECT relative_path,latest_version_id,latest_present
 FROM task_code_services WHERE id=$1 FOR UPDATE`, codeServiceID).Scan(&relativePath, &latestVersionID, &latestPresent); err != nil {
 		return err
@@ -909,7 +1710,7 @@ WHERE code_service_id=$1 AND version_id=$2 AND scope_path=$3 AND id<>$4 AND stat
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM task_code_audit_candidates candidate
 JOIN task_code_audit_runs run ON run.id=candidate.run_id
 WHERE run.code_service_id=$1 AND run.version_id=$2 AND run.scope_path=$3
-AND run.status IN ('completed','incomplete') AND candidate.review_status='pending_review'`,
+AND run.status IN ('completed','incomplete') AND candidate.review_status IN ('pending_review','incomplete')`,
 		codeServiceID, versionID, scopePath).Scan(&pending); err != nil {
 		return err
 	}
@@ -1037,25 +1838,30 @@ WHERE id=$1 AND kind='finding'`, finding.nodeID.Int64, string(encoded)); err != 
 	return nil
 }
 
+var taskCodeAuditVulnClassPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+// ValidTaskCodeAuditVulnClass only checks the shape of a normalized class
+// label. The platform does not decide which vulnerability types the model may
+// report; the server maps free-form model labels to known buckets or OTHER
+// before they reach this layer.
 func ValidTaskCodeAuditVulnClass(value string) bool {
-	switch value {
-	case "SQL_INJECTION", "COMMAND_INJECTION", "PATH_TRAVERSAL", "SSRF", "XSS", "UNSAFE_DESERIALIZATION":
-		return true
-	default:
-		return false
-	}
+	return taskCodeAuditVulnClassPattern.MatchString(value)
 }
 
 func (d *DB) ValidateTaskCodeAuditService(taskID, codeServiceID int64) (TaskCodeService, error) {
 	var service TaskCodeService
 	var assetID sql.NullInt64
+	var languagesJSON []byte
 	err := d.QueryRow(`SELECT id,task_id,codebase_id,relative_path,name,decision,decision_source,asset_id,
-latest_version_id,latest_present,evidence,reason,created_at,updated_at FROM task_code_services
+latest_version_id,latest_present,evidence,reason,created_at,updated_at,to_json(languages) FROM task_code_services
 WHERE task_id=$1 AND id=$2`, taskID, codeServiceID).Scan(
 		&service.ID, &service.TaskID, &service.CodebaseID, &service.RelativePath, &service.Name,
 		&service.Decision, &service.DecisionSource, &assetID, &service.LatestVersionID, &service.LatestPresent,
-		&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt)
+		&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt, &languagesJSON)
 	if err != nil {
+		return service, err
+	}
+	if err := json.Unmarshal(languagesJSON, &service.Languages); err != nil {
 		return service, err
 	}
 	if assetID.Valid {

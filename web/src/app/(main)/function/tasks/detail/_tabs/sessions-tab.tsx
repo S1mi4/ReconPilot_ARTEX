@@ -5,10 +5,12 @@ import {
   ArrowUpIcon,
   BrainIcon,
   ChevronDownIcon,
+  ChevronRightIcon,
   CircleCheckIcon,
   CircleSlashIcon,
   CircleXIcon,
   ClockIcon,
+  EyeIcon,
   HistoryIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -43,6 +45,8 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { InputGroup, InputGroupAddon, InputGroupButton } from "@/components/ui/input-group";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
@@ -52,9 +56,11 @@ import { useSideQuestions } from "@/hooks/use-side-questions";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api, openSSE } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
+import { isWhiteboxAuditWorker } from "@/lib/execution-display";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
+import { startTaskSessionStream, type TaskSessionStreamState } from "@/lib/task-session-stream";
 import type {
   Activity,
   ChatAttachment,
@@ -63,6 +69,8 @@ import type {
   Session,
   SessionStatus,
   SessionTokenUsage,
+  TaskCodeAuditRun,
+  TaskCodeService,
   TaskLLMResolution,
   TaskLLMResolutions,
   TaskNode,
@@ -147,6 +155,8 @@ function sessionKeyOf(a: Activity): string {
   if (a.worker === "system" || a.kind === "llm_switch" || a.kind === "llm_failover") return "system";
   if (a.worker === "mainagent") return `main:${a.main_seg ?? 0}`; // one key per conversation segment
   if (a.worker === "planner") return "plan";
+  if (a.worker.startsWith("code_audit_run:")) return a.worker;
+  if (isWhiteboxAuditWorker(a.worker)) return "whitebox_audit";
   if (a.intent_id) return `intent:${a.intent_id}`;
   return "unknown";
 }
@@ -241,7 +251,7 @@ const roleMeta = (ui: UITranslate) =>
   ({
     mainagent: { label: ui("screen.565311dc5e56ac"), icon: UserIcon },
     planner: { label: ui("screen.acd72a15e06e97"), icon: BrainIcon },
-    worker: { label: "Workers", icon: RadioIcon },
+    whitebox_audit: { label: "白盒审计 Agent", icon: ShieldAlertIcon },
     system: { label: ui("screen.dd0bee3359fe82"), icon: HistoryIcon },
   }) as const;
 
@@ -293,11 +303,398 @@ const SYSTEM_SESSION = (ui: UITranslate): Session => ({
   last_activity: "",
 });
 
+const WHITEBOX_AUDIT_SESSION = (live = false, lastActivity = ""): Session => ({
+  id: "s-whitebox-audit",
+  role: "whitebox_audit",
+  title: "白盒审计 Agent",
+  status: live ? "running" : "done",
+  live,
+  last_activity: lastActivity,
+});
+
+function auditWorkerSession(run: TaskCodeAuditRun, ui: UITranslate): Session {
+  const status: SessionStatus =
+    run.status === "running"
+      ? "running"
+      : run.status === "queued"
+        ? "pending"
+        : run.status === "incomplete"
+          ? "paused"
+          : run.status === "failed"
+            ? "blocked"
+            : "done";
+  return {
+    id: `code_audit_run:${run.id}`,
+    role: "audit_worker",
+    title: run.service_name.trim() || ui("screen.taskSessionsAuditWorker"),
+    status,
+    live: run.status === "running",
+    last_activity: run.updated_at,
+    audit_run_id: run.id,
+    audit_scope: run.scope_path.trim() || ".",
+  };
+}
+
+function auditRunStatusLabel(status: TaskCodeAuditRun["status"]): string {
+  switch (status) {
+    case "queued":
+      return "排队中";
+    case "running":
+      return "审计中";
+    case "incomplete":
+      return "未完成";
+    case "failed":
+      return "失败";
+    case "completed":
+      return "已完成";
+  }
+  return "未知状态";
+}
+
+function auditRunConclusion(run: TaskCodeAuditRun): string {
+  const candidates = run.candidates ?? [];
+  const registered = candidates.filter((item) => item.review_status === "published").length;
+  const lowConfidence = candidates.filter(
+    (item) => item.review_status === "published" && item.candidate.registration_tier === "B",
+  ).length;
+  const registeredText = `${registered} 条待确认 Finding（其中 B 级低置信度 ${lowConfidence} 条）`;
+  const incomplete = candidates.filter(
+    (item) => item.review_status === "pending_review" || item.review_status === "incomplete",
+  ).length;
+  const rejected = candidates.filter(
+    (item) => item.review_status === "rejected" || item.review_status === "dismissed",
+  ).length;
+  if (run.status === "queued") return "审计已排队，尚无结论。";
+  if (run.status === "running") return `审计进行中；已登记 ${registeredText}，证据不完整候选 ${incomplete} 条。`;
+  if (run.status === "failed") return `审计失败；此前已登记 ${registeredText}。查看运行过程了解失败原因。`;
+  if (run.status === "incomplete") return `审计未完成；已登记 ${registeredText}，剩余范围需要续跑。`;
+  if (registered > 0) return `已登记 ${registeredText}；静态分析尚未进行动态验证。`;
+  if (incomplete > 0) return `有 ${incomplete} 条候选证据不完整，未登记 Finding；查看候选卡中的缺失项。`;
+  if (rejected > 0) return `${rejected} 条历史候选已拒绝，未登记 Finding。`;
+  return "本轮没有登记符合代码证据要求的漏洞线索；这不等同于证明代码不存在漏洞。";
+}
+
+function AuditRunCoverage({ coverage }: { coverage: NonNullable<TaskCodeAuditRun["coverage"]> }) {
+  const files = coverage.files ?? [];
+  const read = files.filter((file) => file.read).length;
+  const analyzed = files.filter((file) => file.analyzed).length;
+  const missing = files.filter((file) => !file.read || !file.analyzed).length;
+
+  return (
+    <section className="mt-4 space-y-2 rounded-lg border p-3 sm:p-4">
+      <h3 className="font-semibold text-sm">文件覆盖记录</h3>
+      <p className="text-sm">
+        已读取 {read}/{files.length} · 已分析 {analyzed}/{files.length} · 未读取 {files.length - read} · 未分析{" "}
+        {files.length - analyzed} · 未完整覆盖 {missing} 个文件
+      </p>
+      <p className="text-muted-foreground text-xs">
+        收尾扫描：{coverage.sweep_completed ? "已完成" : "未完成"} · 已完成 {coverage.sweep_chunks_completed} 个扫描组
+      </p>
+      {coverage.java_binary ? (
+        <p className="text-muted-foreground text-xs">
+          JavaCodeDB 类审计：已读取 {coverage.java_binary.classes_analyzed}/{coverage.java_binary.class_count} · 已处理{" "}
+          {coverage.java_binary.next_class_index}/{coverage.java_binary.class_count} ·
+          {coverage.java_binary.completed ? "阶段已完成" : "阶段未完成"} · 已完成{" "}
+          {coverage.java_binary.chunks_completed} 个扫描组
+        </p>
+      ) : null}
+      <p className="text-muted-foreground text-xs">读取和分析记录表示处理进度，不代表已排除漏洞。</p>
+      {files.length > 0 ? (
+        <details>
+          <summary className="cursor-pointer text-sm">查看逐文件覆盖记录</summary>
+          <ul className="mt-2 max-h-64 space-y-2 overflow-y-auto text-xs">
+            {files.map((file) => (
+              <li key={file.path} className="rounded-md border p-2">
+                <p className="break-all font-mono">{file.path}</p>
+                <p className="mt-1 text-muted-foreground">
+                  {file.language} · {file.read ? "已读取" : "未读取"} · {file.analyzed ? "已分析" : "未分析"} · 尝试{" "}
+                  {file.attempts} 次 · 已读取 {file.lines_read} 行
+                </p>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </section>
+  );
+}
+
+function AuditRunResultsPanel({
+  run,
+  actionID,
+  onRetry,
+  onStop,
+}: {
+  run: TaskCodeAuditRun;
+  actionID: number | null;
+  onRetry: (run: TaskCodeAuditRun, retry: boolean) => void;
+  onStop: (run: TaskCodeAuditRun) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const candidates = React.useMemo(
+    () =>
+      [...(run.candidates ?? [])].sort((left, right) => {
+        const rank = (item: NonNullable<TaskCodeAuditRun["candidates"]>[number]) =>
+          item.review_status === "published" ? (item.candidate.registration_tier === "B" ? 1 : 0) : 2;
+        return rank(left) - rank(right);
+      }),
+    [run.candidates],
+  );
+  const isBusy = actionID === run.id;
+  const canRetry = run.status === "incomplete" || run.status === "failed";
+  const canStop = run.status === "queued" || run.status === "running";
+
+  return (
+    <>
+      <div className="shrink-0 border-t bg-muted/10 px-3 py-2.5">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs">
+          <Badge variant={run.status === "failed" ? "destructive" : "outline"}>{auditRunStatusLabel(run.status)}</Badge>
+          <span className="text-muted-foreground">
+            已分析文件 {run.files_analyzed}/{run.files_total}
+          </span>
+          <span className="text-muted-foreground">
+            分析组 {run.chunks_completed}/{run.chunks_total}
+          </span>
+          <span className="text-muted-foreground">候选 {run.candidate_count} 条</span>
+          {run.coverage ? (
+            <span className="text-muted-foreground">收尾扫描{run.coverage.sweep_completed ? "已完成" : "未完成"}</span>
+          ) : null}
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {canRetry ? (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={isBusy}
+                onClick={() => onRetry(run, run.status === "failed")}
+              >
+                {isBusy ? <Loader2Icon className="animate-spin" /> : null}
+                {run.status === "failed" ? "重试" : "续跑"}
+              </Button>
+            ) : null}
+            {canStop ? (
+              <Button size="sm" variant="outline" disabled={isBusy} onClick={() => onStop(run)}>
+                {isBusy ? <Loader2Icon className="animate-spin" /> : null}
+                停止审计
+              </Button>
+            ) : null}
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <EyeIcon />
+              查看审计结果
+            </Button>
+          </div>
+        </div>
+        <p
+          className={cn("mt-1.5 truncate text-xs", run.error ? "text-destructive" : "text-muted-foreground")}
+          title={run.error ?? auditRunConclusion(run)}
+        >
+          {run.error ? `失败原因：${run.error}` : `审计结论：${auditRunConclusion(run)}`}
+        </p>
+      </div>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl">
+          <DialogHeader className="shrink-0 border-b px-5 py-4 pe-12">
+            <DialogTitle>白盒审计结果 · {run.service_name}</DialogTitle>
+            <DialogDescription className="break-all">
+              运行 #{run.id} · 版本 {run.version_id} · 范围 {run.scope_path || "."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+            <div className="rounded-lg border bg-muted/20 p-3 sm:p-4">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                <Badge variant={run.status === "failed" ? "destructive" : "outline"}>
+                  {auditRunStatusLabel(run.status)}
+                </Badge>
+                <span>
+                  已分析文件 {run.files_analyzed}/{run.files_total}
+                </span>
+                <span>
+                  分析组 {run.chunks_completed}/{run.chunks_total}
+                </span>
+                <span>
+                  Token {run.used_tokens}/{run.budget_tokens > 0 ? run.budget_tokens : "不限"}
+                </span>
+                <span>候选 {run.candidate_count} 条</span>
+              </div>
+              <p className="mt-3 text-sm font-medium">审计结论</p>
+              <p className="mt-1 text-sm text-muted-foreground">{auditRunConclusion(run)}</p>
+              {run.summary ? <p className="mt-3 whitespace-pre-wrap text-sm">{run.summary}</p> : null}
+              {run.error ? (
+                <p className="mt-2 whitespace-pre-wrap text-sm text-destructive">失败原因：{run.error}</p>
+              ) : null}
+            </div>
+
+            {run.coverage ? (
+              <AuditRunCoverage coverage={run.coverage} />
+            ) : (
+              <p className="mt-4 text-muted-foreground text-xs">此运行未提供逐文件覆盖及收尾扫描记录。</p>
+            )}
+
+            <div className="mb-3 mt-6 flex flex-wrap items-center gap-2">
+              <h3 className="font-semibold">审计候选</h3>
+              <Badge variant="secondary">{candidates.length} 条</Badge>
+            </div>
+            <div className="flex flex-col gap-3">
+              {candidates.map((item) => {
+                const candidate = item.candidate;
+                const source = candidate.source as Record<string, unknown> | undefined;
+                const sink = candidate.sink as Record<string, unknown> | undefined;
+                const flow = Array.isArray(candidate.flow) ? candidate.flow : [];
+                const anchors = Array.isArray(candidate.anchors) ? candidate.anchors : [];
+                const variants = Array.isArray(item.variants) ? item.variants : [];
+                return (
+                  <div key={item.id} className="rounded-lg border bg-background p-3 sm:p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium">{String(candidate.title ?? "审计候选")}</span>
+                      <Badge variant="outline">{String(candidate.severity ?? "unknown")}</Badge>
+                      <Badge variant="outline">
+                        {item.review_status === "published"
+                          ? candidate.registration_tier === "B"
+                            ? "B 级低置信度 · 待确认"
+                            : "A 级 Finding · 待确认"
+                          : item.review_status === "rejected" || item.review_status === "dismissed"
+                            ? "已拒绝"
+                            : item.review_status === "incomplete"
+                              ? "证据不完整 · 未登记"
+                              : "历史待处理"}
+                      </Badge>
+                      {variants.length > 1 ? (
+                        <Badge variant="secondary">已归并 {variants.length} 个候选变体</Badge>
+                      ) : null}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground text-xs">
+                      {typeof candidate.category === "string" && candidate.category ? (
+                        <span>候选原始类别：{candidate.category}</span>
+                      ) : null}
+                      {typeof candidate.language === "string" && candidate.language ? (
+                        <span>语言：{candidate.language}</span>
+                      ) : null}
+                      {typeof candidate.cwe === "string" && candidate.cwe ? <span>CWE：{candidate.cwe}</span> : null}
+                    </div>
+                    {item.review_status === "published" && candidate.registration_tier === "B" ? (
+                      <div className="mt-3 rounded-md border px-3 py-2.5 text-sm">
+                        <p className="font-semibold">低置信度原因 · 报告不自动生成</p>
+                        <ul className="mt-1 list-disc space-y-1 pl-5">
+                          {(Array.isArray(candidate.validation_issues) ? candidate.validation_issues : []).map(
+                            (issue) => (
+                              <li key={String(issue)}>{String(issue)}</li>
+                            ),
+                          )}
+                        </ul>
+                      </div>
+                    ) : null}
+                    {item.review_status === "incomplete" || item.review_status === "pending_review" ? (
+                      <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 text-sm text-amber-950 dark:text-amber-100">
+                        <p className="font-semibold">未登记原因</p>
+                        <p className="mt-1 whitespace-pre-wrap">
+                          {item.reviewer_summary?.trim() || "后台没有返回具体校验理由。"}
+                        </p>
+                      </div>
+                    ) : null}
+                    {source?.file || sink?.file ? (
+                      <p className="mt-3 break-all font-mono text-xs sm:text-sm">
+                        Source {String(source?.file ?? "?")}:{String(source?.line ?? "?")} → Sink{" "}
+                        {String(sink?.file ?? "?")}:{String(sink?.line ?? "?")}
+                      </p>
+                    ) : null}
+                    {anchors.length > 0 ? (
+                      <div className="mt-2 rounded-md bg-muted/40 p-2.5">
+                        <p className="mb-1 text-xs font-medium text-muted-foreground">关键代码位置</p>
+                        <p className="whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
+                          {anchors
+                            .map((anchor) => {
+                              const row = anchor as Record<string, unknown>;
+                              return `[${String(row.role ?? "")}] ${String(row.file ?? "?")}:${String(row.line ?? "?")} ${String(row.symbol ?? "")}`;
+                            })
+                            .join(" → ")}
+                        </p>
+                      </div>
+                    ) : null}
+                    {flow.length > 0 ? (
+                      <div className="mt-2 rounded-md bg-muted/40 p-2.5">
+                        <p className="mb-1 text-xs font-medium text-muted-foreground">污点传播路径</p>
+                        <p className="whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
+                          {flow
+                            .map((step) => {
+                              const row = step as Record<string, unknown>;
+                              return `${String(row.file ?? "?")}:${String(row.line ?? "?")} ${String(row.symbol ?? "")} ${String(row.propagation ?? "")}`;
+                            })
+                            .join(" → ")}
+                        </p>
+                      </div>
+                    ) : null}
+                    {typeof candidate.why_unobstructed === "string" ? (
+                      <p className="mt-2 whitespace-pre-wrap text-sm">无有效阻断：{candidate.why_unobstructed}</p>
+                    ) : null}
+                    {typeof candidate.exploitability === "string" ? (
+                      <p className="mt-2 whitespace-pre-wrap text-sm">可利用条件：{candidate.exploitability}</p>
+                    ) : null}
+                    {item.reviewer_summary &&
+                    item.review_status !== "incomplete" &&
+                    item.review_status !== "pending_review" ? (
+                      <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">
+                        未登记原因：{item.reviewer_summary}
+                      </p>
+                    ) : null}
+                    {item.verification_summary ? (
+                      <p className="mt-2 whitespace-pre-wrap text-sm">登记信息：{item.verification_summary}</p>
+                    ) : null}
+                    {variants.length > 1 ? (
+                      <details className="mt-3 rounded-md border bg-muted/30 px-3 py-2">
+                        <summary className="cursor-pointer select-none text-sm font-medium">
+                          查看候选变体及校验原因
+                        </summary>
+                        <div className="mt-3 flex flex-col gap-3">
+                          {variants.map((variant, variantIndex) => {
+                            const variantCandidate = variant.candidate ?? {};
+                            const variantSource = variantCandidate.source as Record<string, unknown> | undefined;
+                            const variantSink = variantCandidate.sink as Record<string, unknown> | undefined;
+                            return (
+                              <div key={`${item.id}-variant-${variantIndex}`} className="border-l-2 pl-3 text-sm">
+                                <p className="font-medium">
+                                  变体 {variantIndex + 1}
+                                  {variant.analysis_chunk ? ` · 分析组 ${variant.analysis_chunk}` : ""}
+                                </p>
+                                <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                                  Source {String(variantSource?.file ?? "?")}:{String(variantSource?.line ?? "?")} →
+                                  Sink {String(variantSink?.file ?? "?")}:{String(variantSink?.line ?? "?")}
+                                </p>
+                                {variant.validation_issues?.length ? (
+                                  <ul className="mt-1 list-disc pl-5 text-amber-900 dark:text-amber-100">
+                                    {variant.validation_issues.map((issue, issueIndex) => (
+                                      <li key={`${item.id}-variant-${variantIndex}-issue-${issueIndex}`}>{issue}</li>
+                                    ))}
+                                  </ul>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </details>
+                    ) : null}
+                  </div>
+                );
+              })}
+              {candidates.length === 0 ? (
+                <p className="rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
+                  当前运行没有待展示的审计候选。
+                </p>
+              ) : null}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 // keyForSession maps a UI Session → its stable store key (main:<seg> | plan | intent:<id>).
 function keyForSession(s: Session): string {
   if (s.role === "mainagent") return `main:${s.seg ?? 0}`;
   if (s.role === "planner") return "plan";
   if (s.role === "system") return "system";
+  if (isWhiteboxAuditWorker(s.role)) return "whitebox_audit";
+  if (s.role === "audit_worker") return `code_audit_run:${s.audit_run_id}`;
   return `intent:${s.intent_id}`;
 }
 
@@ -366,7 +763,7 @@ function SessionItem({
 
   const icon = deleted ? (
     <Trash2Icon className="size-3.5 text-destructive" />
-  ) : s.role === "worker" ? (
+  ) : s.role === "worker" || s.role === "audit_worker" ? (
     statusIcon(s.status)
   ) : s.live ? (
     <Loader2Icon className="size-3.5 animate-spin text-blue-500" />
@@ -378,6 +775,10 @@ function SessionItem({
     !deleted &&
     // pending = 待领(open)意图;连同运行中/已暂停都允许删除。
     (s.status === "running" || s.status === "paused" || s.status === "pending");
+  let auditSubtitle: string | undefined;
+  if (s.audit_scope === ".") auditSubtitle = ui("screen.taskSessionsAuditWorkerWholeService");
+  else if (s.audit_scope) auditSubtitle = ui("screen.taskSessionsAuditWorkerScope", { v0: s.audit_scope });
+
   return (
     <div
       className={cn(
@@ -396,16 +797,22 @@ function SessionItem({
             #{s.intent_id}
           </span>
         )}
+        {s.audit_run_id && (
+          <span className="shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">
+            #{s.audit_run_id}
+          </span>
+        )}
         {s.inherited && s.source_task_id && (
           <Badge variant="outline" className="shrink-0">
             {ui("screen.3afe69a08aa62f")}
             {s.source_task_id}
           </Badge>
         )}
-        <span
-          className={cn("min-w-0 flex-1 truncate text-sm font-medium", deleted && "text-muted-foreground line-through")}
-        >
-          {displayTitle}
+        <span className="flex min-w-0 flex-1 flex-col" title={auditSubtitle && `${displayTitle} · ${auditSubtitle}`}>
+          <span className={cn("truncate font-medium text-sm", deleted && "text-muted-foreground line-through")}>
+            {displayTitle}
+          </span>
+          {auditSubtitle && <span className="truncate text-muted-foreground text-xs">{auditSubtitle}</span>}
         </span>
         {deleted && (
           <Badge variant="outline" className="shrink-0 border-destructive/40 text-destructive">
@@ -498,7 +905,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
   const [linkedSession, setLinkedSession] = React.useState<Session>();
   const hasRequestedSession = React.useRef(false);
-  hasRequestedSession.current = /^(intent:[1-9]\d*|main:\d+|plan)$/.test(requestedSession);
+  hasRequestedSession.current =
+    /^(intent:[1-9]\d*|main:\d+|plan|whitebox_(?:java_)?audit|code_audit_run:[1-9]\d*)$/.test(requestedSession);
   React.useEffect(() => {
     let session: Session | undefined;
     if (/^intent:[1-9]\d*$/.test(requestedSession)) {
@@ -516,6 +924,19 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       const seg = Number(requestedSession.slice(5));
       session = { ...MAIN_SESSION(liveUI), id: mainSessionId(seg), seg, title: mainSessionTitle(seg, liveUI) };
     } else if (requestedSession === "plan") session = PLANNER_SESSION(liveUI);
+    else if (isWhiteboxAuditWorker(requestedSession)) session = WHITEBOX_AUDIT_SESSION(false, "");
+    else if (/^code_audit_run:[1-9]\d*$/.test(requestedSession)) {
+      const runID = Number(requestedSession.slice("code_audit_run:".length));
+      session = {
+        id: requestedSession,
+        role: "audit_worker",
+        audit_run_id: runID,
+        title: liveUI("screen.taskSessionsAuditWorker"),
+        status: "done",
+        live: false,
+        last_activity: "",
+      };
+    }
     setLinkedSession(session);
     if (session) setActiveId(session.id);
   }, [requestedSession, liveUI]);
@@ -569,8 +990,16 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const [loadingOlderIntents, setLoadingOlderIntents] = React.useState(false);
   const [input, setInput] = React.useState("");
   const [sending, setSending] = React.useState(false);
+  const [auditAgentMessage, setAuditAgentMessage] = React.useState("");
+  const [auditAgentSending, setAuditAgentSending] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
   const [mainChatRunning, setMainChatRunning] = React.useState<boolean | null>(null);
+  const [auditAgentRunning, setAuditAgentRunning] = React.useState(false);
+  const [auditSourceAcknowledged, setAuditSourceAcknowledged] = React.useState(false);
+  const [auditCodeServices, setAuditCodeServices] = React.useState<TaskCodeService[]>([]);
+  const [auditRuns, setAuditRuns] = React.useState<TaskCodeAuditRun[]>([]);
+  const [selectedAuditServiceID, setSelectedAuditServiceID] = React.useState<number | null>(null);
+  const [auditRunActionID, setAuditRunActionID] = React.useState<number | null>(null);
   const [controllingIntent, setControllingIntent] = React.useState<string | null>(null);
   const [cancelIntent, setCancelIntent] = React.useState<Session | null>(null);
   const [cancelReason, setCancelReason] = React.useState("");
@@ -669,9 +1098,11 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     [controllingIntent, patchIntentState, taskId, liveUI],
   );
 
-  // SSE connection state — surfaced so a dropped realtime link is visible, never
-  // silently shown as "no messages".
-  const [sseLive, setSseLive] = React.useState(false);
+  const [streamState, setStreamState] = React.useState<TaskSessionStreamState>({
+    status: "loading",
+    stage: "sessions",
+  });
+  const streamRef = React.useRef<ReturnType<typeof startTaskSessionStream> | null>(null);
   // Whole-task token total (all agents), polled from the backend aggregate.
   const [taskTokens, setTaskTokens] = React.useState<TokenTotal | null>(null);
   const [sessionTokens, setSessionTokens] = React.useState<Record<string, SessionTokenUsage>>({});
@@ -680,8 +1111,6 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
 
   // Refs backing SSE/loading without re-render churn.
-  const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
-  const esRef = React.useRef<EventSource | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
   const llmToastSeqRef = React.useRef<Set<number>>(new Set());
@@ -759,7 +1188,6 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
         .activityHistory(taskId, key, 0, PAGE)
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
-          if (r.snapshotCursor > snapshotRef.current) snapshotRef.current = r.snapshotCursor;
           patchStore(key, (s) => {
             const items = mergeBySeq(r.items, s.items); // keep any live frames arrived meanwhile
             return {
@@ -840,6 +1268,51 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     return () => {
       alive = false;
       clearInterval(t);
+    };
+  }, [taskId]);
+
+  React.useEffect(() => {
+    let alive = true;
+    setAuditAgentRunning(false);
+    const load = () =>
+      api
+        .taskCodeAuditAgentChatStatus(taskId)
+        .then(({ running }) => {
+          if (alive) setAuditAgentRunning(running);
+        })
+        .catch(() => {
+          // Status polling is best-effort; the task SSE still shows activity.
+        });
+    void load();
+    const timer = setInterval(load, 2000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [taskId]);
+
+  React.useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const codeServices = await api.taskCodeServices(taskId);
+        if (!alive) return;
+        setAuditCodeServices(codeServices.services);
+        const availableIDs = new Set(
+          codeServices.services
+            .filter((service) => service.decision === "confirmed" && service.latest_present)
+            .map((service) => service.id),
+        );
+        setSelectedAuditServiceID((current) => (current && availableIDs.has(current) ? current : null));
+      } catch {
+        // Keep the last service list until the next poll.
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 10_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
     };
   }, [taskId]);
 
@@ -928,11 +1401,9 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     setTaskTokens(null);
     setSessionTokens({});
     setLLMResolutions(null);
-    setSseLive(false);
     if (!hasRequestedSession.current) setActiveId(MAIN_ID); // preserve an explicit session deep link
     setMainSegs([{ seq: 0, created_at: "" }]);
     setCurrentSeg(0);
-    snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
     // Reserve the initial main key so the active-session effect (which fires for main on
@@ -964,40 +1435,39 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
           buckets.system ??= { ...emptyState(), loaded: true };
           setStore(buckets);
         })
-        .catch(() =>
+        .catch(() => {
+          if (!alive) return;
           setStore({
             [mainSessionKey(0)]: { ...emptyState(), loaded: true },
             system: { ...emptyState(), loaded: true },
-          }),
-        );
+          });
+        });
       return () => {
         alive = false;
       };
     }
 
-    const token = (reqTokenRef.current.mainboot ?? 0) + 1;
-    reqTokenRef.current.mainboot = token;
     let bootKey = mainSessionKey(0);
-    // Resolve the main-agent segments first, then load the CURRENT segment's history and
-    // open the SSE from its snapshot cursor. The SSE tails all segments and routes each
-    // frame by session_key (main:<seg>), so switching segments needs no new stream.
-    api
-      .mainSessions(taskId)
-      .then((ms) => {
-        if (!alive || reqTokenRef.current.mainboot !== token) throw new Error("superseded");
-        const segs = ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }];
-        setMainSegs(segs);
+    const controller = startTaskSessionStream({
+      async loadSessions(signal) {
+        const ms = await api.mainSessions(taskId, signal);
+        signal.throwIfAborted();
+        setMainSegs(ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }]);
         setCurrentSeg(ms.current);
-        bootKey = mainSessionKey(ms.current);
-        if (bootKey !== mainSessionKey(0)) loadingKeysRef.current.delete(mainSessionKey(0));
-        loadingKeysRef.current.add(bootKey);
-        if (!hasRequestedSession.current) setActiveId(mainSessionId(ms.current));
-        patchStore(bootKey, (s) => ({ ...s, loading: true }));
-        return api.activityHistory(taskId, bootKey, 0, PAGE);
-      })
-      .then((r) => {
-        if (!alive || reqTokenRef.current.mainboot !== token) return;
-        snapshotRef.current = r.snapshotCursor;
+        const key = mainSessionKey(ms.current);
+        if (key !== bootKey) {
+          loadingKeysRef.current.delete(bootKey);
+          patchStore(bootKey, (state) => ({ ...state, loading: false }));
+          bootKey = key;
+          loadingKeysRef.current.add(bootKey);
+        }
+        if (!hasRequestedSession.current) {
+          setActiveId((selected) => (selected === MAIN_ID ? mainSessionId(ms.current) : selected));
+        }
+      },
+      async loadHistory(signal) {
+        const r = await api.activityHistory(taskId, bootKey, 0, PAGE, signal);
+        signal.throwIfAborted();
         patchStore(bootKey, (s) => {
           const items = mergeBySeq(r.items, s.items);
           return {
@@ -1008,90 +1478,81 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             hasMore: r.hasMore,
             earliestSeq: items.length ? items[0].seq : 0,
             unread: 0,
+            error: undefined,
           };
         });
-        // Open the single task SSE from the snapshot cursor.
-        const es = openSSE(
-          `/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`,
-        );
-        esRef.current = es;
-        es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false); // EventSource auto-reconnects; DB compensates the gap
-        es.onmessage = (e) => {
-          let a: Activity;
-          try {
-            a = JSON.parse(e.data) as Activity;
-          } catch {
-            return; // ignore malformed frame
+        loadingKeysRef.current.delete(bootKey);
+        return r.snapshotCursor;
+      },
+      openStream: (since) =>
+        openSSE(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${since}`),
+      onState(state) {
+        setStreamState(state);
+        if (state.status === "loading") {
+          patchStore(bootKey, (s) => ({ ...s, loading: true, error: undefined }));
+        } else if (state.status === "failed" && state.stage !== "stream") {
+          patchStore(bootKey, (s) => ({ ...s, loading: false }));
+        }
+      },
+      onActivity(a) {
+        if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
+          llmToastSeqRef.current.add(a.seq);
+          const transition = a.metadata?.llm_transition;
+          if (transition?.mode === "exhausted" || a.is_error) {
+            toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+          } else if (transition?.mode === "automatic") {
+            toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+          } else {
+            toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
           }
-          if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
-            llmToastSeqRef.current.add(a.seq);
-            const transition = a.metadata?.llm_transition;
-            if (transition?.mode === "exhausted" || a.is_error) {
-              toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else if (transition?.mode === "automatic") {
-              toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else {
-              toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            }
-            void api
-              .taskLLMResolution(taskId)
-              .then((value) => {
-                if (alive) setLLMResolutions(value);
-              })
-              .catch(() => {
-                // The periodic resolver poll will retry if this event-triggered refresh fails.
-              });
+          void api
+            .taskLLMResolution(taskId)
+            .then((value) => {
+              if (alive) setLLMResolutions(value);
+            })
+            .catch(() => {
+              // The periodic resolver poll will retry if this event-triggered refresh fails.
+            });
+        }
+        const k = sessionKeyOf(a);
+        setStore((prev) => {
+          const cur = prev[k] ?? emptyState();
+          const activeK = activeKeyRef.current;
+          // Merge into sessions that are loaded, actively loading, or the current
+          // view (so returning is instant + a frame that lands mid-load isn't lost).
+          // A cold, inactive session also keeps a tiny accounting tail so the
+          // sidebar can add the latest unfinished usage without loading history.
+          if (!cur.loaded && !cur.loading && k !== activeK) {
+            const accountingItems =
+              a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
+            return {
+              ...prev,
+              [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
+            };
           }
-          const k = sessionKeyOf(a);
-          setStore((prev) => {
-            const cur = prev[k] ?? emptyState();
-            const activeK = activeKeyRef.current;
-            // Merge into sessions that are loaded, actively loading, or the current
-            // view (so returning is instant + a frame that lands mid-load isn't lost).
-            // A cold, inactive session also keeps a tiny accounting tail so the
-            // sidebar can add the latest unfinished usage without loading history.
-            if (!cur.loaded && !cur.loading && k !== activeK) {
-              const accountingItems =
-                a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-              return {
-                ...prev,
-                [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-              };
-            }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
-            let hasMore = cur.hasMore;
-            let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
-              hasMore = true;
-              earliestSeq = items[0].seq;
-            }
-            const unread = k === activeK ? 0 : cur.unread + 1;
-            return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
-          });
-        };
-      })
-      .catch((err) => {
-        if (!alive || reqTokenRef.current.mainboot !== token) return;
-        if ((err as Error).message === "superseded") return;
-        patchStore(bootKey, (s) => ({
-          ...s,
-          loading: false,
-          error: (err as Error).message || liveUI("screen.d1d044826a45ef"),
-        }));
-      })
-      .finally(() => loadingKeysRef.current.delete(bootKey));
-
+          let items = mergeBySeq(cur.items, [a]);
+          // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
+          // but never while the user is reading this session's history (scrolled up).
+          let hasMore = cur.hasMore;
+          let earliestSeq = cur.earliestSeq;
+          const trimmable = k !== activeK || atBottomRef.current;
+          if (trimmable && items.length > MAX_KEEP) {
+            items = items.slice(items.length - MAX_KEEP);
+            hasMore = true;
+            earliestSeq = items[0].seq;
+          }
+          const unread = k === activeK ? 0 : cur.unread + 1;
+          return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
+        });
+      },
+    });
+    streamRef.current = controller;
     return () => {
       alive = false;
-      esRef.current?.close();
-      esRef.current = null;
+      controller.close();
+      streamRef.current = null;
     };
-  }, [taskId, patchStore, liveUI]);
+  }, [taskId, patchStore]);
 
   React.useEffect(() => {
     let active = true;
@@ -1193,6 +1654,52 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   }, [intentAssets]);
 
   const workerSessions = React.useMemo(() => allIntents.map(intentToSession), [allIntents]);
+  const { auditWorkerSessions, latestAuditActivityRunID } = React.useMemo(() => {
+    const byID = new Map(auditRuns.map((run) => [run.id, auditWorkerSession(run, ui)]));
+    let latestAuditActivityRunID = 0;
+    for (const [key, state] of Object.entries(store)) {
+      if (!key.startsWith("code_audit_run:")) continue;
+      const runID = Number(key.slice("code_audit_run:".length));
+      if (!Number.isInteger(runID) || runID <= 0) continue;
+      latestAuditActivityRunID = Math.max(latestAuditActivityRunID, runID);
+      if (byID.has(runID)) continue;
+      const latest = state.items[state.items.length - 1];
+      const terminal = latest?.kind === "result" || (latest?.kind === "text" && latest.is_error);
+      byID.set(runID, {
+        id: key,
+        role: "audit_worker",
+        title: ui("screen.taskSessionsAuditWorker"),
+        status: terminal ? (latest?.is_error ? "blocked" : "done") : "running",
+        live: !terminal && Date.now() - Date.parse(state.lastTs) < STREAM_WINDOW_MS,
+        last_activity: state.lastTs,
+        audit_run_id: runID,
+      });
+    }
+    return {
+      auditWorkerSessions: [...byID.values()].sort((a, b) => (b.audit_run_id ?? 0) - (a.audit_run_id ?? 0)),
+      latestAuditActivityRunID,
+    };
+  }, [auditRuns, store, ui]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: restart the poll when a new Worker appears in the stream.
+  React.useEffect(() => {
+    let alive = true;
+    const load = () =>
+      api
+        .taskCodeAudits(taskId)
+        .then((runs) => {
+          if (alive) setAuditRuns(runs);
+        })
+        .catch(() => {
+          // The next poll retries without interrupting the transcript.
+        });
+    void load();
+    const timer = setInterval(load, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [taskId, latestAuditActivityRunID]);
   const intentsHasMore = hasLoadedOlderIntentsPage ? olderIntentsHasMore : firstIntentsHasMore;
 
   // For each worker session (intent), derive the display title from the intent
@@ -1294,20 +1801,43 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     const items = [
       ...mainSessions,
       { ...PLANNER_SESSION(ui), live: plannerLive },
+      WHITEBOX_AUDIT_SESSION(auditAgentRunning, store.whitebox_audit?.lastTs ?? ""),
+      ...auditWorkerSessions,
       ...workerSessions,
       SYSTEM_SESSION(ui),
     ];
     const located = focusSession ?? retainedSession ?? linkedSession;
     if (located && !items.some((s) => s.id === located.id)) items.push(located);
     return items;
-  }, [mainSessions, workerSessions, plannerLive, focusSession, retainedSession, linkedSession, ui]);
+  }, [
+    mainSessions,
+    workerSessions,
+    auditWorkerSessions,
+    plannerLive,
+    auditAgentRunning,
+    store.whitebox_audit?.lastTs,
+    focusSession,
+    retainedSession,
+    linkedSession,
+    ui,
+  ]);
 
   const grouped = {
     mainagent: sessions.filter((s) => s.role === "mainagent"),
     planner: sessions.filter((s) => s.role === "planner"),
-    worker: sessions.filter((s) => s.role === "worker"),
+    whitebox_audit: sessions.filter((s) => isWhiteboxAuditWorker(s.role)),
     system: sessions.filter((s) => s.role === "system"),
   };
+  const activeWorkers: Session[] = [];
+  const archivedWorkers: Session[] = [];
+  for (const session of sessions) {
+    if (session.role !== "worker" && session.role !== "audit_worker") continue;
+    if (session.status === "running" || session.status === "paused") {
+      activeWorkers.push(session);
+    } else {
+      archivedWorkers.push(session);
+    }
+  }
 
   const active = sessions.find((s) => s.id === activeId) ?? MAIN_SESSION(ui);
   const side = useSideQuestions(
@@ -1318,6 +1848,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
         : null,
   );
   const isMain = active.role === "mainagent";
+  const isAuditAgent = isWhiteboxAuditWorker(active.role);
+  const isAuditWorker = active.role === "audit_worker";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
   const activeKey = keyForSession(active);
@@ -1331,9 +1863,19 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const activeSettled =
     !!activeLast && (activeLast.kind === "result" || (activeLast.kind === "text" && activeLast.is_error));
   const mainBusy = isMain && (sending || (!activeSettled && (mainChatRunning ?? recentLive(activeKey))));
+  const auditAgentBusy =
+    isAuditAgent && (auditAgentSending || auditAgentRunning || (!activeSettled && recentLive(activeKey)));
   // 折叠态（手机端）标题栏要替代整张列表：显示当前会话名 + 其它会话的未读合计，
   // 否则收起后既不知道自己在看哪个会话，也看不到别处有新消息。
   const activeDisplayTitle = (active.role === "worker" ? sessionMeta.get(active.id)?.title : "") || active.title;
+  const activeAuditRun = isAuditWorker ? auditRuns.find((run) => run.id === active.audit_run_id) : undefined;
+  const latestAuditRun = auditRuns.reduce<TaskCodeAuditRun | undefined>(
+    (latest, run) => (!latest || run.id > latest.id ? run : latest),
+    undefined,
+  );
+  const latestIncompleteCandidates = (latestAuditRun?.candidates ?? []).filter(
+    (item) => item.review_status === "incomplete" || item.review_status === "pending_review",
+  );
   const hiddenUnread = React.useMemo(
     () => Object.entries(store).reduce((sum, [key, s]) => (key === activeKey ? sum : sum + s.unread), 0),
     [store, activeKey],
@@ -1387,7 +1929,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     // persisted+broadcast by the backend BEFORE it returns, so it arrives over the
     // same SSE stream (worker="mainagent") as every agent step — no client-side
     // optimistic echo, hence no fabricated seq that could collide with real DB ids.
-    if (isMain) return items;
+    if (isMain || isAuditAgent || isAuditWorker) return items;
     if (isPlanner || isSystem) return items;
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
@@ -1404,6 +1946,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     return [intentMsg, ...items];
   }, [
     isMain,
+    isAuditAgent,
+    isAuditWorker,
     isPlanner,
     isSystem,
     activeState,
@@ -1539,7 +2083,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   function stop() {
     if (stopping) return;
     setStopping(true);
-    void api.stopChat(taskId).finally(() => setStopping(false));
+    const request = isAuditAgent ? api.stopTaskCodeAuditAgentChat(taskId) : api.stopChat(taskId);
+    void request.finally(() => setStopping(false));
   }
 
   function send() {
@@ -1567,6 +2112,49 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
         toast.error(ui("screen.21e2615f9d508d", { v0: (e as Error).message || ui("screen.9ba4b48c2d1830") }));
       })
       .finally(() => setSending(false));
+  }
+
+  function sendAuditAgent() {
+    const text = auditAgentMessage.trim();
+    if (!text || auditAgentSending || auditAgentRunning) return;
+    setAuditAgentMessage("");
+    setAuditAgentSending(true);
+    api
+      .taskCodeAuditAgentChat(taskId, text, auditSourceAcknowledged, selectedAuditServiceID ?? undefined)
+      .then(() => setAuditAgentRunning(true))
+      .catch((error) => {
+        setAuditAgentMessage(text);
+        toast.error(ui("screen.21e2615f9d508d", { v0: (error as Error).message || ui("screen.9ba4b48c2d1830") }));
+      })
+      .finally(() => setAuditAgentSending(false));
+  }
+
+  async function requeueAuditRun(run: TaskCodeAuditRun, retry: boolean) {
+    setAuditRunActionID(run.id);
+    try {
+      const additional = run.budget_tokens > 0 ? 50000 : 0;
+      if (retry) await api.retryTaskCodeAudit(taskId, run.id, additional);
+      else await api.resumeTaskCodeAudit(taskId, run.id, additional);
+      toast.success(run.budget_tokens > 0 ? "已追加 50,000 Token 并加入队列" : "预算不限，已加入审计队列");
+      setAuditRuns(await api.taskCodeAudits(taskId));
+    } catch (error) {
+      toast.error(`无法${retry ? "重试" : "续跑"}审计：${(error as Error).message}`);
+    } finally {
+      setAuditRunActionID(null);
+    }
+  }
+
+  async function stopAuditRun(run: TaskCodeAuditRun) {
+    setAuditRunActionID(run.id);
+    try {
+      const result = await api.stopTaskCodeAudit(taskId, run.id);
+      toast.success(result.status === "stopped" ? "已停止排队中的审计" : "正在停止审计，将在当前步骤结束后保存检查点");
+      setAuditRuns(await api.taskCodeAudits(taskId));
+    } catch (error) {
+      toast.error(`无法停止审计：${(error as Error).message}`);
+    } finally {
+      setAuditRunActionID(null);
+    }
   }
 
   function sendWorkerChat() {
@@ -1600,10 +2188,34 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const mainLoaded = !!store[currentMainKey]?.loaded;
   // 发送键位由系统设置决定（localStorage），默认 Enter 发送。
   const sendMode = useChatSendMode();
+  const streamLive = streamState.status === "live";
+  const streamFailed = streamState.status === "failed";
+  let streamTitle: string | undefined;
+  if (streamFailed) streamTitle = streamState.error;
+  if (streamLive) streamTitle = ui("screen.fa6a37f8021e59");
+  if (streamState.status === "reconnecting") streamTitle = ui("screen.47e5803d19ab15");
+  const streamLabel =
+    streamState.status === "failed"
+      ? ui(
+          {
+            sessions: "screen.taskSessionsListFailed",
+            history: "screen.taskSessionsHistoryFailed",
+            stream: "screen.taskSessionsStreamFailed",
+          }[streamState.stage],
+        )
+      : ui(
+          {
+            loading: "screen.taskSessionsLoading",
+            connecting: "screen.taskSessionsConnecting",
+            live: "screen.c69ec2ffb0db8c",
+            reconnecting: "screen.ab7e3afbecbdaf",
+          }[streamState.status],
+        );
   // What the transcript pane should show for the active session.
   const showLoader = !activeState || (activeState.loading && !activeState.loaded);
   const resolutionForSession = (session: Session): TaskLLMResolution | undefined => {
     if (!llmResolutions || session.inherited || session.role === "system") return undefined;
+    if (isWhiteboxAuditWorker(session.role) || session.role === "audit_worker") return undefined;
     if (session.role === "mainagent") return llmResolutions.mainagent;
     if (session.role === "planner") return llmResolutions.planner;
     return llmResolutions.worker;
@@ -1611,6 +2223,34 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const activeResolution = resolutionForSession(active);
   const activeAssets =
     active.role === "worker" && active.intent_id ? intentAssetsByID.get(active.intent_id) : undefined;
+  const archivedUnread = archivedWorkers.reduce(
+    (sum, session) => (session.id === activeId ? sum : sum + (store[keyForSession(session)]?.unread ?? 0)),
+    0,
+  );
+
+  function renderSessionItem(session: Session) {
+    const meta = session.role === "worker" ? sessionMeta.get(session.id) : undefined;
+    return (
+      <SessionItem
+        key={session.id}
+        s={session}
+        active={session.id === activeId}
+        displayTitle={meta?.title ?? session.title}
+        hasPending={hasPendingForSession(session)}
+        unread={store[keyForSession(session)]?.unread}
+        onClick={() => {
+          approvalFocus.close();
+          setActiveId(session.id);
+          setListOpen(false); // 手机端选完即收起，把高度还给会话记录
+          setWorkerMessage("");
+          setWorkerMessageRequestId("");
+        }}
+        controlling={controllingIntent === session.intent_id}
+        deleted={meta?.deleted}
+        onCancel={() => setCancelIntent(session)}
+      />
+    );
+  }
 
   return (
     <TooltipProvider delayDuration={300}>
@@ -1653,25 +2293,32 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 )}
               </button>
               {!MOCK && (
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1 text-[10px]",
-                    sseLive ? "text-emerald-500" : "text-amber-500",
+                <div className="flex flex-wrap items-center gap-1">
+                  <span
+                    role="status"
+                    className={cn(
+                      "inline-flex items-center gap-1 text-[10px]",
+                      streamLive ? "text-emerald-500" : "text-amber-500",
+                    )}
+                    title={streamTitle}
+                  >
+                    {streamLive && <span className="size-1 animate-pulse rounded-full bg-emerald-500" />}
+                    {streamFailed && <WifiOffIcon className="size-3" />}
+                    {!streamLive && !streamFailed && <Loader2Icon className="size-3 animate-spin" />}
+                    {streamLabel}
+                  </span>
+                  {streamFailed && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-5 px-1 text-[10px]"
+                      onClick={() => streamRef.current?.retry()}
+                    >
+                      {ui("screen.b8784c8dd5636f")}
+                    </Button>
                   )}
-                  title={sseLive ? ui("screen.fa6a37f8021e59") : ui("screen.47e5803d19ab15")}
-                >
-                  {sseLive ? (
-                    <>
-                      <span className="size-1 animate-pulse rounded-full bg-emerald-500" />
-                      {ui("screen.c69ec2ffb0db8c")}
-                    </>
-                  ) : (
-                    <>
-                      <WifiOffIcon className="size-3" />
-                      {ui("screen.ab7e3afbecbdaf")}
-                    </>
-                  )}
-                </span>
+                </div>
               )}
             </div>
             {taskTokens && (
@@ -1706,7 +2353,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             )}
           >
             <div className="flex w-full flex-col gap-3 p-2">
-              {(["mainagent", "planner", "system", "worker"] as const).map((role) => {
+              {(["mainagent", "planner", "whitebox_audit", "system"] as const).map((role) => {
                 const items = grouped[role];
                 if (!items.length) return null;
                 const Meta = roleMeta(ui)[role];
@@ -1733,51 +2380,68 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                         </button>
                       )}
                     </div>
-                    {items.map((s) => {
-                      const meta = s.role === "worker" ? sessionMeta.get(s.id) : undefined;
-                      return (
-                        <SessionItem
-                          key={s.id}
-                          s={s}
-                          active={s.id === activeId}
-                          displayTitle={meta?.title ?? s.title}
-                          hasPending={hasPendingForSession(s)}
-                          unread={store[keyForSession(s)]?.unread}
-                          onClick={() => {
-                            approvalFocus.close();
-                            setActiveId(s.id);
-                            setListOpen(false); // 手机端选完即收起，把高度还给会话记录
-                            setWorkerMessage("");
-                            setWorkerMessageRequestId("");
-                          }}
-                          controlling={controllingIntent === s.intent_id}
-                          deleted={meta?.deleted}
-                          onCancel={() => {
-                            setCancelIntent(s);
-                          }}
-                        />
-                      );
-                    })}
-                    {role === "worker" && intentsHasMore && (
-                      <button
-                        type="button"
-                        onClick={loadOlderIntents}
-                        disabled={loadingOlderIntents}
-                        className="mt-0.5 flex items-center justify-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent/50"
-                      >
-                        {loadingOlderIntents ? (
-                          <Loader2Icon className="size-3.5 animate-spin" />
-                        ) : (
-                          <RotateCwIcon className="size-3.5" />
-                        )}
-                        {ui("screen.279a6ac7544928")}
-                      </button>
-                    )}
+                    {items.map(renderSessionItem)}
                   </div>
                 );
               })}
-              {mainLoaded && !workerSessions.length && (
-                <div className="px-2 py-1 text-xs text-muted-foreground">{ui("screen.20785247ce9fea")}</div>
+              {(mainLoaded || activeWorkers.length > 0 || archivedWorkers.length > 0 || intentsHasMore) && (
+                <div className="flex flex-col gap-0.5">
+                  <div className="flex items-center gap-1.5 px-2 py-1 font-medium text-muted-foreground text-xs">
+                    <RadioIcon className="size-3.5" />
+                    Workers
+                  </div>
+                  {activeWorkers.map(renderSessionItem)}
+                  {mainLoaded && activeWorkers.length === 0 && (
+                    <div className="px-2 py-1 text-muted-foreground text-xs">
+                      {ui("screen.taskSessionsNoActiveWorkers")}
+                    </div>
+                  )}
+                  {(archivedWorkers.length > 0 || intentsHasMore) && (
+                    <Collapsible>
+                      <CollapsibleTrigger
+                        className={cn(
+                          "group flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left font-medium text-muted-foreground text-xs hover:bg-accent/50 hover:text-foreground",
+                          archivedWorkers.some((session) => session.id === activeId) && "text-foreground",
+                        )}
+                      >
+                        <ChevronRightIcon
+                          aria-hidden="true"
+                          className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90"
+                        />
+                        {ui("screen.taskSessionsArchivedWorkers")}
+                        <span className="ml-auto tabular-nums">{archivedWorkers.length}</span>
+                        {archivedUnread > 0 && (
+                          <span
+                            className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] text-blue-600 tabular-nums dark:text-blue-400"
+                          >
+                            <span className="sr-only">
+                              {ui("screen.taskSessionsArchivedUnread", { v0: archivedUnread })}
+                            </span>
+                            <span aria-hidden="true">{archivedUnread > 99 ? "99+" : archivedUnread}</span>
+                          </span>
+                        )}
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="mt-0.5 flex flex-col gap-0.5 pl-2 data-[state=closed]:hidden">
+                        {archivedWorkers.map(renderSessionItem)}
+                        {intentsHasMore && (
+                          <button
+                            type="button"
+                            onClick={loadOlderIntents}
+                            disabled={loadingOlderIntents}
+                            className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-muted-foreground text-xs hover:bg-accent/50"
+                          >
+                            {loadingOlderIntents ? (
+                              <Loader2Icon className="size-3.5 animate-spin" />
+                            ) : (
+                              <RotateCwIcon className="size-3.5" />
+                            )}
+                            {ui("screen.279a6ac7544928")}
+                          </button>
+                        )}
+                      </CollapsibleContent>
+                    </Collapsible>
+                  )}
+                </div>
               )}
             </div>
           </ScrollArea>
@@ -1786,7 +2450,13 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
         {/* Right: transcript */}
         <SideQuestionWorkspace
           side={side}
-          label={active.role === "worker" ? `Worker #${active.intent_id} · ${activeDisplayTitle}` : activeDisplayTitle}
+          label={
+            active.role === "worker"
+              ? `Worker #${active.intent_id} · ${activeDisplayTitle}`
+              : isAuditWorker
+                ? `审计 Worker #${active.audit_run_id} · ${activeDisplayTitle}`
+                : activeDisplayTitle
+          }
           noSnapshotHint={isMain ? ui("screen.6f366ec16cc84e") : ui("screen.10a5540c63e8c8")}
           emptyDescription={isMain ? ui("screen.15f927bcff550e") : ui("screen.1f866dfbace864")}
           placeholder={isMain ? ui("screen.dc0916cb804643") : ui("screen.c19d5225096ab9")}
@@ -1961,17 +2631,135 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                     activity={activity}
                     live={active.live}
                     taskId={taskId}
-                    chat={isMain}
+                    chat={isMain || isAuditAgent || isAuditWorker}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">
-                    {isMain ? ui("screen.bea91526654ba5") : ui("screen.c9a480c629c7fe")}
+                    {isMain
+                      ? ui("screen.bea91526654ba5")
+                      : isAuditAgent
+                        ? "请描述要选择、启动、续跑或查看的服务审计，支持 Java/Python/C 源码。"
+                        : ui("screen.c9a480c629c7fe")}
                   </div>
                 )}
               </div>
             </ScrollArea>
-            {isMain ? (
+            {isAuditWorker && activeAuditRun ? (
+              <AuditRunResultsPanel
+                run={activeAuditRun}
+                actionID={auditRunActionID}
+                onRetry={(run, retry) => void requeueAuditRun(run, retry)}
+                onStop={(run) => void stopAuditRun(run)}
+              />
+            ) : null}
+            {isAuditAgent && latestAuditRun && latestIncompleteCandidates.length > 0 ? (
+              <div className="max-h-40 shrink-0 overflow-y-auto border-t bg-amber-500/5 p-3">
+                <p className="mb-2 text-xs font-semibold">最近一次审计 #{latestAuditRun.id} 的未登记原因</p>
+                <div className="flex flex-col gap-2">
+                  {latestIncompleteCandidates.map((item) => (
+                    <div
+                      key={item.id}
+                      className="rounded-md border border-amber-500/30 bg-background px-2.5 py-2 text-xs"
+                    >
+                      <p className="font-medium">{String(item.candidate.title ?? "审计候选")}</p>
+                      <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                        {item.reviewer_summary?.trim() || "后台没有返回具体校验理由。"}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {isAuditAgent ? (
+              <div className="border-t p-3">
+                <label className="mb-2 flex flex-col gap-1.5 text-xs">
+                  <span className="font-medium">本轮要审计的服务</span>
+                  <select
+                    className="h-9 rounded-md border bg-background px-3 text-sm"
+                    value={selectedAuditServiceID ?? ""}
+                    onChange={(event) =>
+                      setSelectedAuditServiceID(event.target.value ? Number(event.target.value) : null)
+                    }
+                  >
+                    <option value="">让 Agent 根据对话选择</option>
+                    {auditCodeServices
+                      .filter((service) => service.decision === "confirmed" && service.latest_present)
+                      .map((service) => (
+                        <option key={service.id} value={service.id}>
+                          {service.name} · {service.relative_path}
+                          {service.languages?.length ? ` · ${service.languages.join(" / ")}` : ""}
+                        </option>
+                      ))}
+                  </select>
+                  {auditCodeServices.every((service) => service.decision !== "confirmed" || !service.latest_present) ? (
+                    <span className="text-muted-foreground">
+                      当前没有已确认且存在于最新版本的服务；请先在测试资产的“代码服务”中确认服务。
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      选中服务会作为本轮明确选择；Agent 仍只在你明确要求后启动审计。
+                    </span>
+                  )}
+                </label>
+                <label className="mb-2 flex items-start gap-2 rounded-md border p-2.5 text-xs">
+                  <input
+                    className="mt-0.5 accent-primary"
+                    type="checkbox"
+                    checked={auditSourceAcknowledged}
+                    onChange={(event) => setAuditSourceAcknowledged(event.target.checked)}
+                  />
+                  <span>
+                    我确认启动审计时，所选服务源码或反编译源码会发送给任务当前 LLM 配置分析。未勾选时 Agent
+                    不能启动审计。
+                  </span>
+                </label>
+                <InputGroup className="min-h-9 has-disabled:opacity-100">
+                  <MentionTextarea
+                    inputGroup
+                    rows={1}
+                    aria-label="白盒审计 Agent 消息"
+                    placeholder={auditAgentBusy ? "Agent 正在处理…" : "询问服务、启动或查看审计…"}
+                    value={auditAgentMessage}
+                    disabled={auditAgentSending}
+                    onValueChange={setAuditAgentMessage}
+                    onKeyDown={(event) => {
+                      if (!shouldSubmitOnKey(event, sendMode)) return;
+                      event.preventDefault();
+                      sendAuditAgent();
+                    }}
+                    className="max-h-36 min-h-9 overflow-y-auto"
+                  />
+                  <InputGroupAddon align="block-end">
+                    {auditAgentBusy ? (
+                      <InputGroupButton
+                        className="ml-auto"
+                        size="icon-xs"
+                        variant="destructive"
+                        onClick={stop}
+                        disabled={stopping}
+                        title="停止 Agent"
+                        aria-label="停止 Agent"
+                      >
+                        {stopping ? <Loader2Icon className="animate-spin" /> : <SquareIcon />}
+                      </InputGroupButton>
+                    ) : (
+                      <InputGroupButton
+                        className="ml-auto"
+                        size="icon-xs"
+                        variant="default"
+                        onClick={sendAuditAgent}
+                        disabled={!auditAgentMessage.trim() || auditAgentSending}
+                        title={ui("screen.008814832cf702")}
+                        aria-label={ui("screen.008814832cf702")}
+                      >
+                        {auditAgentSending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
+                      </InputGroupButton>
+                    )}
+                  </InputGroupAddon>
+                </InputGroup>
+              </div>
+            ) : isMain ? (
               <div className="border-t p-3">
                 {attachments.length > 0 && (
                   <div className="mb-2 flex flex-wrap gap-1.5">

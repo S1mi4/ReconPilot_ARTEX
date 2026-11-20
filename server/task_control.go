@@ -111,6 +111,9 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		}
 		defer s.engine.decInflight(t.ID)
 		lifecycle := t.lifecycleSnapshot()
+		if lifecycle.Draft {
+			return out, fmt.Errorf("草稿任务尚未启动，请先完成材料检查并显式启动")
+		}
 		if isTerminalStatus(lifecycle.Status) {
 			return out, fmt.Errorf("终态任务不能执行暂停")
 		}
@@ -177,9 +180,13 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		// after the persistent pause commits, so a failed control request is fully
 		// compensated and does not lose an otherwise valid conversation turn.
 		s.cancelTaskChat(t.ID, agent.AbortChatPausedWithTask)
+		s.cancelTaskChat(taskCodeAuditAgentChatBusyKey(t.ID), agent.AbortChatPausedWithTask)
 		out.Paused, out.Status = true, "paused"
 		go s.reconcileConcurrency()
 	case "resume":
+		if t.IsDraft() {
+			return out, fmt.Errorf("草稿任务不能直接恢复，请先完成材料检查并显式启动")
+		}
 		queued, err := s.admitTaskWhenScheduled(t, "resume", true, pauseCause == agent.AbortPausedBySchedule)
 		if err != nil {
 			return out, err

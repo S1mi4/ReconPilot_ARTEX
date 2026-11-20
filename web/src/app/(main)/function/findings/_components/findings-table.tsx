@@ -287,6 +287,12 @@ export function FindingsTable({
                       </span>
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
+                    {(f.code_audit_evidence?.registration_tier ??
+                      f.code_audit_evidence?.candidate.registration_tier) === "B" ? (
+                      <Badge variant="outline" className="w-fit">
+                        B 级 · 低置信度
+                      </Badge>
+                    ) : null}
                     {matchedIds && !matchedIds.includes(Number(f.finding_id)) ? (
                       <Badge variant="outline" className="w-fit">
                         {ui("screen.7852ff0b787df8")}

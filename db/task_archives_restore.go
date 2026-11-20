@@ -129,6 +129,7 @@ AND NOT EXISTS (
  llm_profile_id=NULL,active_llm_profile_id=NULL,llm_chain_revision=llm_chain_revision+1,
  company_id=NULL,parent_ref=NULL,timeout_seconds=0,coverage_enabled=true,share_project_assets=false,worker_count=0,pinned_at=NULL,
  no_result_seconds=0,no_result_min_findings=1,no_result_min_severity='',no_result_base_seconds=0,no_result_checked_at=NULL,stop_reason='',
+ assessment_mode=false,assessment_phase='',draft=false,assessment_config='{}'::jsonb,material_check='{}'::jsonb,
  first_run_at=NULL,deadline_at=NULL,archived_at=now(),deleted_at=now()
 WHERE id=$1`, taskID); err != nil {
 		return err
@@ -343,6 +344,11 @@ func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) er
  no_result_min_severity=COALESCE(archived.no_result_min_severity,''),
  no_result_base_seconds=COALESCE(archived.no_result_base_seconds,0),
  no_result_checked_at=archived.no_result_checked_at,stop_reason=COALESCE(archived.stop_reason,''),
+ assessment_mode=COALESCE(archived.assessment_mode,false),
+ assessment_phase=COALESCE(archived.assessment_phase,''),
+ draft=COALESCE(archived.draft,false),
+ assessment_config=COALESCE(archived.assessment_config,'{}'::jsonb),
+ material_check=COALESCE(archived.material_check,'{}'::jsonb),
  coverage_enabled=archived.coverage_enabled,share_project_assets=COALESCE(archived.share_project_assets,false),worker_count=COALESCE(archived.worker_count,0),pinned_at=archived.pinned_at,first_run_at=archived.first_run_at,
  deadline_at=CASE WHEN archived.paused AND $3>0 THEN now()+make_interval(secs=>$3::double precision)
                   ELSE archived.deadline_at END,
@@ -385,19 +391,26 @@ func rowExists(tx *sql.Tx, table string, id int64) bool {
 
 func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	// json_populate_recordset inserts NULL for absent columns, bypassing SQL
-	// defaults. Preserve compatibility with v3 archives predating side memory.
-	if (table == "side_question_sessions" || table == "side_question_requests") && len(raw) > 0 {
+	// defaults. Backfill fields introduced after legacy snapshots were written.
+	defaultField, defaultValue := "", json.RawMessage(nil)
+	switch table {
+	case "side_question_sessions":
+		defaultField, defaultValue = "memory", json.RawMessage(`{}`)
+	case "side_question_requests":
+		defaultField, defaultValue = "context_info", json.RawMessage(`{}`)
+	case "task_code_services":
+		defaultField, defaultValue = "languages", json.RawMessage(`["java"]`)
+	case "task_code_audit_runs":
+		defaultField, defaultValue = "coverage", json.RawMessage(`{}`)
+	}
+	if defaultField != "" && len(raw) > 0 {
 		var rows []map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &rows); err != nil {
 			return err
 		}
-		field := "memory"
-		if table == "side_question_requests" {
-			field = "context_info"
-		}
 		for _, row := range rows {
-			if len(row[field]) == 0 || string(row[field]) == "null" {
-				row[field] = json.RawMessage(`{}`)
+			if len(row[defaultField]) == 0 || string(row[defaultField]) == "null" {
+				row[defaultField] = defaultValue
 			}
 		}
 		var err error

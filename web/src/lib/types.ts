@@ -69,6 +69,116 @@ export interface Task {
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   share_global_assets?: boolean; // opt-in global asset visibility; default false
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  assessment_mode?: boolean;
+  assessment_phase?: AssessmentPhase;
+  draft?: boolean;
+  assessment_config?: AssessmentConfig;
+  material_check?: MaterialCheckReport;
+}
+
+export type AssessmentPhase =
+  | ""
+  | "material_check"
+  | "profiling"
+  | "coverage_planning"
+  | "executing"
+  | "reconciliation"
+  | "completed";
+
+export type AssessmentExecutionMode = "dynamic" | "offline";
+
+export interface AssessmentEnvironmentInput {
+  name?: string;
+  url: string;
+  description?: string;
+  is_default?: boolean;
+}
+
+export interface AssessmentEnvAccessInput {
+  mode?: "direct" | "vpn" | "proxy" | "offline" | "custom" | "";
+  notes?: string;
+}
+
+export interface AssessmentIdentityInput {
+  role: string;
+  username?: string;
+  credential_ref?: string;
+  auth_type?: string;
+  scope?: string;
+  notes?: string;
+}
+
+export interface AssessmentConstraintInput {
+  kind: "allow" | "deny";
+  text: string;
+}
+
+export interface AssessmentConfig {
+  execution_mode?: AssessmentExecutionMode;
+  business_overview?: string;
+  business_focus?: string[];
+  environments?: AssessmentEnvironmentInput[];
+  env_access?: AssessmentEnvAccessInput;
+  identities?: AssessmentIdentityInput[];
+  scope_notes?: string;
+  operation_constraints?: AssessmentConstraintInput[];
+  source_acknowledged?: boolean;
+}
+
+export interface MaterialCheckItem {
+  key: string;
+  status: "pass" | "warn" | "fail" | "not_applicable";
+  summary: string;
+  detail?: string;
+  blocking: boolean;
+}
+
+export interface MaterialCodebaseInventory {
+  codebase_id: string;
+  version_id: string;
+  name: string;
+  kind: string;
+  languages?: string[];
+  deployability: "deployable" | "auditable_library" | "binary_only" | "empty" | "unreadable" | string;
+  valid_source_files: number;
+  valid_class_files: number;
+  valid_template_files: number;
+  nested_archive_files: number;
+  invalid_code_files?: string[];
+  unclassified_files?: string[];
+  unclassified_count: number;
+  unreadable_entries?: string[];
+  warnings?: string[];
+  blocking_error?: string;
+  needs_java_code_db?: boolean;
+  discovery_status?: string;
+}
+
+export interface MaterialGap {
+  kind: string;
+  severity: "blocker" | "warning" | string;
+  target: string;
+  message: string;
+}
+
+export interface MaterialCheckReport {
+  checked_at?: string;
+  config_digest?: string;
+  codebase_digest?: string;
+  execution_mode?: AssessmentExecutionMode | string;
+  standard_version?: string;
+  ready: boolean;
+  source_acknowledged: boolean;
+  java_code_db_required: boolean;
+  java_code_db_ready: boolean;
+  llm_ready: boolean;
+  summary?: string;
+  blockers?: string[];
+  warnings?: string[];
+  items?: MaterialCheckItem[];
+  codebases?: MaterialCodebaseInventory[];
+  gaps?: MaterialGap[];
+  valid_environment_urls?: string[];
 }
 
 export interface TaskCategory {
@@ -320,7 +430,7 @@ export interface TaskAssetScopeMutation {
 // 无资产行的根域名="r:<domain>"。in_scope=false 的是仅用于连线的灰色上下文节点。
 export interface CoverageGraphNode {
   key: string;
-  kind: "company" | "root_domain" | "subdomain" | "ip" | "service" | "app" | "endpoint";
+  kind: "company" | "root_domain" | "subdomain" | "ip" | "service" | "app" | "endpoint" | "code_service";
   label: string;
   tested: boolean;
   in_scope: boolean;
@@ -332,6 +442,8 @@ export interface CoverageGraphNode {
   url?: string;
   port?: number;
   service_type?: string;
+  service_name?: string;
+  relative_path?: string;
   app_name?: string;
   page_title?: string;
   status_code?: number;
@@ -537,6 +649,16 @@ export interface CodeAuditFlowStep {
   propagation: string;
 }
 
+// CodeAuditAnchor 是模型引用的关键代码位置，role 由模型自选（source/sink/check/missing_check/alloc/free 等）。
+export interface CodeAuditAnchor {
+  excerpt?: string;
+  role: string;
+  file: string;
+  line: number;
+  symbol: string;
+  description?: string;
+}
+
 export interface CodeAuditControl {
   file: string;
   line: number;
@@ -546,12 +668,23 @@ export interface CodeAuditControl {
 export interface CodeAuditCandidateEvidence {
   title: string;
   category: string;
+  language?: string;
+  cwe?: string;
+  severity: Severity;
+  confidence: "high" | "medium" | "low";
+  registration_tier?: "A" | "B";
+  validation_issues?: string[];
   source: CodeAuditLocation;
   sink: CodeAuditLocation;
   entry_point: CodeAuditLocation;
   flow: CodeAuditFlowStep[];
+  anchors?: CodeAuditAnchor[];
+  reasoning_chain?: string[];
   controls_checked: CodeAuditControl[];
   why_unobstructed: string;
+  exploitability: string;
+  no_effective_block: boolean;
+  exploitable: boolean;
   evidence_excerpt: string;
   remediation: string;
   provenance?: CodeAuditProvenance;
@@ -566,13 +699,14 @@ export interface CodeAuditProvenanceLocation {
 }
 
 export interface CodeAuditProvenance {
-  decompiler: string;
-  decompiler_sha256: string;
+  javacodedb: string;
+  javacodedb_sha256: string;
   artifact_name: string;
   artifact_format: string;
   artifact_sha256: string;
   source: CodeAuditProvenanceLocation;
   sink: CodeAuditProvenanceLocation;
+  anchors?: CodeAuditProvenanceLocation[];
 }
 
 export interface CodeAuditReviewEvidence {
@@ -603,6 +737,8 @@ export interface CodeAuditHistoryEvent {
 }
 
 export interface CodeAuditFindingEvidence {
+  registration_tier?: "A" | "B";
+  validation_issues?: string[];
   candidate_key: string;
   service_name: string;
   relative_path: string;
@@ -615,7 +751,7 @@ export interface CodeAuditFindingEvidence {
   fixed_in_version_id?: string;
   history?: CodeAuditHistoryEvent[];
   candidate: CodeAuditCandidateEvidence;
-  review: CodeAuditReviewEvidence;
+  review?: CodeAuditReviewEvidence;
 }
 
 export type VerifyLevel = "unknown" | "minimal" | "standard" | "theoretical";
@@ -975,7 +1111,14 @@ export interface LogLine {
   text: string;
 }
 
-export type SessionRole = "mainagent" | "planner" | "worker" | "system";
+export type SessionRole =
+  | "mainagent"
+  | "planner"
+  | "worker"
+  | "audit_worker"
+  | "system"
+  | "whitebox_audit"
+  | "whitebox_java_audit";
 export type SessionStatus = "running" | "paused" | "done" | "blocked" | "exhausted" | "pending" | "stopped" | "deleted";
 
 // Daily token aggregate bucket (GET /api/tokens/daily).
@@ -1072,6 +1215,8 @@ export interface Session {
   live: boolean;
   last_activity: string;
   intent_id?: string;
+  audit_run_id?: number;
+  audit_scope?: string;
   source_task_id?: string;
   inherited?: boolean;
   seg?: number; // main-agent session: which conversation segment (0 = original)
@@ -2176,6 +2321,7 @@ export interface TaskCodebaseVersion {
 export type TaskCodebaseUploadKind = "directory" | "source_archive" | "artifact";
 
 export interface TaskCodeService {
+  languages?: string[];
   id: number;
   task_id: number;
   codebase_id: string;
@@ -2204,12 +2350,19 @@ export interface TaskCodeAuditCandidate {
   id: number;
   run_id: number;
   candidate_key: string;
-  review_status: "pending_review" | "rejected" | "published" | "dismissed";
+  review_status: "pending_review" | "incomplete" | "rejected" | "published" | "dismissed";
   candidate: Record<string, unknown>;
+  variants?: TaskCodeAuditCandidateVariant[];
   reviewer_summary: string;
   verification_summary: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface TaskCodeAuditCandidateVariant {
+  candidate: Record<string, unknown>;
+  validation_issues?: string[];
+  analysis_chunk?: number;
 }
 
 export interface TaskCodeAuditRun {
@@ -2244,6 +2397,25 @@ export interface TaskCodeAuditRun {
   completed_at?: string;
   updated_at: string;
   candidates?: TaskCodeAuditCandidate[];
+  coverage?: {
+    files: {
+      path: string;
+      language: string;
+      read: boolean;
+      analyzed: boolean;
+      attempts: number;
+      lines_read: number;
+    }[];
+    sweep_completed: boolean;
+    sweep_chunks_completed: number;
+    java_binary?: {
+      class_count: number;
+      classes_analyzed: number;
+      next_class_index: number;
+      chunks_completed: number;
+      completed: boolean;
+    };
+  };
 }
 
 export interface TaskCodeAuditLLMConfig {
@@ -2261,7 +2433,9 @@ export interface TaskCodeAuditConfig {
   service: TaskCodeService;
   version: TaskCodebaseVersion;
   scope_path: string;
+  languages?: string[];
   production_source_files: number;
+  test_files?: number;
   test_java_files: number;
   config_files: number;
   binary_class_files: number;
@@ -2270,8 +2444,8 @@ export interface TaskCodeAuditConfig {
   audit_available: boolean;
   source_notice?: string;
   audit_notice?: string;
-  decompiler_available: boolean;
-  decompiler_notice?: string;
+  javacodedb_available: boolean;
+  javacodedb_notice?: string;
   llm: TaskCodeAuditLLMConfig;
 }
 

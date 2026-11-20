@@ -93,17 +93,18 @@ JSON
   # go 环境检查
   command -v go >/dev/null 2>&1 || die "未检测到 Go，请先安装 Go（>=1.26）：https://go.dev/dl/"
   ok "Go: $(go version)"
+  ./scripts/build-java-code-db.sh ./java-code-db.jar
 
   # 内嵌前端需要 node 出静态产物
   if command -v npm >/dev/null 2>&1; then
     info "构建前端静态产物…"
     ( cd web && npm ci && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
-    info "编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    info "编译内嵌前端的 ARTEX 二进制…"
+    CGO_ENABLED=0 go build -tags embedui,javacodedb -trimpath -o artex ./cmd/artex
   else
     warn "未检测到 npm：将编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -tags javacodedb -o artex ./cmd/artex
   fi
   ok "编译完成 → ./artex"
 
@@ -114,7 +115,7 @@ JSON
 echo "=============================="
 echo "  ARTEX 安装"
 echo "  1) 全部 Docker 安装"
-echo "  2) 本地运行（go 编译）"
+echo "  2) 本地运行（Go + JavaCodeDB 编译；需要 Maven 和 JDK 21）"
 echo "=============================="
 case "$(ask '选择' 1)" in
   1) install_docker ;;

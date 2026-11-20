@@ -7,6 +7,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { AssessmentDraftWorkflow } from "@/components/assessment-draft-panel";
 import { IntelligencePanel } from "@/components/intelligence-panel";
 import { StatusBadge } from "@/components/status-badge";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
@@ -23,6 +24,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -37,6 +39,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
@@ -214,6 +217,7 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
 
 function TaskDetailInner() {
   const { ui, liveUI } = useUITranslation();
+  const { t: translate } = useLiveTranslation();
 
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -295,7 +299,7 @@ function TaskDetailInner() {
   }, [load]);
 
   async function togglePause() {
-    if (task && ["done", "failed", "timeout"].includes(task.status)) return;
+    if (task && (task.draft || ["done", "failed", "timeout"].includes(task.status))) return;
     const next = !paused;
     try {
       await api.controlTask(id, next ? "pause" : "resume");
@@ -397,12 +401,19 @@ function TaskDetailInner() {
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
-          <StatusBadge
-            stopReason={task.stop_reason}
-            domain={terminal ? "task" : "engine"}
-            value={terminal ? task.status : engineMode}
-            dot
-          />
+          {task.draft ? (
+            <Badge variant="secondary">{translate("taskUI.assessment.draftBadge")}</Badge>
+          ) : (
+            <StatusBadge
+              stopReason={task.stop_reason}
+              domain={terminal ? "task" : "engine"}
+              value={terminal ? task.status : engineMode}
+              dot
+            />
+          )}
+          {task.assessment_mode && task.assessment_phase && (
+            <Badge variant="outline">{translate(`taskUI.assessment.phase.${task.assessment_phase}`)}</Badge>
+          )}
           {canArchive ? (
             <AlertDialog>
               <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
@@ -431,7 +442,7 @@ function TaskDetailInner() {
               <TooltipContent>{archiveDisabledReason}</TooltipContent>
             </Tooltip>
           )}
-          <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
+          <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal || Boolean(task.draft)}>
             {controlIcon}
             {controlLabel}
           </Button>
@@ -505,6 +516,19 @@ function TaskDetailInner() {
 
       {/* Tab content */}
       <div className="flex-1 p-4 lg:p-6">
+        {task.draft && (
+          <div className="mb-4 rounded-xl border bg-card p-4">
+            <AssessmentDraftWorkflow
+              key={task.id}
+              task={task}
+              onTaskUpdated={(next) => {
+                setTask(next);
+                load();
+              }}
+              onStarted={() => load()}
+            />
+          </div>
+        )}
         <TabsContent value="sessions" className="mt-0">
           <SessionsTab key={id} taskId={id} requestedSession={searchParams.get("session") ?? ""} />
         </TabsContent>

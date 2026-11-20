@@ -9,6 +9,70 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
+func (s *Server) queueWhiteboxFindingReport(f *db.DBFinding, run *db.TaskCodeAuditRun, candidate taskCodeAuditCandidate) (int64, error) {
+	if f == nil || f.ID <= 0 || f.NodeID == nil || *f.NodeID <= 0 || f.TaskID == nil || *f.TaskID <= 0 {
+		return 0, fmt.Errorf("white-box Finding has no task or exploration node")
+	}
+	reporter, err := s.m.pg.GetAgentByKey("reporter")
+	if err != nil {
+		return 0, fmt.Errorf("load report Agent: %w", err)
+	}
+	if reporter == nil || !reporter.Enabled {
+		return 0, fmt.Errorf("report Agent is missing or disabled")
+	}
+	if s.resolveChatAgent(&db.Conversation{AgentKey: reporter.Key}) == nil {
+		return 0, fmt.Errorf("%s", s.chatUnavailableReason())
+	}
+	if s.ctx != nil && s.ctx.Err() != nil {
+		return 0, fmt.Errorf("server is stopping")
+	}
+	taskID := *f.TaskID
+	projectID := s.projectOfTask(taskID)
+	if projectID <= 0 {
+		return 0, fmt.Errorf("cannot determine project for the report conversation")
+	}
+	var taskDesc, taskGoal string
+	if task := s.m.ResolveTask(strconv.FormatInt(taskID, 10)); task != nil {
+		taskDesc, taskGoal = task.Description, task.Goal
+	}
+	message := whiteboxFindingReportMessage(f, run, candidate)
+	conversation, err := s.m.pg.CreateConversation(projectID, "reporter", fmt.Sprintf("白盒审计报告 · finding#%d", f.ID), nil)
+	if err != nil {
+		return 0, fmt.Errorf("create report conversation: %w", err)
+	}
+	if err := s.m.pg.SetFindingReportConversationID(f.ID, conversation.ID); err != nil {
+		return 0, fmt.Errorf("link report conversation: %w", err)
+	}
+	s.StartTriggeredRunWithConversation(
+		"reporter", fmt.Sprintf("白盒审计报告 · finding#%d", f.ID), message, taskID, false,
+		taskDesc, taskGoal, conversation.ID,
+	)
+	return conversation.ID, nil
+}
+
+func whiteboxFindingReportMessage(f *db.DBFinding, run *db.TaskCodeAuditRun, candidate taskCodeAuditCandidate) string {
+	var b strings.Builder
+	b.WriteString("【白盒静态审计报告任务】请为一个已经登记为 pending / theoretical 的 Finding 生成中文 Markdown 报告。该结果来自静态代码审计与数据流分析，没有进行动态验证。\n")
+	fmt.Fprintf(&b, "独立漏洞记录 ID（get_finding_traffic 使用）=%d；探索节点 ID（get_task_node_detail 和 update_finding_report 使用）=%d；任务 ID=%d。\n",
+		f.ID, *f.NodeID, *f.TaskID)
+	if run != nil {
+		fmt.Fprintf(&b, "服务=%s；服务路径=%s；代码版本=%s；审计范围=%s；审计运行=%d。\n",
+			run.ServiceName, run.ScopePath, run.VersionID, run.ScopePath, run.ID)
+	}
+	fmt.Fprintf(&b, "候选摘要：%s；漏洞类型=%s；严重等级=%s。\n", candidate.Title, normalizeTaskCodeAuditVulnClass(candidate.Category), candidate.Severity)
+	if taskCodeAuditLocationPresent(candidate.Source) || taskCodeAuditLocationPresent(candidate.Sink) {
+		fmt.Fprintf(&b, "Source=%s:%d %s；Sink=%s:%d %s(%s)。\n",
+			candidate.Source.File, candidate.Source.Line, candidate.Source.Symbol,
+			candidate.Sink.File, candidate.Sink.Line, candidate.Sink.Symbol, candidate.Sink.Parameter)
+	}
+	for _, anchor := range candidate.Anchors {
+		fmt.Fprintf(&b, "锚点[%s]=%s:%d %s。\n", anchor.Role, anchor.File, anchor.Line, anchor.Symbol)
+	}
+	fmt.Fprintf(&b, "结构化代码证据：\n%s\n", string(f.CodeAuditEvidence))
+	b.WriteString("先读取 get_finding_traffic 的清单和 evidence version，再读取 get_task_node_detail 中的完整静态证据；只按真实保存的代码证据写报告。动态请求、响应、命令输出、PoC 执行和运行时影响均未验证，必须明确标为待确认，不能编造。复现步骤写成可核查的静态推理链；污点型问题列出 source-to-sink 路径，列出代码文件和行号，并说明后续动态验证条件。不要创建或更改 Finding。最后使用 node ID 调用 update_finding_report，并传入刚读取的 evidence version。\n")
+	return b.String()
+}
+
 // generateFindingReport requeues the existing reporter workflow for a finding.
 // This is intentionally separate from report_finding: a restart can leave a
 // finding persisted while the one-shot trigger conversation is gone.

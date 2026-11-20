@@ -38,6 +38,7 @@ import {
   PlusIcon,
   SaveIcon,
   SearchIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   StarIcon,
   TablePropertiesIcon,
@@ -48,6 +49,11 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AssessmentConfigFormFields,
+  AssessmentDraftWorkflow,
+  defaultAssessmentConfig,
+} from "@/components/assessment-draft-panel";
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
 import { DateSelect } from "@/components/date-select";
 import { RemarkEditor } from "@/components/remark-editor";
@@ -131,6 +137,7 @@ import { api, type ScheduleInput } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
+  AssessmentConfig,
   AssetInterceptRuleInput,
   ChatAttachment,
   Company,
@@ -263,7 +270,8 @@ const UNCATEGORIZED_VALUE = "uncategorized";
 const PAUSABLE_STATUSES = new Set<TaskStatus>(["created", "queued", "running"]);
 const ARCHIVABLE_STATUSES = new Set<TaskStatus>(["paused", "done", "failed", "timeout"]);
 
-function taskControlAction(status: TaskStatus): "pause" | "resume" | null {
+function taskControlAction(status: TaskStatus, draft?: boolean): "pause" | "resume" | null {
+  if (draft) return null;
   if (status === "paused") return "resume";
   if (PAUSABLE_STATUSES.has(status)) return "pause";
   return null;
@@ -563,6 +571,8 @@ export default function TasksPage() {
     return () => clearInterval(i);
   }, [load, loadCategories]);
 
+  const [resumingDraftTask, setResumingDraftTask] = React.useState<Task | null>(null);
+
   const refreshCategoriesAndTasks = React.useCallback(() => {
     lastRef.current = "";
     loadCategories();
@@ -812,15 +822,19 @@ export default function TasksPage() {
 
   const selectedTasks = React.useMemo(() => tasks.filter((task) => selectedIds.has(task.id)), [tasks, selectedIds]);
   const pausableTaskIDs = React.useMemo(
-    () => selectedTasks.filter((task) => taskControlAction(task.status) === "pause").map((task) => task.id),
+    () => selectedTasks.filter((task) => taskControlAction(task.status, task.draft) === "pause").map((task) => task.id),
     [selectedTasks],
   );
   const resumableTaskIDs = React.useMemo(
-    () => selectedTasks.filter((task) => taskControlAction(task.status) === "resume").map((task) => task.id),
+    () =>
+      selectedTasks.filter((task) => taskControlAction(task.status, task.draft) === "resume").map((task) => task.id),
     [selectedTasks],
   );
   const archivableTaskIDs = React.useMemo(
-    () => selectedTasks.filter((task) => ARCHIVABLE_STATUSES.has(task.status) && !task.queued).map((task) => task.id),
+    () =>
+      selectedTasks
+        .filter((task) => !task.draft && ARCHIVABLE_STATUSES.has(task.status) && !task.queued)
+        .map((task) => task.id),
     [selectedTasks],
   );
 
@@ -1088,6 +1102,8 @@ export default function TasksPage() {
               <CreateTaskSheet
                 tasks={tasks}
                 categories={categories}
+                resumeDraftTask={resumingDraftTask}
+                onResumeDraftClose={() => setResumingDraftTask(null)}
                 onCreated={refreshCategoriesAndTasks}
                 onCategoriesChanged={refreshCategoriesAndTasks}
               />
@@ -1186,6 +1202,7 @@ export default function TasksPage() {
                       onTogglePinned={toggleTaskPinned}
                       onToggleGlobalAssets={toggleTaskGlobalAssets}
                       onArchive={queueTaskArchive}
+                      onResumeDraft={setResumingDraftTask}
                       selected={selectedIds.has(task.id)}
                       onSelectedChange={toggleSelected}
                       visibleColumns={visibleColumns}
@@ -1430,6 +1447,7 @@ const TaskRow = React.memo(function TaskRow({
   onTogglePinned,
   onToggleGlobalAssets,
   onArchive,
+  onResumeDraft,
   selected,
   onSelectedChange,
   visibleColumns,
@@ -1443,6 +1461,7 @@ const TaskRow = React.memo(function TaskRow({
   onTogglePinned: (task: Task) => Promise<void>;
   onToggleGlobalAssets: (task: Task) => Promise<void>;
   onArchive: (task: Task) => Promise<void>;
+  onResumeDraft?: (task: Task) => void;
   selected: boolean;
   onSelectedChange: (id: string, checked: boolean) => void;
   visibleColumns: Record<TaskColumnKey, boolean>;
@@ -1489,7 +1508,18 @@ const TaskRow = React.memo(function TaskRow({
         {task.goal}
       </TableCell>
       <TableCell className={cn(!visibleColumns.status && "hidden")}>
-        <StatusBadge domain="task" value={task.status} stopReason={task.stop_reason} dot />
+        <div className="flex flex-wrap items-center gap-1.5">
+          {task.draft ? (
+            <Badge variant="secondary">{translate("taskUI.assessment.draftBadge")}</Badge>
+          ) : (
+            <StatusBadge domain="task" value={task.status} stopReason={task.stop_reason} dot />
+          )}
+          {task.assessment_mode && task.assessment_phase && (
+            <Badge variant="outline" className="text-[11px] font-normal">
+              {translate(`taskUI.assessment.phase.${task.assessment_phase}`)}
+            </Badge>
+          )}
+        </div>
       </TableCell>
       <TableCell
         className={cn("text-muted-foreground text-center text-xs tabular-nums", !visibleColumns.progress && "hidden")}
@@ -1602,6 +1632,21 @@ const TaskRow = React.memo(function TaskRow({
               </Link>
             </Button>
           </TaskActionTooltip>
+          {task.draft && onResumeDraft && (
+            <TaskActionTooltip
+              label={translate("taskUI.assessment.resumeDraft")}
+              description={translate("taskUI.assessment.draftNotice")}
+            >
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label={translate("taskUI.assessment.resumeDraft")}
+                onClick={() => onResumeDraft(task)}
+              >
+                <ShieldCheckIcon />
+              </Button>
+            </TaskActionTooltip>
+          )}
           <TaskControlButton task={task} onControl={onControl} />
           <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
           <TaskArchiveAction task={task} onArchive={onArchive} />
@@ -1833,7 +1878,7 @@ function TaskControlButton({
 }) {
   const { t: translate } = useLiveTranslation();
   const [pending, setPending] = React.useState(false);
-  const action = taskControlAction(task.status);
+  const action = taskControlAction(task.status, task.draft);
   const label = action === "resume" ? translate("taskUI.resumeTask") : translate("taskUI.pauseTask");
   let description = translate("taskUI.pauseHelp");
   if (action === "resume") description = translate("taskUI.resumeHelp");
@@ -3572,11 +3617,15 @@ function CategoryManagementSheet({
 function CreateTaskSheet({
   tasks,
   categories,
+  resumeDraftTask,
+  onResumeDraftClose,
   onCreated,
   onCategoriesChanged,
 }: {
   tasks: Task[];
   categories: TaskCategory[];
+  resumeDraftTask?: Task | null;
+  onResumeDraftClose?: () => void;
   onCreated: () => void;
   onCategoriesChanged: () => void;
 }) {
@@ -3584,6 +3633,9 @@ function CreateTaskSheet({
   const scheduleEnabledID = React.useId();
   const scheduleImmediateID = React.useId();
   const [open, setOpen] = React.useState(false);
+  const [assessmentMode, setAssessmentMode] = React.useState(true);
+  const [activeDraftTask, setActiveDraftTask] = React.useState<Task | null>(null);
+  const [assessmentConfig, setAssessmentConfig] = React.useState<AssessmentConfig>(() => defaultAssessmentConfig());
   const [name, setName] = React.useState("");
   const [remark, setRemark] = React.useState("");
   const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
@@ -3625,6 +3677,14 @@ function CreateTaskSheet({
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
 
+  React.useEffect(() => {
+    if (resumeDraftTask) {
+      setActiveDraftTask(resumeDraftTask);
+      setAssessmentMode(true);
+      setOpen(true);
+    }
+  }, [resumeDraftTask]);
+
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
     api
@@ -3659,8 +3719,45 @@ function CreateTaskSheet({
     }
   }
 
+  function resetCreateForm() {
+    setAssessmentConfig(defaultAssessmentConfig());
+    setName("");
+    setRemark("");
+    setCategoryID(undefined);
+    setDescription("");
+    setGoal("");
+    setSelectedTemplateID(null);
+    setSourceTaskIDs([]);
+    setCompanyIDs([]);
+    setLLMProfileIDs([]);
+    setTimeoutMin("");
+    setNoResultMin("");
+    setNoResultCount("1");
+    setNoResultSeverity("");
+    setHeartbeatMin("10");
+    setSeedFirstIntent(false);
+    setCoverageEnabled(true);
+    setShareGlobalAssets(false);
+    setWorkerCount("");
+    setInterceptRules([]);
+    setScheduleEnabled(false);
+    setSchedule({
+      name: translate("taskUI.defaultSchedule"),
+      schedule_type: "weekly",
+      end_date: "",
+      weekdays: [6, 7],
+      start_time: "18:00",
+      end_time: "",
+      task_ids: [],
+      timezone_mode: "beijing",
+      start_immediately: false,
+    });
+    setUploadCount(0);
+    draftIdRef.current = "";
+  }
+
   async function createTask() {
-    if (!description.trim() || !goal.trim()) {
+    if (!assessmentMode && (!description.trim() || !goal.trim())) {
       toast.error(translate("taskUI.descriptionGoalRequired"));
       return;
     }
@@ -3677,12 +3774,23 @@ function CreateTaskSheet({
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
-      await api.createTask({
+      const cleanedCfg: AssessmentConfig = {
+        ...assessmentConfig,
+        environments: (assessmentConfig.environments ?? []).filter((e) => e.url.trim() !== ""),
+        identities: (assessmentConfig.identities ?? []).filter(
+          (ident) => ident.role.trim() !== "" || (ident.username ?? "").trim() !== "",
+        ),
+        operation_constraints: (assessmentConfig.operation_constraints ?? []).filter((c) => c.text.trim() !== ""),
+      };
+      const effectiveDescription = assessmentMode
+        ? cleanedCfg.business_overview?.trim() || name.trim() || translate("taskUI.untitled")
+        : description.trim();
+      const created = await api.createTask({
         name: name.trim(),
         remark: remark.trim(),
         categoryId: categoryID,
-        description: description.trim(),
-        goal: goal.trim(),
+        description: effectiveDescription,
+        goal: assessmentMode ? "" : goal.trim(),
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
@@ -3690,7 +3798,7 @@ function CreateTaskSheet({
         noResultSeconds: Math.max(0, Math.floor((Number(noResultMin) || 0) * 60)),
         noResultMinFindings: Math.max(1, Math.floor(Number(noResultCount) || 1)),
         noResultMinSeverity: noResultSeverity,
-        seedFirstIntent,
+        seedFirstIntent: assessmentMode ? false : seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
         shareGlobalAssets,
@@ -3701,43 +3809,19 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        assessmentMode,
+        draft: assessmentMode,
+        assessmentConfig: assessmentMode ? cleanedCfg : undefined,
       });
-      toast.success(translate("taskUI.taskCreated"));
-      setName("");
-      setRemark("");
-      setCategoryID(undefined);
-      setDescription("");
-      setGoal("");
-      setSelectedTemplateID(null);
-      setSourceTaskIDs([]);
-      setCompanyIDs([]);
-      setLLMProfileIDs([]);
-      setTimeoutMin("");
-      setNoResultMin("");
-      setNoResultCount("1");
-      setNoResultSeverity("");
-      setHeartbeatMin("10");
-      setSeedFirstIntent(false);
-      setCoverageEnabled(true);
-      setShareGlobalAssets(false);
-      setWorkerCount("");
-      setInterceptRules([]);
-      setScheduleEnabled(false);
-      setSchedule({
-        name: translate("taskUI.defaultSchedule"),
-        schedule_type: "weekly",
-        end_date: "",
-        weekdays: [6, 7],
-        start_time: "18:00",
-        end_time: "",
-        task_ids: [],
-        timezone_mode: "beijing",
-        start_immediately: false,
-      });
-      setUploadCount(0);
-      draftIdRef.current = "";
-      setOpen(false);
+      resetCreateForm();
       onCreated();
+      if (created.draft) {
+        toast.success(translate("taskUI.assessment.draftCreated", { id: created.id }));
+        setActiveDraftTask(created);
+      } else {
+        toast.success(translate("taskUI.taskCreated"));
+        setOpen(false);
+      }
     } catch (e) {
       toast.error(translate("taskUI.createError", { message: taskError(e, translate) }));
     } finally {
@@ -3745,8 +3829,16 @@ function CreateTaskSheet({
     }
   }
 
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (!nextOpen) {
+      setActiveDraftTask(null);
+      onResumeDraftClose?.();
+    }
+  }
+
   return (
-    <Sheet open={open} onOpenChange={setOpen}>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetTrigger asChild>
         <Button size="sm">
           <PlusIcon /> {translate("taskUI.newTask")}
@@ -3760,420 +3852,488 @@ function CreateTaskSheet({
         className="w-full! max-w-none! gap-0 p-0 sm:w-[45vw]! sm:max-w-[45vw]!"
       >
         <SheetHeader className="border-b p-6">
-          <SheetTitle>{translate("taskUI.newTask")}</SheetTitle>
-          <SheetDescription>{translate("taskUI.newTaskHelp")}</SheetDescription>
+          <SheetTitle>
+            {activeDraftTask ? translate("taskUI.assessment.stage2Title") : translate("taskUI.newTask")}
+          </SheetTitle>
+          <SheetDescription>
+            {activeDraftTask ? translate("taskUI.assessment.draftNotice") : translate("taskUI.newTaskHelp")}
+          </SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-6">
-          <div className="grid gap-5">
-            <TaskTemplateControls
-              description={description}
-              goal={goal}
-              remark={remark}
-              categoryID={categoryID}
-              interceptRules={interceptRules}
-              workerCount={workerCount}
-              selectedTemplateID={selectedTemplateID}
-              onSelectedTemplateIDChange={setSelectedTemplateID}
-              onApply={(template) => {
-                setDescription(template.description);
-                setGoal(template.goal);
-                setRemark(template.remark ?? "");
-                setCategoryID(template.category_id ?? undefined);
-                setInterceptRules(template.intercept_rules ?? []);
-                setWorkerCount(template.worker_count ? String(template.worker_count) : "");
-                setUploadCount(0);
+          {activeDraftTask ? (
+            <AssessmentDraftWorkflow
+              key={activeDraftTask.id}
+              task={activeDraftTask}
+              onTaskUpdated={(next) => {
+                setActiveDraftTask(next);
+                onCreated();
               }}
-              portalContainer={sheetContentRef}
+              onStarted={() => {
+                setActiveDraftTask(null);
+                handleOpenChange(false);
+                onCreated();
+              }}
             />
-            <div className="grid gap-2">
-              <Label htmlFor="name">{translate("taskUI.nameOptional")}</Label>
-              <Input
-                id="name"
-                placeholder={translate("taskUI.nameExample")}
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="remark">{translate("taskUI.remarkOptional")}</Label>
-              <Textarea
-                id="remark"
-                className="min-h-20"
-                maxLength={MAX_TASK_REMARK_RUNES}
-                placeholder={translate("taskUI.remarkExample")}
-                value={remark}
-                onChange={(e) => setRemark(e.target.value)}
-              />
-            </div>
-            <Field>
-              <FieldLabel htmlFor="task-category">{translate("taskUI.category")}</FieldLabel>
-              <CategoryPicker
-                categories={categories}
-                value={categoryID}
-                onValueChange={setCategoryID}
-                onCategoryCreated={onCategoriesChanged}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>{translate("taskUI.categoryHelp")}</FieldDescription>
-            </Field>
-            <FieldSet>
-              <FieldLegend>{translate("taskUI.scheduleOptional")}</FieldLegend>
-              <label htmlFor={scheduleEnabledID} className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  id={scheduleEnabledID}
-                  checked={scheduleEnabled}
-                  onCheckedChange={(v) => setScheduleEnabled(!!v)}
+          ) : (
+            <div className="grid gap-5">
+              <div className="grid gap-2 rounded-lg border bg-muted/30 p-3">
+                <span className="text-xs font-medium text-muted-foreground">
+                  {translate("taskUI.assessment.modeTitle")}
+                </span>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={assessmentMode ? "default" : "outline"}
+                    onClick={() => setAssessmentMode(true)}
+                  >
+                    {translate("taskUI.assessment.modeWhiteboxShort")}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={!assessmentMode ? "default" : "outline"}
+                    onClick={() => setAssessmentMode(false)}
+                  >
+                    {translate("taskUI.assessment.modeLegacyShort")}
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {assessmentMode
+                    ? translate("taskUI.assessment.modeWhitebox")
+                    : translate("taskUI.assessment.modeLegacy")}
+                </p>
+              </div>
+              {!assessmentMode && (
+                <TaskTemplateControls
+                  description={description}
+                  goal={goal}
+                  remark={remark}
+                  categoryID={categoryID}
+                  interceptRules={interceptRules}
+                  workerCount={workerCount}
+                  selectedTemplateID={selectedTemplateID}
+                  onSelectedTemplateIDChange={setSelectedTemplateID}
+                  onApply={(template) => {
+                    setDescription(template.description);
+                    setGoal(template.goal);
+                    setRemark(template.remark ?? "");
+                    setCategoryID(template.category_id ?? undefined);
+                    setInterceptRules(template.intercept_rules ?? []);
+                    setWorkerCount(template.worker_count ? String(template.worker_count) : "");
+                    setUploadCount(0);
+                  }}
+                  portalContainer={sheetContentRef}
                 />
-                {translate("taskUI.scheduleEnable")}
-              </label>
-              {scheduleEnabled && (
-                <FieldGroup className="rounded-lg border p-3">
-                  <Field>
-                    <FieldLabel>{translate("taskUI.scheduleName")}</FieldLabel>
-                    <Input
-                      placeholder={translate("taskUI.defaultSchedule")}
-                      value={schedule.name}
-                      onChange={(e) => setSchedule({ ...schedule, name: e.target.value })}
-                    />
-                  </Field>
-                  <div className="grid grid-cols-2 gap-3">
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="name">{translate("taskUI.nameOptional")}</Label>
+                <Input
+                  id="name"
+                  placeholder={translate("taskUI.nameExample")}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="remark">{translate("taskUI.remarkOptional")}</Label>
+                <Textarea
+                  id="remark"
+                  className="min-h-20"
+                  maxLength={MAX_TASK_REMARK_RUNES}
+                  placeholder={translate("taskUI.remarkExample")}
+                  value={remark}
+                  onChange={(e) => setRemark(e.target.value)}
+                />
+              </div>
+              <Field>
+                <FieldLabel htmlFor="task-category">{translate("taskUI.category")}</FieldLabel>
+                <CategoryPicker
+                  categories={categories}
+                  value={categoryID}
+                  onValueChange={setCategoryID}
+                  onCategoryCreated={onCategoriesChanged}
+                  portalContainer={sheetContentRef}
+                />
+                <FieldDescription>{translate("taskUI.categoryHelp")}</FieldDescription>
+              </Field>
+              <FieldSet>
+                <FieldLegend>{translate("taskUI.scheduleOptional")}</FieldLegend>
+                <label htmlFor={scheduleEnabledID} className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    id={scheduleEnabledID}
+                    checked={scheduleEnabled}
+                    onCheckedChange={(v) => setScheduleEnabled(!!v)}
+                  />
+                  {translate("taskUI.scheduleEnable")}
+                </label>
+                {scheduleEnabled && (
+                  <FieldGroup className="rounded-lg border p-3">
                     <Field>
-                      <FieldLabel>{translate("taskUI.rule")}</FieldLabel>
-                      <Select
-                        value={schedule.schedule_type}
-                        onValueChange={(value) =>
-                          setSchedule({
-                            ...schedule,
-                            schedule_type: value as ScheduleInput["schedule_type"],
-                          })
-                        }
-                      >
-                        <SelectTrigger className="h-10 w-full bg-background">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="weekly">{translate("taskUI.weekly")}</SelectItem>
-                          <SelectItem value="once">{translate("taskUI.once")}</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      <FieldLabel>{translate("taskUI.scheduleName")}</FieldLabel>
+                      <Input
+                        placeholder={translate("taskUI.defaultSchedule")}
+                        value={schedule.name}
+                        onChange={(e) => setSchedule({ ...schedule, name: e.target.value })}
+                      />
                     </Field>
-                    <Field>
-                      <FieldLabel>{translate("taskUI.timezone")}</FieldLabel>
-                      <Select
-                        value={schedule.timezone_mode}
-                        onValueChange={(value) =>
-                          setSchedule({
-                            ...schedule,
-                            timezone_mode: value as ScheduleInput["timezone_mode"],
-                          })
-                        }
-                      >
-                        <SelectTrigger className="h-10 w-full bg-background">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="beijing">{translate("taskUI.beijing")}</SelectItem>
-                          <SelectItem value="system">{translate("taskUI.systemTimezone")}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </Field>
-                  </div>
-                  {schedule.schedule_type === "once" ? (
                     <div className="grid grid-cols-2 gap-3">
                       <Field>
-                        <FieldLabel>{translate("taskUI.startDate")}</FieldLabel>
-                        <DateSelect
-                          value={schedule.run_date ?? ""}
-                          onValueChange={(value) => setSchedule({ ...schedule, run_date: value })}
-                          aria-label={translate("taskUI.startDate")}
+                        <FieldLabel>{translate("taskUI.rule")}</FieldLabel>
+                        <Select
+                          value={schedule.schedule_type}
+                          onValueChange={(value) =>
+                            setSchedule({
+                              ...schedule,
+                              schedule_type: value as ScheduleInput["schedule_type"],
+                            })
+                          }
+                        >
+                          <SelectTrigger className="h-10 w-full bg-background">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="weekly">{translate("taskUI.weekly")}</SelectItem>
+                            <SelectItem value="once">{translate("taskUI.once")}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </Field>
+                      <Field>
+                        <FieldLabel>{translate("taskUI.timezone")}</FieldLabel>
+                        <Select
+                          value={schedule.timezone_mode}
+                          onValueChange={(value) =>
+                            setSchedule({
+                              ...schedule,
+                              timezone_mode: value as ScheduleInput["timezone_mode"],
+                            })
+                          }
+                        >
+                          <SelectTrigger className="h-10 w-full bg-background">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="beijing">{translate("taskUI.beijing")}</SelectItem>
+                            <SelectItem value="system">{translate("taskUI.systemTimezone")}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </Field>
+                    </div>
+                    {schedule.schedule_type === "once" ? (
+                      <div className="grid grid-cols-2 gap-3">
+                        <Field>
+                          <FieldLabel>{translate("taskUI.startDate")}</FieldLabel>
+                          <DateSelect
+                            value={schedule.run_date ?? ""}
+                            onValueChange={(value) => setSchedule({ ...schedule, run_date: value })}
+                            aria-label={translate("taskUI.startDate")}
+                          />
+                        </Field>
+                        <Field>
+                          <FieldLabel>{translate("taskUI.endDateOptional")}</FieldLabel>
+                          <DateSelect
+                            value={schedule.end_date ?? ""}
+                            onValueChange={(value) => setSchedule({ ...schedule, end_date: value })}
+                            optional
+                            placeholder={translate("taskUI.noEndDate")}
+                            aria-label={translate("taskUI.endDateAccessible")}
+                          />
+                        </Field>
+                      </div>
+                    ) : (
+                      <Field>
+                        <FieldLabel>{translate("taskUI.weekdays")}</FieldLabel>
+                        <Input
+                          value={(schedule.weekdays ?? []).join(",")}
+                          onChange={(e) =>
+                            setSchedule({
+                              ...schedule,
+                              weekdays: e.target.value
+                                .split(",")
+                                .map(Number)
+                                .filter((n) => n >= 1 && n <= 7),
+                            })
+                          }
+                          placeholder={translate("taskUI.weekdaysExample")}
+                        />
+                      </Field>
+                    )}
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field>
+                        <FieldLabel>{translate("taskUI.startTime")}</FieldLabel>
+                        <TimeSelect
+                          value={schedule.start_time}
+                          onValueChange={(value) => setSchedule({ ...schedule, start_time: value })}
+                          aria-label={translate("taskUI.startTime")}
                         />
                       </Field>
                       <Field>
-                        <FieldLabel>{translate("taskUI.endDateOptional")}</FieldLabel>
-                        <DateSelect
-                          value={schedule.end_date ?? ""}
-                          onValueChange={(value) => setSchedule({ ...schedule, end_date: value })}
+                        <FieldLabel>{translate("taskUI.endTimeOptional")}</FieldLabel>
+                        <TimeSelect
+                          value={schedule.end_time ?? ""}
+                          onValueChange={(value) => setSchedule({ ...schedule, end_time: value })}
                           optional
-                          placeholder={translate("taskUI.noEndDate")}
-                          aria-label={translate("taskUI.endDateAccessible")}
+                          aria-label={translate("taskUI.endTimeAccessible")}
                         />
                       </Field>
                     </div>
-                  ) : (
-                    <Field>
-                      <FieldLabel>{translate("taskUI.weekdays")}</FieldLabel>
-                      <Input
-                        value={(schedule.weekdays ?? []).join(",")}
-                        onChange={(e) =>
-                          setSchedule({
-                            ...schedule,
-                            weekdays: e.target.value
-                              .split(",")
-                              .map(Number)
-                              .filter((n) => n >= 1 && n <= 7),
-                          })
-                        }
-                        placeholder={translate("taskUI.weekdaysExample")}
+                    <label htmlFor={scheduleImmediateID} className="flex items-center gap-2 text-sm">
+                      <Checkbox
+                        id={scheduleImmediateID}
+                        checked={schedule.start_immediately}
+                        onCheckedChange={(v) => setSchedule({ ...schedule, start_immediately: !!v })}
                       />
-                    </Field>
-                  )}
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field>
-                      <FieldLabel>{translate("taskUI.startTime")}</FieldLabel>
-                      <TimeSelect
-                        value={schedule.start_time}
-                        onValueChange={(value) => setSchedule({ ...schedule, start_time: value })}
-                        aria-label={translate("taskUI.startTime")}
-                      />
-                    </Field>
-                    <Field>
-                      <FieldLabel>{translate("taskUI.endTimeOptional")}</FieldLabel>
-                      <TimeSelect
-                        value={schedule.end_time ?? ""}
-                        onValueChange={(value) => setSchedule({ ...schedule, end_time: value })}
-                        optional
-                        aria-label={translate("taskUI.endTimeAccessible")}
-                      />
-                    </Field>
-                  </div>
-                  <label htmlFor={scheduleImmediateID} className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id={scheduleImmediateID}
-                      checked={schedule.start_immediately}
-                      onCheckedChange={(v) => setSchedule({ ...schedule, start_immediately: !!v })}
-                    />
-                    {translate("taskUI.startImmediately")}
-                  </label>
-                </FieldGroup>
-              )}
-            </FieldSet>
-            <div className="grid gap-2">
-              <Label htmlFor="description">{translate("taskUI.description")}</Label>
-              <Textarea
-                id="description"
-                className="min-h-32"
-                placeholder={translate("taskUI.descriptionExample")}
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-              />
-              {/* 上传文件(可多选):暂存到 drafts/,把绝对路径追加进上方描述,worker 据此 Read/Bash 打开。 */}
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => void pickFiles(e.target.files)}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploading}
-                >
-                  {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
-                  {translate("taskUI.upload")}
-                </Button>
-                <span className="text-muted-foreground text-xs">
-                  {uploadCount > 0
-                    ? translate("taskUI.uploaded", { count: uploadCount })
-                    : translate("taskUI.uploadHelp")}
-                </span>
-              </div>
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="goal">{translate("taskUI.goal")}</Label>
-              <Textarea
-                id="goal"
-                className="min-h-32"
-                placeholder={translate("taskUI.goalExample")}
-                value={goal}
-                onChange={(e) => setGoal(e.target.value)}
-              />
-            </div>
-            <Field>
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="share-global-assets"
-                  checked={shareGlobalAssets}
-                  onCheckedChange={(checked) => setShareGlobalAssets(checked === true)}
-                />
-                <Label htmlFor="share-global-assets">{translate("taskUI.shareGlobal")}</Label>
-              </div>
-              <FieldDescription>{translate("taskUI.shareGlobalHelp")}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="source-tasks">{translate("taskUI.linkedTasks")}</FieldLabel>
-              <SourceTaskPicker
-                tasks={tasks}
-                value={sourceTaskIDs}
-                onValueChange={setSourceTaskIDs}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>{translate("taskUI.sourceHelp", { count: MAX_SOURCE_TASKS })}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="task-companies">{translate("taskUI.companyScope")}</FieldLabel>
-              <CompanyPicker
-                companies={companies}
-                value={companyIDs}
-                onValueChange={setCompanyIDs}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>{translate("taskUI.companyScopeHelp")}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="task-intercept-rules">{translate("taskUI.interceptOptional")}</FieldLabel>
-              <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
-              <FieldDescription>{translate("taskUI.interceptHelp")}</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="llm-profiles">{translate("taskUI.llmChain")}</FieldLabel>
-              <TaskLLMProfileChain
-                profiles={profiles}
-                value={llmProfileIDs}
-                onValueChange={setLLMProfileIDs}
-                inputId="llm-profiles"
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>{translate("taskUI.llmChainHelp")}</FieldDescription>
-            </Field>
-
-            {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}
-            <Collapsible>
-              <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
-                <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
-                {translate("taskUI.advanced")}
-                <span className="text-muted-foreground ml-auto text-xs font-normal">
-                  {translate("taskUI.advancedSummary")}
-                </span>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="grid gap-5 pt-5">
-                <div className="grid gap-2">
-                  <Label htmlFor="timeout-min">{translate("taskUI.timeoutOptional")}</Label>
-                  <Input
-                    id="timeout-min"
-                    type="number"
-                    min={0}
-                    className="w-40"
-                    placeholder={translate("taskUI.noTimeout")}
-                    value={timeoutMin}
-                    onChange={(e) => setTimeoutMin(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.timeoutHelp")}</p>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="no-result-min">{translate("taskUI.noResultOptional")}</Label>
-                  <Input
-                    id="no-result-min"
-                    type="number"
-                    min={0}
-                    className="w-40"
-                    placeholder="120"
-                    value={noResultMin}
-                    onChange={(e) => setNoResultMin(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.noResultHelp")}</p>
-                </div>
-                {Number(noResultMin) > 0 && (
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="grid gap-2">
-                      <Label htmlFor="no-result-count">{translate("taskUI.noResultCount")}</Label>
-                      <Input
-                        id="no-result-count"
-                        type="number"
-                        min={1}
-                        step={1}
-                        value={noResultCount}
-                        onChange={(e) => setNoResultCount(e.target.value)}
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="no-result-severity">{translate("taskUI.noResultSeverity")}</Label>
-                      <Select
-                        value={noResultSeverity || "any"}
-                        onValueChange={(v) =>
-                          setNoResultSeverity((v === "any" ? "" : v) as NonNullable<Task["no_result_min_severity"]>)
-                        }
-                      >
-                        <SelectTrigger id="no-result-severity">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="any">{translate("taskUI.noResultAnySeverity")}</SelectItem>
-                          <SelectItem value="low">{translate("taskUI.noResultLow")}</SelectItem>
-                          <SelectItem value="medium">{translate("taskUI.noResultMedium")}</SelectItem>
-                          <SelectItem value="high">{translate("taskUI.noResultHigh")}</SelectItem>
-                          <SelectItem value="critical">{translate("taskUI.noResultCritical")}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
+                      {translate("taskUI.startImmediately")}
+                    </label>
+                  </FieldGroup>
                 )}
-                <div className="grid gap-2">
-                  <Label htmlFor="heartbeat-min">{translate("taskUI.heartbeat")}</Label>
-                  <Input
-                    id="heartbeat-min"
-                    type="number"
-                    min={10}
-                    className="w-40"
-                    placeholder={translate("taskUI.defaultTen")}
-                    value={heartbeatMin}
-                    onChange={(e) => setHeartbeatMin(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.heartbeatHelp")}</p>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="worker-count">{translate("taskUI.workerCount")}</Label>
-                  <Input
-                    id="worker-count"
-                    type="number"
-                    min={0}
-                    max={MAX_TASK_WORKER_COUNT}
-                    className="w-40"
-                    placeholder={translate("taskUI.globalDefault")}
-                    value={workerCount}
-                    onChange={(e) => setWorkerCount(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.workerCountHelp")}</p>
-                </div>
-                <div className="grid gap-2">
-                  <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id="seed-first-intent"
-                      checked={seedFirstIntent}
-                      onCheckedChange={(v) => setSeedFirstIntent(!!v)}
+              </FieldSet>
+              {assessmentMode ? (
+                <AssessmentConfigFormFields config={assessmentConfig} onChange={setAssessmentConfig} />
+              ) : (
+                <>
+                  <div className="grid gap-2">
+                    <Label htmlFor="description">{translate("taskUI.description")}</Label>
+                    <Textarea
+                      id="description"
+                      className="min-h-32"
+                      placeholder={translate("taskUI.descriptionExample")}
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
                     />
-                    {translate("taskUI.seedIntent")}
-                  </label>
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.seedIntentHelp")}</p>
-                </div>
-                <div className="grid gap-2">
-                  <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id="coverage-enabled"
-                      checked={coverageEnabled}
-                      onCheckedChange={(v) => setCoverageEnabled(!!v)}
+                    {/* 上传文件(可多选):暂存到 drafts/,把绝对路径追加进上方描述,worker 据此 Read/Bash 打开。 */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => void pickFiles(e.target.files)}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={uploading}
+                      >
+                        {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
+                        {translate("taskUI.upload")}
+                      </Button>
+                      <span className="text-muted-foreground text-xs">
+                        {uploadCount > 0
+                          ? translate("taskUI.uploaded", { count: uploadCount })
+                          : translate("taskUI.uploadHelp")}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="goal">{translate("taskUI.goal")}</Label>
+                    <Textarea
+                      id="goal"
+                      className="min-h-32"
+                      placeholder={translate("taskUI.goalExample")}
+                      value={goal}
+                      onChange={(e) => setGoal(e.target.value)}
                     />
-                    {translate("taskUI.coverage")}
-                  </label>
-                  <p className="text-muted-foreground text-xs">{translate("taskUI.coverageHelp")}</p>
+                  </div>
+                </>
+              )}
+              <Field>
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="share-global-assets"
+                    checked={shareGlobalAssets}
+                    onCheckedChange={(checked) => setShareGlobalAssets(checked === true)}
+                  />
+                  <Label htmlFor="share-global-assets">{translate("taskUI.shareGlobal")}</Label>
                 </div>
-              </CollapsibleContent>
-            </Collapsible>
-          </div>
+                <FieldDescription>{translate("taskUI.shareGlobalHelp")}</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="source-tasks">{translate("taskUI.linkedTasks")}</FieldLabel>
+                <SourceTaskPicker
+                  tasks={tasks}
+                  value={sourceTaskIDs}
+                  onValueChange={setSourceTaskIDs}
+                  portalContainer={sheetContentRef}
+                />
+                <FieldDescription>{translate("taskUI.sourceHelp", { count: MAX_SOURCE_TASKS })}</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="task-companies">{translate("taskUI.companyScope")}</FieldLabel>
+                <CompanyPicker
+                  companies={companies}
+                  value={companyIDs}
+                  onValueChange={setCompanyIDs}
+                  portalContainer={sheetContentRef}
+                />
+                <FieldDescription>{translate("taskUI.companyScopeHelp")}</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="task-intercept-rules">{translate("taskUI.interceptOptional")}</FieldLabel>
+                <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
+                <FieldDescription>{translate("taskUI.interceptHelp")}</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="llm-profiles">{translate("taskUI.llmChain")}</FieldLabel>
+                <TaskLLMProfileChain
+                  profiles={profiles}
+                  value={llmProfileIDs}
+                  onValueChange={setLLMProfileIDs}
+                  inputId="llm-profiles"
+                  portalContainer={sheetContentRef}
+                />
+                <FieldDescription>{translate("taskUI.llmChainHelp")}</FieldDescription>
+              </Field>
+
+              {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}
+              <Collapsible>
+                <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
+                  <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
+                  {translate("taskUI.advanced")}
+                  <span className="text-muted-foreground ml-auto text-xs font-normal">
+                    {translate("taskUI.advancedSummary")}
+                  </span>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="grid gap-5 pt-5">
+                  <div className="grid gap-2">
+                    <Label htmlFor="timeout-min">{translate("taskUI.timeoutOptional")}</Label>
+                    <Input
+                      id="timeout-min"
+                      type="number"
+                      min={0}
+                      className="w-40"
+                      placeholder={translate("taskUI.noTimeout")}
+                      value={timeoutMin}
+                      onChange={(e) => setTimeoutMin(e.target.value)}
+                    />
+                    <p className="text-muted-foreground text-xs">{translate("taskUI.timeoutHelp")}</p>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="no-result-min">{translate("taskUI.noResultOptional")}</Label>
+                    <Input
+                      id="no-result-min"
+                      type="number"
+                      min={0}
+                      className="w-40"
+                      placeholder="120"
+                      value={noResultMin}
+                      onChange={(e) => setNoResultMin(e.target.value)}
+                    />
+                    <p className="text-muted-foreground text-xs">{translate("taskUI.noResultHelp")}</p>
+                  </div>
+                  {Number(noResultMin) > 0 && (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="grid gap-2">
+                        <Label htmlFor="no-result-count">{translate("taskUI.noResultCount")}</Label>
+                        <Input
+                          id="no-result-count"
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={noResultCount}
+                          onChange={(e) => setNoResultCount(e.target.value)}
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="no-result-severity">{translate("taskUI.noResultSeverity")}</Label>
+                        <Select
+                          value={noResultSeverity || "any"}
+                          onValueChange={(v) =>
+                            setNoResultSeverity((v === "any" ? "" : v) as NonNullable<Task["no_result_min_severity"]>)
+                          }
+                        >
+                          <SelectTrigger id="no-result-severity">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="any">{translate("taskUI.noResultAnySeverity")}</SelectItem>
+                            <SelectItem value="low">{translate("taskUI.noResultLow")}</SelectItem>
+                            <SelectItem value="medium">{translate("taskUI.noResultMedium")}</SelectItem>
+                            <SelectItem value="high">{translate("taskUI.noResultHigh")}</SelectItem>
+                            <SelectItem value="critical">{translate("taskUI.noResultCritical")}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                  )}
+                  <div className="grid gap-2">
+                    <Label htmlFor="heartbeat-min">{translate("taskUI.heartbeat")}</Label>
+                    <Input
+                      id="heartbeat-min"
+                      type="number"
+                      min={10}
+                      className="w-40"
+                      placeholder={translate("taskUI.defaultTen")}
+                      value={heartbeatMin}
+                      onChange={(e) => setHeartbeatMin(e.target.value)}
+                    />
+                    <p className="text-muted-foreground text-xs">{translate("taskUI.heartbeatHelp")}</p>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="worker-count">{translate("taskUI.workerCount")}</Label>
+                    <Input
+                      id="worker-count"
+                      type="number"
+                      min={0}
+                      max={MAX_TASK_WORKER_COUNT}
+                      className="w-40"
+                      placeholder={translate("taskUI.globalDefault")}
+                      value={workerCount}
+                      onChange={(e) => setWorkerCount(e.target.value)}
+                    />
+                    <p className="text-muted-foreground text-xs">{translate("taskUI.workerCountHelp")}</p>
+                  </div>
+                  {!assessmentMode && (
+                    <div className="grid gap-2">
+                      <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
+                        <Checkbox
+                          id="seed-first-intent"
+                          checked={seedFirstIntent}
+                          onCheckedChange={(v) => setSeedFirstIntent(!!v)}
+                        />
+                        {translate("taskUI.seedIntent")}
+                      </label>
+                      <p className="text-muted-foreground text-xs">{translate("taskUI.seedIntentHelp")}</p>
+                    </div>
+                  )}
+                  <div className="grid gap-2">
+                    <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
+                      <Checkbox
+                        id="coverage-enabled"
+                        checked={coverageEnabled}
+                        onCheckedChange={(v) => setCoverageEnabled(!!v)}
+                      />
+                      {translate("taskUI.coverage")}
+                    </label>
+                    <p className="text-muted-foreground text-xs">{translate("taskUI.coverageHelp")}</p>
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
+          )}
         </div>
 
         <SheetFooter className="flex-row justify-end gap-2 border-t p-4">
           <SheetClose asChild>
-            <Button variant="outline">{translate("taskUI.cancel")}</Button>
+            <Button variant="outline">
+              {activeDraftTask ? translate("taskUI.close") : translate("taskUI.cancel")}
+            </Button>
           </SheetClose>
-          <Button onClick={createTask} disabled={creating || uploading}>
-            {creating && <Spinner data-icon="inline-start" />}
-            {creating ? translate("taskUI.creating") : translate("taskUI.create")}
-          </Button>
+          {!activeDraftTask && (
+            <Button onClick={createTask} disabled={creating || uploading}>
+              {creating && <Spinner data-icon="inline-start" />}
+              {creating
+                ? assessmentMode
+                  ? translate("taskUI.assessment.creatingDraft")
+                  : translate("taskUI.creating")
+                : assessmentMode
+                  ? translate("taskUI.assessment.createDraft")
+                  : translate("taskUI.create")}
+            </Button>
+          )}
         </SheetFooter>
       </SheetContent>
     </Sheet>

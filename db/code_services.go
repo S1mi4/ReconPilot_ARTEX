@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -14,6 +16,7 @@ type TaskCodeService struct {
 	CodebaseID      string                   `json:"codebase_id"`
 	RelativePath    string                   `json:"relative_path"`
 	Name            string                   `json:"name"`
+	Languages       []string                 `json:"languages"`
 	Decision        string                   `json:"decision"`
 	DecisionSource  string                   `json:"decision_source"`
 	AssetID         *int64                   `json:"asset_id,omitempty"`
@@ -48,17 +51,51 @@ type TaskCodebaseDiscoveryRun struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
-// CodeServiceDiscoveryCandidate is the bounded metadata classification written
-// by the codebase discovery agent. Decision values are service, not_service,
-// or uncertain; only service candidates with strong or explicit evidence become
-// code_service assets.
+// CodeServiceDiscoveryCandidate is a service decision for one snapshot.
+// SourceDirectory marks a confirmed parent of src in a source snapshot.
 type CodeServiceDiscoveryCandidate struct {
-	RelativePath string          `json:"relative_path"`
-	Name         string          `json:"name"`
-	Decision     string          `json:"decision"`
-	Source       string          `json:"source"`
-	Reason       string          `json:"reason"`
-	Evidence     json.RawMessage `json:"evidence"`
+	RelativePath    string          `json:"relative_path"`
+	Name            string          `json:"name"`
+	Languages       []string        `json:"languages"`
+	Decision        string          `json:"decision"`
+	Source          string          `json:"source"`
+	Reason          string          `json:"reason"`
+	Evidence        json.RawMessage `json:"evidence"`
+	SourceDirectory bool            `json:"-"`
+}
+
+// codeServiceLanguages scans array_to_json(languages), avoiding driver-specific
+// TEXT[] decoding through database/sql.
+type codeServiceLanguages []string
+
+func (languages *codeServiceLanguages) Scan(value any) error {
+	var data []byte
+	switch value := value.(type) {
+	case string:
+		data = []byte(value)
+	case []byte:
+		data = value
+	default:
+		return fmt.Errorf("invalid code service languages value %T", value)
+	}
+	return json.Unmarshal(data, languages)
+}
+
+func normalizedCodeServiceLanguages(languages []string) []string {
+	seen := make(map[string]bool, len(languages))
+	result := make([]string, 0, len(languages))
+	for _, language := range languages {
+		language = strings.ToLower(strings.TrimSpace(language))
+		if language != "" && !seen[language] {
+			seen[language] = true
+			result = append(result, language)
+		}
+	}
+	if len(result) == 0 {
+		return []string{"java"}
+	}
+	sort.Strings(result)
+	return result
 }
 
 type TaskCodebaseVersionRef struct {
@@ -148,35 +185,49 @@ ON CONFLICT(code_service_id,version_id) DO NOTHING`, taskID, version.CodebaseID,
 		if source != "llm" && source != "discovery" {
 			source = "discovery"
 		}
-		evidence := candidate.Evidence
-		if len(evidence) == 0 || !json.Valid(evidence) {
-			evidence = json.RawMessage(`{}`)
+		languages, err := json.Marshal(normalizedCodeServiceLanguages(candidate.Languages))
+		if err != nil {
+			return err
+		}
+		var evidenceFields map[string]json.RawMessage
+		if err := json.Unmarshal(candidate.Evidence, &evidenceFields); err != nil || evidenceFields == nil {
+			evidenceFields = make(map[string]json.RawMessage)
+		}
+		// Scanner languages are authoritative even if evidence came from an LLM.
+		evidenceFields["languages"] = languages
+		evidence, err := json.Marshal(evidenceFields)
+		if err != nil {
+			return err
 		}
 		resolved := map[string]string{"service": "confirmed", "not_service": "rejected", "uncertain": "pending"}[decision]
-		if _, err := tx.Exec(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,evidence,reason)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(task_id,codebase_id,relative_path) DO NOTHING`,
-			taskID, version.CodebaseID, candidate.RelativePath, candidate.Name, resolved, source, string(evidence), candidate.Reason); err != nil {
+		if _, err := tx.Exec(`INSERT INTO task_code_services(task_id,codebase_id,relative_path,name,decision,decision_source,evidence,reason,languages)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,ARRAY(SELECT jsonb_array_elements_text($9::jsonb))) ON CONFLICT(task_id,codebase_id,relative_path) DO NOTHING`,
+			taskID, version.CodebaseID, candidate.RelativePath, candidate.Name, resolved, source, string(evidence), candidate.Reason, string(languages)); err != nil {
 			return err
 		}
 		var service TaskCodeService
 		var assetID sql.NullInt64
 		if err := tx.QueryRow(`SELECT id,task_id,codebase_id,relative_path,name,decision,decision_source,asset_id,
-latest_version_id,latest_present,evidence,reason,created_at,updated_at
+latest_version_id,latest_present,evidence,reason,created_at,updated_at,array_to_json(languages)
 FROM task_code_services WHERE task_id=$1 AND codebase_id=$2 AND relative_path=$3 FOR UPDATE`,
 			taskID, version.CodebaseID, candidate.RelativePath).Scan(
 			&service.ID, &service.TaskID, &service.CodebaseID, &service.RelativePath, &service.Name,
 			&service.Decision, &service.DecisionSource, &assetID, &service.LatestVersionID, &service.LatestPresent,
-			&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt); err != nil {
+			&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt, (*codeServiceLanguages)(&service.Languages)); err != nil {
 			return err
 		}
-		if service.DecisionSource != "manual" {
-			effectiveDecision, effectiveSource := resolved, source
-			if service.Decision == "confirmed" {
-				effectiveDecision, effectiveSource = service.Decision, service.DecisionSource
-			}
+		// A source directory now meets the fixed discovery rule even if older
+		// heuristic discovery required a manual decision for this path.
+		sourceRuleConfirmed := candidate.SourceDirectory && resolved == "confirmed" && source == "discovery"
+		if service.DecisionSource != "manual" || (sourceRuleConfirmed && service.Decision == "rejected") {
 			if _, err := tx.Exec(`UPDATE task_code_services SET name=$2,decision=$3,decision_source=$4,evidence=$5,reason=$6,updated_at=now()
-WHERE id=$1`, service.ID, candidate.Name, effectiveDecision, effectiveSource, string(evidence), candidate.Reason); err != nil {
+WHERE id=$1`, service.ID, candidate.Name, resolved, source, string(evidence), candidate.Reason); err != nil {
 				return err
+			}
+			if service.Decision == "confirmed" && resolved != "confirmed" && assetID.Valid {
+				if err := detachReclassifiedCodeServiceAsset(tx, taskID, service.ID, assetID.Int64); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := tx.Exec(`INSERT INTO task_code_service_versions(code_service_id,version_id,version_created_at,present,evidence)
@@ -198,7 +249,9 @@ ON CONFLICT(code_service_id,version_id) DO NOTHING`, taskID, version.CodebaseID,
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE task_code_services service SET latest_version_id=latest.version_id,latest_present=latest.present,
- evidence=latest.evidence,updated_at=now()
+ evidence=latest.evidence,languages=CASE WHEN jsonb_typeof(latest.evidence->'languages')='array'
+ THEN ARRAY(SELECT jsonb_array_elements_text(latest.evidence->'languages'))
+ ELSE ARRAY['java']::text[] END,updated_at=now()
 FROM (
  SELECT DISTINCT ON (observation.code_service_id) observation.code_service_id,observation.version_id,
  observation.version_created_at,observation.present,observation.evidence
@@ -213,14 +266,18 @@ AND (service.latest_version_id='' OR latest.version_created_at >= COALESCE((
 ),'-infinity'::timestamptz))`, taskID, version.CodebaseID); err != nil {
 		return err
 	}
-	rows, err := tx.Query(`SELECT id,decision,decision_source,asset_id,codebase_id,relative_path,name,latest_version_id,latest_present,evidence,reason
-FROM task_code_services WHERE task_id=$1 AND codebase_id=$2 FOR UPDATE`, taskID, version.CodebaseID)
+	rows, err := tx.Query(`SELECT service.id,decision,decision_source,asset_id,codebase_id,relative_path,name,latest_version_id,latest_present,
+service.evidence,reason,array_to_json(languages),COALESCE(observation.present,false)
+FROM task_code_services service
+LEFT JOIN task_code_service_versions observation ON observation.code_service_id=service.id AND observation.version_id=$3
+WHERE task_id=$1 AND codebase_id=$2 FOR UPDATE OF service`, taskID, version.CodebaseID, version.ID)
 	if err != nil {
 		return err
 	}
 	type assetState struct {
-		service TaskCodeService
-		assetID sql.NullInt64
+		service      TaskCodeService
+		assetID      sql.NullInt64
+		presentInRun bool
 	}
 	assets := make([]assetState, 0)
 	confirmed, pending := 0, 0
@@ -228,14 +285,16 @@ FROM task_code_services WHERE task_id=$1 AND codebase_id=$2 FOR UPDATE`, taskID,
 		var item assetState
 		if err := rows.Scan(&item.service.ID, &item.service.Decision, &item.service.DecisionSource, &item.assetID,
 			&item.service.CodebaseID, &item.service.RelativePath, &item.service.Name, &item.service.LatestVersionID,
-			&item.service.LatestPresent, &item.service.Evidence, &item.service.Reason); err != nil {
+			&item.service.LatestPresent, &item.service.Evidence, &item.service.Reason, (*codeServiceLanguages)(&item.service.Languages), &item.presentInRun); err != nil {
 			rows.Close()
 			return err
 		}
 		if item.service.Decision == "confirmed" {
-			confirmed++
 			assets = append(assets, item)
-		} else if item.service.Decision == "pending" {
+			if item.presentInRun {
+				confirmed++
+			}
+		} else if item.service.Decision == "pending" && item.presentInRun {
 			pending++
 		}
 	}
@@ -243,6 +302,22 @@ FROM task_code_services WHERE task_id=$1 AND codebase_id=$2 FOR UPDATE`, taskID,
 		return err
 	}
 	for _, item := range assets {
+		// A confirmed service that the newest snapshot no longer contains must not
+		// keep a task asset: refresh the existing asset's presence, then detach it
+		// unless an audit run or finding already references it.
+		if !item.presentInRun {
+			if !item.assetID.Valid {
+				continue
+			}
+			assetID, err := upsertCodeServiceAsset(tx, taskID, item.service)
+			if err != nil {
+				return err
+			}
+			if err := detachReclassifiedCodeServiceAsset(tx, taskID, item.service.ID, assetID); err != nil {
+				return err
+			}
+			continue
+		}
 		assetID, err := upsertCodeServiceAsset(tx, taskID, item.service)
 		if err != nil {
 			return err
@@ -259,6 +334,24 @@ WHERE task_id=$1 AND version_id=$2`, taskID, version.ID, len(candidates), confir
 	return tx.Commit()
 }
 
+func detachReclassifiedCodeServiceAsset(tx *sql.Tx, taskID, serviceID, assetID int64) error {
+	var hasHistory bool
+	if err := tx.QueryRow(`SELECT
+EXISTS(SELECT 1 FROM task_code_audit_runs WHERE code_service_id=$1) OR
+EXISTS(SELECT 1 FROM findings WHERE task_id=$2 AND asset_ids @> jsonb_build_array($3::bigint))`,
+		serviceID, taskID, assetID).Scan(&hasHistory); err != nil {
+		return err
+	}
+	if hasHistory {
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE assets SET task_ids=array_remove(task_ids,$1) WHERE id=$2`, taskID, assetID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE task_code_services SET asset_id=NULL WHERE id=$1 AND asset_id=$2`, serviceID, assetID)
+	return err
+}
+
 func upsertCodeServiceAsset(tx *sql.Tx, taskID int64, service TaskCodeService) (int64, error) {
 	var projectID int64
 	if err := tx.QueryRow(`SELECT project_id FROM tasks WHERE id=$1`, taskID).Scan(&projectID); err != nil {
@@ -267,7 +360,7 @@ func upsertCodeServiceAsset(tx *sql.Tx, taskID int64, service TaskCodeService) (
 	extra := map[string]any{
 		"task_id": taskID, "codebase_id": service.CodebaseID, "relative_path": service.RelativePath,
 		"latest_version_id": service.LatestVersionID, "present": service.LatestPresent,
-		"evidence": json.RawMessage(service.Evidence), "reason": service.Reason,
+		"evidence": json.RawMessage(service.Evidence), "reason": service.Reason, "languages": service.Languages,
 	}
 	encoded, err := json.Marshal(extra)
 	if err != nil {
@@ -314,7 +407,7 @@ VALUES($1,$2,$3,$4) ON CONFLICT(task_id,asset_id) DO UPDATE SET source=EXCLUDED.
 
 func (d *DB) ListTaskCodeServices(taskID int64) ([]TaskCodeService, []TaskCodebaseDiscoveryRun, error) {
 	rows, err := d.Query(`SELECT id,task_id,codebase_id,relative_path,name,decision,decision_source,asset_id,
-latest_version_id,latest_present,evidence,reason,created_at,updated_at
+latest_version_id,latest_present,evidence,reason,created_at,updated_at,array_to_json(languages)
 FROM task_code_services WHERE task_id=$1 ORDER BY updated_at DESC,id DESC`, taskID)
 	if err != nil {
 		return nil, nil, err
@@ -325,7 +418,7 @@ FROM task_code_services WHERE task_id=$1 ORDER BY updated_at DESC,id DESC`, task
 		var assetID sql.NullInt64
 		if err := rows.Scan(&service.ID, &service.TaskID, &service.CodebaseID, &service.RelativePath, &service.Name,
 			&service.Decision, &service.DecisionSource, &assetID, &service.LatestVersionID, &service.LatestPresent,
-			&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt); err != nil {
+			&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt, (*codeServiceLanguages)(&service.Languages)); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
@@ -404,11 +497,11 @@ func (d *DB) DecideTaskCodeService(taskID, serviceID int64, decision string) (*T
 	var service TaskCodeService
 	var assetID sql.NullInt64
 	if err := tx.QueryRow(`SELECT id,task_id,codebase_id,relative_path,name,decision,decision_source,asset_id,
-latest_version_id,latest_present,evidence,reason,created_at,updated_at
+latest_version_id,latest_present,evidence,reason,created_at,updated_at,array_to_json(languages)
 FROM task_code_services WHERE task_id=$1 AND id=$2 FOR UPDATE`, taskID, serviceID).Scan(
 		&service.ID, &service.TaskID, &service.CodebaseID, &service.RelativePath, &service.Name,
 		&service.Decision, &service.DecisionSource, &assetID, &service.LatestVersionID, &service.LatestPresent,
-		&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt); err != nil {
+		&service.Evidence, &service.Reason, &service.CreatedAt, &service.UpdatedAt, (*codeServiceLanguages)(&service.Languages)); err != nil {
 		return nil, err
 	}
 	if decision == "confirm" {
@@ -438,4 +531,17 @@ WHERE task_id=$1 AND id=$2`, taskID, serviceID); err != nil {
 		return nil, err
 	}
 	return &service, nil
+}
+
+// SetTaskCodebaseDiscoveryNote records a non-fatal note on a discovery run.
+func (d *DB) SetTaskCodebaseDiscoveryNote(taskID int64, versionID, note string) error {
+	_, err := d.Exec(`UPDATE task_codebase_discovery_runs SET error=$3 WHERE task_id=$1 AND version_id=$2`, taskID, versionID, note)
+	return err
+}
+
+// TaskCodebaseDiscoveryCounts returns the persisted candidate/confirmed/pending counts of a discovery run.
+func (d *DB) TaskCodebaseDiscoveryCounts(taskID int64, versionID string) (candidates, confirmed, pending int, err error) {
+	err = d.QueryRow(`SELECT candidate_count,confirmed_count,pending_count FROM task_codebase_discovery_runs
+WHERE task_id=$1 AND version_id=$2`, taskID, versionID).Scan(&candidates, &confirmed, &pending)
+	return
 }

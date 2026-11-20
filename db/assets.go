@@ -1156,7 +1156,22 @@ func pageClause(args *[]any, limit, offset int) string {
 }
 
 // QueryByTask returns assets rows that have a given task_id in task_ids.
+// currentCodeServiceOnly hides code_service assets that the newest codebase
+// snapshot no longer contains (extra.present=false). Other asset types are
+// unaffected.
+const currentCodeServiceOnly = `NOT (type = 'code_service' AND extra->>'present' = 'false')`
+
 func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([]*Asset, error) {
+	return s.queryByTask(taskID, typ, limit, offset, false)
+}
+
+// QueryByTaskCurrent is QueryByTask without code_service assets that are absent
+// from the task's newest codebase snapshot.
+func (s *AssetStore) QueryByTaskCurrent(taskID int64, typ string, limit, offset int) ([]*Asset, error) {
+	return s.queryByTask(taskID, typ, limit, offset, true)
+}
+
+func (s *AssetStore) queryByTask(taskID int64, typ string, limit, offset int, currentOnly bool) ([]*Asset, error) {
 	q := `SELECT id, type, company_id, array_to_json(task_ids)::text,
        COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
        COALESCE(c_segment::text,''), port,
@@ -1172,6 +1187,9 @@ FROM assets WHERE $1 = ANY(task_ids)`
 	if typ != "" {
 		args = append(args, typ)
 		q += fmt.Sprintf(` AND type = $%d`, len(args))
+	}
+	if currentOnly {
+		q += ` AND ` + currentCodeServiceOnly
 	}
 	q += pageClause(&args, limit, offset)
 	rows, err := s.db.Query(q, args...)
@@ -1190,11 +1208,24 @@ FROM assets WHERE $1 = ANY(task_ids)`
 }
 
 func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
+	return s.countByTask(taskID, typ, false)
+}
+
+// CountByTaskCurrent is CountByTask without code_service assets that are absent
+// from the task's newest codebase snapshot.
+func (s *AssetStore) CountByTaskCurrent(taskID int64, typ string) (int, error) {
+	return s.countByTask(taskID, typ, true)
+}
+
+func (s *AssetStore) countByTask(taskID int64, typ string, currentOnly bool) (int, error) {
 	q := `SELECT count(*) FROM assets WHERE $1 = ANY(task_ids)`
 	args := []any{taskID}
 	if typ != "" {
 		args = append(args, typ)
 		q += fmt.Sprintf(` AND type = $%d`, len(args))
+	}
+	if currentOnly {
+		q += ` AND ` + currentCodeServiceOnly
 	}
 	var n int
 	err := s.db.QueryRow(q, args...).Scan(&n)
@@ -1202,7 +1233,21 @@ func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
 }
 
 func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
-	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM assets WHERE $1 = ANY(task_ids) GROUP BY type`, taskID)
+	return s.countsByTypeForTask(taskID, false)
+}
+
+// CountsByTypeForTaskCurrent is CountsByTypeForTask without code_service assets
+// that are absent from the task's newest codebase snapshot.
+func (s *AssetStore) CountsByTypeForTaskCurrent(taskID int64) (map[string]int, error) {
+	return s.countsByTypeForTask(taskID, true)
+}
+
+func (s *AssetStore) countsByTypeForTask(taskID int64, currentOnly bool) (map[string]int, error) {
+	q := `SELECT type, COUNT(*) FROM assets WHERE $1 = ANY(task_ids)`
+	if currentOnly {
+		q += ` AND ` + currentCodeServiceOnly
+	}
+	rows, err := s.db.Query(q+` GROUP BY type`, taskID)
 	if err != nil {
 		return nil, err
 	}

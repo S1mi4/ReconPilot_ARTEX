@@ -340,8 +340,9 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 
 	order := "f.created_at " + f.timeOrder() + ", f.id DESC"
 	if f.Sort == "severity" {
-		// critical > high > medium > low > 其它, then the requested time direction.
-		order = `CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, ` + order
+		// Partial static leads follow findings with complete evidence. Preserve
+		// severity and explicit time sorting rather than changing stored severity.
+		order = `CASE WHEN f.code_audit_evidence->>'registration_tier'='B' THEN 1 ELSE 0 END, CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, ` + order
 	}
 	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	q := fmt.Sprintf(`
