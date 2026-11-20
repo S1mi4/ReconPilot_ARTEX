@@ -1,0 +1,797 @@
+package db
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// 白盒驱动测试转型的领域定义与程序完成判定契约。
+// 设计文档：docs/whitebox-driven-assessment-design.md（§3.3 阶段、§5 覆盖义务、
+// §6 状态/覆盖计算/完成判定、§9 数据模型）。
+//
+// 本文件只定义领域词汇、存储操作和"任务能否被判为全覆盖完成"的程序判定。
+// 契约对 assessment_mode=true 的任务由引擎在结束路径上调用；传统任务
+// （assessment_mode=false）不经过本契约，行为保持不变。
+
+// ---------- 评估阶段（§3.3；与运行状态分离） ----------
+
+const (
+	// AssessmentPhaseNone 表示未启用评估阶段（传统模式任务或未启动的新模式任务）。
+	AssessmentPhaseNone = ""
+	// 1. 材料检查：启动前确认文件可读、可解包、清单可建立、存在有效审计对象。
+	AssessmentPhaseMaterialCheck = "material_check"
+	// 2. 画像构建：确定性清点 + 结构提取 + Agent 关联 + 环境核实，形成初始版本。
+	AssessmentPhaseProfiling = "profiling"
+	// 3. 覆盖规划：从清单与画像生成本轮覆盖义务与前置依赖。
+	AssessmentPhaseCoveragePlanning = "coverage_planning"
+	// 4. 执行与探索：白盒审计与动态测试按计划推进，持续补充画像。
+	AssessmentPhaseExecuting = "executing"
+	// 5. 收尾对账：跨模块收尾检查、证据对账、完成判定。
+	AssessmentPhaseReconciliation = "reconciliation"
+	// 6. 完成：全部必需义务满足且完成判定通过。
+	AssessmentPhaseCompleted = "completed"
+)
+
+var assessmentPhases = map[string]struct{}{
+	AssessmentPhaseNone:             {},
+	AssessmentPhaseMaterialCheck:    {},
+	AssessmentPhaseProfiling:        {},
+	AssessmentPhaseCoveragePlanning: {},
+	AssessmentPhaseExecuting:        {},
+	AssessmentPhaseReconciliation:   {},
+	AssessmentPhaseCompleted:        {},
+}
+
+// IsValidAssessmentPhase reports whether phase is a known assessment phase.
+func IsValidAssessmentPhase(phase string) bool {
+	_, ok := assessmentPhases[phase]
+	return ok
+}
+
+// ---------- 覆盖义务状态（§6.1） ----------
+
+const (
+	// ObligationPending：尚未就绪（前置依赖未满足或计划刚生成）。
+	ObligationPending = "pending"
+	// ObligationReady：前置依赖已满足，可派发执行。
+	ObligationReady = "ready"
+	// ObligationRunning：正在执行。
+	ObligationRunning = "running"
+	// ObligationSatisfied：完成规定检查；可以发现漏洞，也可以没有发现问题。
+	ObligationSatisfied = "satisfied"
+	// ObligationBlocked：前提缺失、环境不可达等；不计入已覆盖。
+	ObligationBlocked = "blocked"
+	// ObligationStale：材料、环境或关键画像变化，原有证据不再适用。
+	ObligationStale = "stale"
+	// ObligationNotApplicable：有可审计的不适用依据；不能由 Agent 为提高覆盖率任意设置。
+	ObligationNotApplicable = "not_applicable"
+)
+
+var obligationStatuses = map[string]struct{}{
+	ObligationPending: {}, ObligationReady: {}, ObligationRunning: {},
+	ObligationSatisfied: {}, ObligationBlocked: {}, ObligationStale: {},
+	ObligationNotApplicable: {},
+}
+
+// IsValidObligationStatus reports whether status is a known obligation status.
+func IsValidObligationStatus(status string) bool {
+	_, ok := obligationStatuses[status]
+	return ok
+}
+
+// obligationStatusNeedsReason 列出必须携带 reason 的终态：不适用要有可审计依据，
+// 阻塞/失效要能解释为什么证据不再适用（§6.1）。
+func obligationStatusNeedsReason(status string) bool {
+	return status == ObligationNotApplicable || status == ObligationBlocked || status == ObligationStale
+}
+
+// ---------- 覆盖维度（§5.3 第一版） ----------
+
+const (
+	DimensionCodeAudit        = "code_audit"        // 自研模块、生产文件、Java 应用类
+	DimensionConfigAudit      = "config_audit"      // 安全配置、部署配置、协议映射
+	DimensionEntryTest        = "entry_test"        // HTTP、RPC、消息消费者、任务入口
+	DimensionIdentityResource = "identity_resource" // 角色、租户、对象归属、业务状态
+	DimensionCrossModule      = "cross_module"      // 服务调用、回调、消息、协议转换
+	DimensionRuntimeAsset     = "runtime_asset"     // 范围内网关、实例、数据库等
+	DimensionHypothesis       = "hypothesis"        // 静态候选、动态异常、配置冲突
+)
+
+var coverageDimensions = map[string]struct{}{
+	DimensionCodeAudit: {}, DimensionConfigAudit: {}, DimensionEntryTest: {},
+	DimensionIdentityResource: {}, DimensionCrossModule: {}, DimensionRuntimeAsset: {},
+	DimensionHypothesis: {},
+}
+
+// IsValidCoverageDimension reports whether dimension is a known coverage dimension.
+func IsValidCoverageDimension(dimension string) bool {
+	_, ok := coverageDimensions[dimension]
+	return ok
+}
+
+// executionDimensions 列出必须通过实际执行（而非纯静态证据）才能满足的维度：
+// 入口测试、身份与资源关系、跨模块链路需要可执行的运行证据（§5.3）。
+var executionDimensions = map[string]struct{}{
+	DimensionEntryTest: {}, DimensionIdentityResource: {}, DimensionCrossModule: {},
+}
+
+// ---------- 尝试结果分类（§7.2） ----------
+
+const (
+	AttemptSupported         = "supported"          // 支持假设
+	AttemptDisproved         = "disproved"          // 反证
+	AttemptUnreproduced      = "unreproduced"       // 未复现（不等于漏洞不存在/已修复）
+	AttemptEnvMismatch       = "env_mismatch"       // 环境不匹配
+	AttemptDependencyMissing = "dependency_missing" // 依赖缺失
+	AttemptFailed            = "failed"             // 执行失败
+)
+
+var attemptOutcomes = map[string]struct{}{
+	AttemptSupported: {}, AttemptDisproved: {}, AttemptUnreproduced: {},
+	AttemptEnvMismatch: {}, AttemptDependencyMissing: {}, AttemptFailed: {},
+}
+
+// IsValidAttemptOutcome reports whether outcome is a known attempt outcome.
+func IsValidAttemptOutcome(outcome string) bool {
+	_, ok := attemptOutcomes[outcome]
+	return ok
+}
+
+// effectiveAttemptOutcomes 是"有依据的处置"：可以支撑义务满足的尝试结果。
+// env_mismatch/dependency_missing/failed 是执行失败类，不等于已覆盖（§6.1/§7.2）。
+var effectiveAttemptOutcomes = map[string]struct{}{
+	AttemptSupported: {}, AttemptDisproved: {}, AttemptUnreproduced: {},
+}
+
+// ---------- 画像断言来源（§4.2） ----------
+
+const (
+	ClaimSourceUserDeclared       = "user_declared"
+	ClaimSourceStaticExtraction   = "static_extraction"
+	ClaimSourceRuntimeObservation = "runtime_observation"
+	ClaimSourceModelInference     = "model_inference"
+)
+
+// ---------- 错误 ----------
+
+var (
+	ErrAssessmentPhaseInvalid     = errors.New("invalid assessment phase")
+	ErrObligationStatusInvalid    = errors.New("invalid obligation status")
+	ErrObligationDimensionInvalid = errors.New("invalid coverage dimension")
+	ErrAttemptOutcomeInvalid      = errors.New("invalid attempt outcome")
+	// ErrObligationStateConflict 表示 CAS 状态推进落空（状态已被并发修改）。
+	ErrObligationStateConflict = errors.New("obligation state conflict")
+	// ErrObligationEvidenceMissing 表示不满足"证据要求"的终态推进被拒绝。
+	ErrObligationEvidenceMissing = errors.New("obligation terminal state requires evidence or reason")
+)
+
+// ---------- 评估轮次 ----------
+
+// AssessmentRound is one assessment round of a task (§6.4/§9).
+type AssessmentRound struct {
+	ID                 int64           `json:"id"`
+	TaskID             int64           `json:"task_id"`
+	RoundNo            int             `json:"round_no"`
+	CodebaseVersion    string          `json:"codebase_version"`
+	EnvironmentVersion string          `json:"environment_version"`
+	ScopeVersion       string          `json:"scope_version"`
+	StandardVersion    string          `json:"standard_version"`
+	Status             string          `json:"status"`
+	CompletionReport   json.RawMessage `json:"completion_report,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
+	CompletedAt        *time.Time      `json:"completed_at,omitempty"`
+}
+
+// CreateAssessmentRound opens round_no = max(existing)+1 for the task.
+func (d *DB) CreateAssessmentRound(taskID int64) (*AssessmentRound, error) {
+	round, err := scanAssessmentRound(d.QueryRow(`
+INSERT INTO task_assessment_rounds(task_id, round_no)
+VALUES ($1, COALESCE((SELECT max(round_no) FROM task_assessment_rounds WHERE task_id=$1), 0) + 1)
+RETURNING id, task_id, round_no, codebase_version, environment_version, scope_version,
+          standard_version, status, completion_report, created_at, completed_at`, taskID))
+	if err != nil {
+		return nil, err
+	}
+	return round, nil
+}
+
+// OpenAssessmentRound returns the task's current open round (nil if none).
+// 完成判定、义务生成、尝试写入都以当前 open 轮次为界；历史轮次保持原有范围和结果。
+func (d *DB) OpenAssessmentRound(taskID int64) (*AssessmentRound, error) {
+	round, err := scanAssessmentRound(d.QueryRow(`
+SELECT id, task_id, round_no, codebase_version, environment_version, scope_version,
+       standard_version, status, completion_report, created_at, completed_at
+FROM task_assessment_rounds
+WHERE task_id=$1 AND status='open'
+ORDER BY round_no DESC LIMIT 1`, taskID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return round, nil
+}
+
+// CompleteAssessmentRound closes an open round with the program-generated
+// completion report (version/scope/standard snapshot of this round, §6.3-7).
+func (d *DB) CompleteAssessmentRound(taskID, roundID int64, report json.RawMessage) error {
+	result, err := d.Exec(`
+UPDATE task_assessment_rounds
+SET status='completed', completion_report=$3, completed_at=now()
+WHERE id=$2 AND task_id=$1 AND status='open'`, taskID, roundID, string(report))
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrObligationStateConflict
+	}
+	return nil
+}
+
+func scanAssessmentRound(sc interface{ Scan(...any) error }) (*AssessmentRound, error) {
+	var r AssessmentRound
+	var report []byte
+	if err := sc.Scan(&r.ID, &r.TaskID, &r.RoundNo, &r.CodebaseVersion, &r.EnvironmentVersion,
+		&r.ScopeVersion, &r.StandardVersion, &r.Status, &report, &r.CreatedAt, &r.CompletedAt); err != nil {
+		return nil, err
+	}
+	if len(report) > 0 {
+		r.CompletionReport = json.RawMessage(report)
+	}
+	return &r, nil
+}
+
+// ---------- 阶段写入 ----------
+
+// SetAssessmentPhase persists the task's assessment phase. It refuses unknown
+// phases (values are fixed by the design document, §3.3).
+func (d *DB) SetAssessmentPhase(taskID int64, phase string) error {
+	if !IsValidAssessmentPhase(phase) {
+		return fmt.Errorf("%w: %q", ErrAssessmentPhaseInvalid, phase)
+	}
+	_, err := d.Exec(`UPDATE tasks SET assessment_phase=$2 WHERE id=$1`, taskID, phase)
+	return err
+}
+
+// ---------- 证据引用 ----------
+
+// CreateEvidenceRef records one evidence reference (code range, decompiled
+// source, traffic, execution output, config, manual note) and returns its id.
+// 画像断言、覆盖义务与测试尝试都只存这里的引用；正文进 payload。
+type EvidenceRefKind string
+
+const (
+	EvidenceCodeRange  EvidenceRefKind = "code_range"
+	EvidenceDecompiled EvidenceRefKind = "decompiled"
+	EvidenceTraffic    EvidenceRefKind = "traffic"
+	EvidenceExecution  EvidenceRefKind = "execution_output"
+	EvidenceConfig     EvidenceRefKind = "config"
+	EvidenceManual     EvidenceRefKind = "manual"
+)
+
+func (d *DB) CreateEvidenceRef(taskID int64, kind EvidenceRefKind, reference string, payload json.RawMessage) (int64, error) {
+	switch kind {
+	case EvidenceCodeRange, EvidenceDecompiled, EvidenceTraffic,
+		EvidenceExecution, EvidenceConfig, EvidenceManual:
+	default:
+		return 0, fmt.Errorf("invalid evidence kind %q", kind)
+	}
+	body := "{}"
+	if len(payload) > 0 {
+		body = string(payload)
+	}
+	var id int64
+	if err := d.QueryRow(`
+INSERT INTO task_evidence_refs(task_id, kind, reference, payload)
+VALUES ($1,$2,$3,$4::jsonb) RETURNING id`, taskID, string(kind), reference, body).
+		Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ---------- 目标实体与清单缺口 ----------
+
+// TargetEntity is an auditable object of the current round (module, service,
+// shared library, entry, identity, ...). It reuses the existing asset id when
+// one exists — the asset graph stays the single source for runtime objects.
+type TargetEntity struct {
+	ID         int64           `json:"id"`
+	TaskID     int64           `json:"task_id"`
+	RoundID    *int64          `json:"round_id,omitempty"`
+	EntityType string          `json:"entity_type"`
+	Name       string          `json:"name"`
+	AssetID    *int64          `json:"asset_id,omitempty"`
+	CodebaseID string          `json:"codebase_id"`
+	VersionID  string          `json:"version_id"`
+	Attributes json.RawMessage `json:"attributes,omitempty"`
+	Gap        bool            `json:"gap"`
+	GapReason  string          `json:"gap_reason"`
+	Resolved   bool            `json:"gap_resolved"`
+}
+
+// CreateTargetEntityInput creates one target entity. gap=true registers a
+// material-inventory gap (unreadable/unclassifiable object) — gaps never
+// silently vanish from the denominator (§5.4).
+type CreateTargetEntityInput struct {
+	TaskID     int64
+	RoundID    *int64
+	EntityType string
+	Name       string
+	AssetID    *int64
+	CodebaseID string
+	VersionID  string
+	Attributes json.RawMessage
+	Gap        bool
+	GapReason  string
+	Resolved   bool
+}
+
+func (d *DB) CreateTargetEntity(in CreateTargetEntityInput) (*TargetEntity, error) {
+	if in.Gap && in.GapReason == "" {
+		return nil, errors.New("target entity gap requires a reason")
+	}
+	attributes := "{}"
+	if len(in.Attributes) > 0 {
+		attributes = string(in.Attributes)
+	}
+	var e TargetEntity
+	err := d.QueryRow(`
+INSERT INTO task_target_entities(task_id, round_id, entity_type, name, asset_id,
+                                codebase_id, version_id, attributes, gap, gap_reason, resolved)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)
+RETURNING id, task_id, round_id, entity_type, name, asset_id, codebase_id, version_id,
+          attributes, gap, gap_reason, resolved`,
+		in.TaskID, in.RoundID, in.EntityType, in.Name, in.AssetID, in.CodebaseID, in.VersionID,
+		attributes, in.Gap, in.GapReason, in.Resolved).Scan(
+		&e.ID, &e.TaskID, &e.RoundID, &e.EntityType, &e.Name, &e.AssetID, &e.CodebaseID,
+		&e.VersionID, scanJSONRaw(&e.Attributes), &e.Gap, &e.GapReason, &e.Resolved)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// ---------- 覆盖义务 ----------
+
+// CoverageObligation is one concrete unit of test work required to claim an
+// object has been tested to this round's standard (§5.2).
+type CoverageObligation struct {
+	ID                  int64           `json:"id"`
+	TaskID              int64           `json:"task_id"`
+	RoundID             *int64          `json:"round_id,omitempty"`
+	Dimension           string          `json:"dimension"`
+	TargetEntityID      *int64          `json:"target_entity_id,omitempty"`
+	Purpose             string          `json:"purpose"`
+	Required            bool            `json:"required"`
+	Status              string          `json:"status"`
+	DedupeKey           string          `json:"dedupe_key,omitempty"`
+	RequiresCredentials bool            `json:"requires_credentials"`
+	CredentialRef       string          `json:"credential_ref,omitempty"`
+	BlockedReason       string          `json:"blocked_reason,omitempty"`
+	StaleReason         string          `json:"stale_reason,omitempty"`
+	NotApplicableReason string          `json:"not_applicable_reason,omitempty"`
+	EvidenceRefID       *int64          `json:"evidence_ref_id,omitempty"`
+	AcceptanceRule      json.RawMessage `json:"acceptance_rule,omitempty"`
+}
+
+// CreateCoverageObligationInput creates an obligation. dedupeKey provides
+// idempotency: re-planning must not duplicate dispatches (§10 step 4).
+type CreateCoverageObligationInput struct {
+	TaskID              int64
+	RoundID             *int64
+	Dimension           string
+	TargetEntityID      *int64
+	Purpose             string
+	Required            bool
+	DedupeKey           string
+	RequiresCredentials bool
+	AcceptanceRule      json.RawMessage
+}
+
+// CreateCoverageObligation inserts an obligation; when dedupeKey already exists
+// for the task it returns the existing row unchanged (idempotent replan).
+func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*CoverageObligation, error) {
+	if !IsValidCoverageDimension(in.Dimension) {
+		return nil, fmt.Errorf("%w: %q", ErrObligationDimensionInvalid, in.Dimension)
+	}
+	if !in.Required {
+		// 非必需义务没有完成语义，第一版不允许创建，避免“降级成展示项”。
+		return nil, errors.New("coverage obligation must be required (non-required obligations are not supported yet)")
+	}
+	if in.DedupeKey == "" {
+		return nil, errors.New("coverage obligation requires a dedupe key")
+	}
+	rule := "{}"
+	if len(in.AcceptanceRule) > 0 {
+		rule = string(in.AcceptanceRule)
+	}
+	obligation, err := scanCoverageObligation(d.QueryRow(`
+INSERT INTO task_coverage_obligations(task_id, round_id, dimension, target_entity_id,
+                                      purpose, required, dedupe_key, requires_credentials, acceptance_rule)
+VALUES ($1,$2,$3,$4,$5,true,$6,$7,$8::jsonb)
+ON CONFLICT (task_id, dedupe_key) WHERE dedupe_key <> '' DO UPDATE SET updated_at=now()
+RETURNING id, task_id, round_id, dimension, target_entity_id, purpose, required, status,
+          dedupe_key, requires_credentials, credential_ref, blocked_reason, stale_reason,
+          not_applicable_reason, evidence_ref_id, acceptance_rule`,
+		in.TaskID, in.RoundID, in.Dimension, in.TargetEntityID, in.Purpose, in.DedupeKey,
+		in.RequiresCredentials, rule))
+	if err != nil {
+		return nil, err
+	}
+	return obligation, nil
+}
+
+func scanCoverageObligation(sc interface{ Scan(...any) error }) (*CoverageObligation, error) {
+	var o CoverageObligation
+	var rule []byte
+	if err := sc.Scan(&o.ID, &o.TaskID, &o.RoundID, &o.Dimension, &o.TargetEntityID, &o.Purpose,
+		&o.Required, &o.Status, &o.DedupeKey, &o.RequiresCredentials, &o.CredentialRef,
+		&o.BlockedReason, &o.StaleReason, &o.NotApplicableReason, &o.EvidenceRefID, &rule); err != nil {
+		return nil, err
+	}
+	if len(rule) > 0 {
+		o.AcceptanceRule = json.RawMessage(rule)
+	}
+	return &o, nil
+}
+
+// TransitionObligationStatus atomically moves an obligation between states
+// (compare-and-set on expected). Terminal states carry evidence requirements
+// so coverage cannot advance without a basis (§6.1/§6.3):
+//
+//   - satisfied：必须有证据引用（evidenceRefID 非空），且执行类维度必须有可执行
+//     依据；证据要求不满足时返回 ErrObligationEvidenceMissing，覆盖不推进。
+//   - not_applicable / blocked / stale：必须携带非空 reason。
+//
+// Planner/Worker 只能经由本方法提交结论建议；满足与否由这里的程序规则裁定。
+type TransitionObligationOptions struct {
+	Reason        string // blocked/stale/not_applicable 的依据说明
+	EvidenceRefID *int64 // satisfied 的证据引用
+}
+
+func (d *DB) TransitionObligationStatus(obligationID int64, expected, next string, opts TransitionObligationOptions) (bool, error) {
+	if !IsValidObligationStatus(next) {
+		return false, fmt.Errorf("%w: %q", ErrObligationStatusInvalid, next)
+	}
+	if obligationStatusNeedsReason(next) && opts.Reason == "" {
+		return false, fmt.Errorf("%w: status %s requires a reason", ErrObligationEvidenceMissing, next)
+	}
+	if next == ObligationSatisfied {
+		if opts.EvidenceRefID == nil {
+			return false, fmt.Errorf("%w: satisfied requires an evidence reference", ErrObligationEvidenceMissing)
+		}
+		// 执行类维度（入口测试/身份资源/跨模块）必须有可执行的尝试依据；
+		// 静态阅读不算动态验证（§1.1/§5.3）。
+		var dimension string
+		var ineffective int64
+		if err := d.QueryRow(`
+SELECT o.dimension,
+       (SELECT count(*) FROM task_test_attempts a
+         WHERE a.obligation_id=o.id AND a.outcome IN ('supported','disproved','unreproduced'))
+FROM task_coverage_obligations o WHERE o.id=$1`, obligationID).Scan(&dimension, &ineffective); err != nil {
+			return false, err
+		}
+		if _, needsExecution := executionDimensions[dimension]; needsExecution && ineffective == 0 {
+			return false, fmt.Errorf("%w: dimension %s requires an effective execution attempt", ErrObligationEvidenceMissing, dimension)
+		}
+	}
+	result, err := d.Exec(`
+UPDATE task_coverage_obligations
+SET status=$3,
+    updated_at=now(),
+    satisfied_at=CASE WHEN $3='satisfied' THEN now() ELSE satisfied_at END,
+    blocked_reason=CASE WHEN $3='blocked' THEN $4 ELSE blocked_reason END,
+    stale_reason=CASE WHEN $3='stale' THEN $4 ELSE stale_reason END,
+    not_applicable_reason=CASE WHEN $3='not_applicable' THEN $4 ELSE not_applicable_reason END,
+    evidence_ref_id=CASE WHEN $3='satisfied' THEN $5 ELSE evidence_ref_id END
+WHERE id=$1 AND status=$2`, obligationID, expected, next, opts.Reason, opts.EvidenceRefID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
+}
+
+// ---------- 测试尝试 ----------
+
+// RecordTestAttemptInput appends one execution attempt for an obligation.
+// attempt_no 在义务内自增；重复登记同一尝试由调用侧幂等键（后续步骤的
+// attempt 标识）保证，本方法只保证编号唯一。
+type RecordTestAttemptInput struct {
+	TaskID         int64
+	ObligationID   int64
+	IntentNodeID   *int64
+	CodeAuditRunID *int64
+	Outcome        string
+	EvidenceRefID  *int64
+	Output         json.RawMessage
+}
+
+func (d *DB) RecordTestAttempt(in RecordTestAttemptInput) (int64, error) {
+	if !IsValidAttemptOutcome(in.Outcome) {
+		return 0, fmt.Errorf("%w: %q", ErrAttemptOutcomeInvalid, in.Outcome)
+	}
+	output := "{}"
+	if len(in.Output) > 0 {
+		output = string(in.Output)
+	}
+	var id int64
+	err := d.QueryRow(`
+INSERT INTO task_test_attempts(task_id, obligation_id, attempt_no, intent_node_id,
+                                code_audit_run_id, outcome, evidence_ref_id, output)
+VALUES ($1,$2,
+        (SELECT COALESCE(max(attempt_no),0)+1 FROM task_test_attempts WHERE obligation_id=$2),
+        $3,$4,$5,$6,$7::jsonb)
+RETURNING id`, in.TaskID, in.ObligationID, in.IntentNodeID, in.CodeAuditRunID,
+		in.Outcome, in.EvidenceRefID, output).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ---------- 评估事件 ----------
+
+// RecordAssessmentEvent registers a reliable assessment event (new asset, new
+// entry, profile change, invalidated evidence, ...). Unprocessed events block
+// the completion contract: 收尾时新发现不会丢失（§6.3-6/§10 第 7 步）。
+func (d *DB) RecordAssessmentEvent(taskID int64, eventType string, payload json.RawMessage) (int64, error) {
+	switch eventType {
+	case "new_asset", "new_entry", "profile_change", "evidence_invalidated",
+		"knowledge_conflict", "code_version_change":
+	default:
+		return 0, fmt.Errorf("invalid assessment event type %q", eventType)
+	}
+	body := "{}"
+	if len(payload) > 0 {
+		body = string(payload)
+	}
+	var id int64
+	if err := d.QueryRow(`
+INSERT INTO task_assessment_events(task_id, event_type, payload)
+VALUES ($1,$2,$3::jsonb) RETURNING id`, taskID, eventType, body).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// MarkAssessmentEventsProcessed marks events processed up to (and including) id.
+func (d *DB) MarkAssessmentEventsProcessed(taskID int64, upToID int64) (int64, error) {
+	result, err := d.Exec(`
+UPDATE task_assessment_events
+SET processed=true, processed_at=now()
+WHERE task_id=$1 AND id<=$2 AND NOT processed`, taskID, upToID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ---------- 程序完成判定契约（§6.3） ----------
+
+// AssessmentCompletionReport is the machine-judged answer to "能否把该任务判为
+// 全覆盖完成"。CanComplete=false 时 Reasons 逐条列出未满足的必要条件。
+// 各状态计数仅针对当前 open 轮次的必需义务；无适用义务的维度显示"不适用"，
+// 不显示 100%（§6.2），由前端基于 RequiredTotal=0 判断。
+type AssessmentCompletionReport struct {
+	TaskID      int64    `json:"task_id"`
+	RoundID     int64    `json:"round_id"`
+	RoundNo     int      `json:"round_no"`
+	CanComplete bool     `json:"can_complete"`
+	Reasons     []string `json:"reasons,omitempty"`
+
+	// 必需义务按状态计数（当前 open 轮次）。
+	Obligations struct {
+		Satisfied     int `json:"satisfied"`
+		NotApplicable int `json:"not_applicable"`
+		Pending       int `json:"pending"`
+		Ready         int `json:"ready"`
+		Running       int `json:"running"`
+		Blocked       int `json:"blocked"`
+		Stale         int `json:"stale"`
+		// MissingCredentials 统计 requires_credentials 且未解析出凭证引用的必需义务
+		//（缺凭证按未满足计，§6.3）。
+		MissingCredentials int `json:"missing_credentials"`
+		// EvidenceBackedSatisfied 统计带证据引用的 satisfied 义务（应为全部）。
+		EvidenceBackedSatisfied int `json:"evidence_backed_satisfied"`
+	} `json:"obligations"`
+
+	TargetCount        int `json:"target_count"`
+	UnresolvedGaps     int `json:"unresolved_gaps"`
+	UnprocessedEvents  int `json:"unprocessed_events"`
+	ActiveWhiteboxRuns int `json:"active_whitebox_runs"`
+	ActiveIntents      int `json:"active_intents"`
+	OpenGoals          int `json:"open_goals"`
+	TotalAttempts      int `json:"total_attempts"`
+	EffectiveAttempts  int `json:"effective_attempts"`
+	FailedAttempts     int `json:"failed_attempts"`
+}
+
+// AssessmentCompletionCheck evaluates the program completion contract for the
+// task's current open assessment round. It is the single judge of "全覆盖完成"
+// (§6.3): Planner 和 Worker 只能提交工作、证据和结论建议，不能直接把任务标为
+// 全覆盖完成。
+//
+// 必要条件（全部满足才返回 CanComplete=true）：
+//  1. 存在进行中的评估轮次；
+//  2. 材料清单没有未对账缺口（读取/解析/分类失败不静默消失）；
+//  3. 范围内至少存在一个目标对象（零资产不能判完成）；
+//  4. 当前轮次全部必需义务 satisfied 或有依据的 not_applicable；
+//     pending/ready/running/blocked/stale 均视为未完成；缺同样阻断；
+//  5. satisfied 必须带证据引用；执行类维度必须有可执行的尝试依据；
+//     只有失败尝试不能判完成（执行失败≠已覆盖）；
+//  6. 存在尝试时，至少一条尝试属于有依据的处置（supported/disproved/unreproduced）；
+//  7. 任务没有任何 open/running 意图与 open goal（队列为空不能自动等于完成，
+//     但仍有活动工作时绝不能完成）；
+//  8. 白盒审计队列没有 queued/running 的运行（独立白盒队列不落下的义务）；
+//  9. 没有未处理的评估事件（新发现/失效事件驱动增量调度，不丢弃）。
+func (d *DB) AssessmentCompletionCheck(taskID int64) (*AssessmentCompletionReport, error) {
+	report := &AssessmentCompletionReport{TaskID: taskID}
+	addReason := func(format string, args ...any) {
+		report.Reasons = append(report.Reasons, fmt.Sprintf(format, args...))
+	}
+
+	round, err := d.OpenAssessmentRound(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if round == nil {
+		addReason("没有进行中的评估轮次，无法进行完成判定")
+		return report, nil
+	}
+	report.RoundID, report.RoundNo = round.ID, round.RoundNo
+
+	// 必需义务统计 + 证据/凭证核验。
+	err = d.QueryRow(`
+SELECT
+  count(*) FILTER (WHERE status='satisfied'),
+  count(*) FILTER (WHERE status='not_applicable'),
+  count(*) FILTER (WHERE status='pending'),
+  count(*) FILTER (WHERE status='ready'),
+  count(*) FILTER (WHERE status='running'),
+  count(*) FILTER (WHERE status='blocked'),
+  count(*) FILTER (WHERE status='stale'),
+  count(*) FILTER (WHERE requires_credentials AND credential_ref='' AND status NOT IN ('satisfied','not_applicable')),
+  count(*) FILTER (WHERE status='satisfied' AND evidence_ref_id IS NOT NULL),
+  count(*) FILTER (WHERE status='not_applicable' AND not_applicable_reason='')
+FROM task_coverage_obligations
+WHERE task_id=$1 AND required AND COALESCE(round_id, $2)=$2`, taskID, round.ID).Scan(
+		&report.Obligations.Satisfied, &report.Obligations.NotApplicable,
+		&report.Obligations.Pending, &report.Obligations.Ready, &report.Obligations.Running,
+		&report.Obligations.Blocked, &report.Obligations.Stale,
+		&report.Obligations.MissingCredentials,
+		&report.Obligations.EvidenceBackedSatisfied,
+		new(int64)) // not_applicable without reason: DB 写入已拦截,此处计数仅作审计
+	if err != nil {
+		return nil, err
+	}
+	incomplete := report.Obligations.Pending + report.Obligations.Ready + report.Obligations.Running
+	// 只有 fact 的空图不能判完成：评估没有产生任何覆盖工作时（零义务），完成
+	// 判定无从谈起；无适用义务的维度显示“不适用”而非 100%（§6.2）。
+	if report.Obligations.Satisfied+report.Obligations.NotApplicable == 0 {
+		addReason("当前轮次没有任何已满足或有依据不适用的必需覆盖义务（评估尚未产生覆盖工作，不能判为完成）")
+	}
+	if incomplete > 0 {
+		addReason("仍有 %d 条必需义务未完成（pending=%d ready=%d running=%d）",
+			incomplete, report.Obligations.Pending, report.Obligations.Ready, report.Obligations.Running)
+	}
+	if report.Obligations.Blocked > 0 {
+		addReason("%d 条必需义务处于 blocked（前提缺失/环境不可达），不计入已覆盖", report.Obligations.Blocked)
+	}
+	if report.Obligations.Stale > 0 {
+		addReason("%d 条必需义务处于 stale（材料/环境/画像变化，原有证据不再适用）", report.Obligations.Stale)
+	}
+	if report.Obligations.MissingCredentials > 0 {
+		addReason("%d 条必需义务缺少凭证解析（requires_credentials 未绑定凭证引用）", report.Obligations.MissingCredentials)
+	}
+	if report.Obligations.EvidenceBackedSatisfied != report.Obligations.Satisfied {
+		addReason("%d 条 satisfied 义务缺少证据引用", report.Obligations.Satisfied-report.Obligations.EvidenceBackedSatisfied)
+	}
+
+	// 执行类维度的 satisfied 必须有可执行尝试依据；只有失败尝试不能推进覆盖。
+	var satisfiedNoEffectiveAttempt int64
+	if err := d.QueryRow(`
+SELECT count(*)
+FROM task_coverage_obligations o
+WHERE o.task_id=$1 AND o.required AND COALESCE(o.round_id,$2)=$2
+  AND o.status='satisfied'
+  AND o.dimension IN ('entry_test','identity_resource','cross_module')
+  AND NOT EXISTS (
+      SELECT 1 FROM task_test_attempts a
+      WHERE a.obligation_id=o.id AND a.outcome IN ('supported','disproved','unreproduced'))`,
+		taskID, round.ID).Scan(&satisfiedNoEffectiveAttempt); err != nil {
+		return nil, err
+	}
+	if satisfiedNoEffectiveAttempt > 0 {
+		addReason("%d 条已满足的执行类义务缺少可执行尝试依据（静态阅读不等于动态验证）", satisfiedNoEffectiveAttempt)
+	}
+
+	// 目标对象与清单缺口（零资产/零目标不能判完成；缺口不能静默消失）。
+	err = d.QueryRow(`
+SELECT
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND NOT gap),
+  (SELECT count(*) FROM task_target_entities WHERE task_id=$1 AND gap AND NOT resolved)`,
+		taskID).Scan(&report.TargetCount, &report.UnresolvedGaps)
+	if err != nil {
+		return nil, err
+	}
+	if report.TargetCount == 0 {
+		addReason("范围内没有任何目标对象（零资产/零目标不能判为完成）")
+	}
+	if report.UnresolvedGaps > 0 {
+		addReason("材料清单存在 %d 个未对账缺口（读取/解析/分类失败不能静默消失）", report.UnresolvedGaps)
+	}
+
+	// 尝试统计：只有失败尝试（无任何有依据的处置）不能判完成。
+	err = d.QueryRow(`
+SELECT
+  count(*),
+  count(*) FILTER (WHERE outcome IN ('supported','disproved','unreproduced')),
+  count(*) FILTER (WHERE outcome IN ('env_mismatch','dependency_missing','failed'))
+FROM task_test_attempts WHERE task_id=$1`, taskID).Scan(
+		&report.TotalAttempts, &report.EffectiveAttempts, &report.FailedAttempts)
+	if err != nil {
+		return nil, err
+	}
+	if report.TotalAttempts > 0 && report.EffectiveAttempts == 0 {
+		addReason("全部 %d 条测试尝试均为失败/未成处置（执行失败不等于已覆盖）", report.TotalAttempts)
+	}
+
+	// 活动意图与开放目标：仍有执行/等待派发的必需工作不能完成。
+	var explorationID int64
+	if err := d.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1`, taskID).
+		Scan(&explorationID); err != nil {
+		return nil, err
+	}
+	err = d.QueryRow(`
+SELECT
+  (SELECT count(*) FROM exploration_nodes
+    WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running')),
+  (SELECT count(*) FROM exploration_nodes
+    WHERE exploration_id=$1 AND kind='goal' AND state='open')`,
+		explorationID).Scan(&report.ActiveIntents, &report.OpenGoals)
+	if err != nil {
+		return nil, err
+	}
+	if report.ActiveIntents > 0 {
+		addReason("仍有 %d 条 open/running 意图在执行或等待派发", report.ActiveIntents)
+	}
+	if report.OpenGoals > 0 {
+		addReason("仍有 %d 个开放目标未了结", report.OpenGoals)
+	}
+
+	// 白盒队列：父任务不能忽略未结束的白盒工作（§2.3/§10 第 5 步）。
+	if err := d.QueryRow(`
+SELECT count(*) FROM task_code_audit_runs
+WHERE task_id=$1 AND status IN ('queued','running')`, taskID).
+		Scan(&report.ActiveWhiteboxRuns); err != nil {
+		return nil, err
+	}
+	if report.ActiveWhiteboxRuns > 0 {
+		addReason("白盒审计队列仍有 %d 个 queued/running 运行未结束", report.ActiveWhiteboxRuns)
+	}
+
+	// 未处理评估事件：新资产/新入口/证据失效必须先被消化（§6.3-6）。
+	if err := d.QueryRow(`
+SELECT count(*) FROM task_assessment_events
+WHERE task_id=$1 AND NOT processed`, taskID).Scan(&report.UnprocessedEvents); err != nil {
+		return nil, err
+	}
+	if report.UnprocessedEvents > 0 {
+		addReason("存在 %d 条未处理的评估事件（新发现/画像变化/证据失效）", report.UnprocessedEvents)
+	}
+
+	report.CanComplete = len(report.Reasons) == 0
+	return report, nil
+}
+
+// scanJSONRaw scans a nullable JSONB column into a RawMessage target.
+func scanJSONRaw(target *json.RawMessage) *[]byte {
+	return (*[]byte)(target)
+}

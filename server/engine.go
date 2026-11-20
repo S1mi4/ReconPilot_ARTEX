@@ -877,6 +877,29 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// completeAssessmentIfEligible runs the program completion contract (white-box
+// assessment mode) and reports whether the task was completed. Contract failures
+// are logged with their per-condition reasons but deliberately emit no repeated
+// activity (this path is polled on every planner wake/heartbeat); the completion
+// itself emits one summary activity so operators see why the task ended.
+func (e *Engine) completeAssessmentIfEligible(t *Task, trigger string) bool {
+	completed, report, err := e.m.CompleteAssessment(t)
+	if err != nil {
+		log.Printf("[assessment] task %s 完成判定失败(%s): %v", t.ID, trigger, err)
+		return false
+	}
+	if completed {
+		log.Printf("[assessment] task %s 完成判定通过(%s)，任务结束", t.ID, trigger)
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: "当前轮次全部必需覆盖义务已满足且证据对账完成，完成判定通过，任务结束"})
+		return true
+	}
+	if report != nil {
+		log.Printf("[assessment] task %s 完成判定未通过(%s): %s", t.ID, trigger, strings.Join(report.Reasons, "；"))
+	}
+	return false
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -925,6 +948,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+				// 白盒驱动评估模式：frontier 抽干不等于完成，完成判定走程序契约
+				//（覆盖义务/尝试/事件/白盒队列逐项核对，§6.3）。契约未通过则任务
+				// 保持运行，等待覆盖工作被派发；每次唤醒/心跳都会复查。
+				if t.AssessmentMode {
+					e.completeAssessmentIfEligible(t, "goalless 收尾")
+					return
+				}
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
 				// pause/delete/超时收尾的状态转换。
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -975,6 +1005,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			}
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
+			// 白盒驱动评估模式：Planner 的"目标达成"只是完成建议，全覆盖完成由程序
+			// 契约统一裁定（§6.3）；契约未通过则任务继续运行。
+			if t.AssessmentMode {
+				if completed := e.completeAssessmentIfEligible(t, "规划者判定达成"); completed {
+					e.cancelExec(t.ID, agent.AbortGoalMet)
+				}
+				break
+			}
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
 			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)

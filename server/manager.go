@@ -67,26 +67,31 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// No-result options are immutable. Mutable checkpoint fields use lifecycleMu.
-	NoResultSeconds      int                    `json:"no_result_seconds"`
-	NoResultMinFindings  int                    `json:"no_result_min_findings"`
-	NoResultMinSeverity  string                 `json:"no_result_min_severity"`
-	NoResultBaseSeconds  int64                  `json:"no_result_base_seconds"`
-	NoResultCheckedAt    int64                  `json:"no_result_checked_at,omitempty"`
-	StopReason           string                 `json:"stop_reason"`
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	ShareGlobalAssets    bool                   `json:"share_global_assets"`
-	WorkerCount          int                    `json:"worker_count"` // 本任务 Worker 数;0=用全局默认
-	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
-	ActiveRunSeconds     int64                  `json:"active_run_seconds"`
-	RunSegmentStartedAt  int64                  `json:"run_segment_started_at,omitempty"`
-	Store                *pgdb.ExplorationStore `json:"-"`
-	Guard                *guard.Guard           `json:"-"`
-	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	NoResultSeconds      int    `json:"no_result_seconds"`
+	NoResultMinFindings  int    `json:"no_result_min_findings"`
+	NoResultMinSeverity  string `json:"no_result_min_severity"`
+	NoResultBaseSeconds  int64  `json:"no_result_base_seconds"`
+	NoResultCheckedAt    int64  `json:"no_result_checked_at,omitempty"`
+	StopReason           string `json:"stop_reason"`
+	TimeoutSeconds       int    `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	ShareGlobalAssets    bool   `json:"share_global_assets"`
+	WorkerCount          int    `json:"worker_count"` // 本任务 Worker 数;0=用全局默认
+	FirstRunAt           int64  `json:"first_run_at,omitempty"`
+	DeadlineAt           int64  `json:"deadline_at,omitempty"`
+	ActiveRunSeconds     int64  `json:"active_run_seconds"`
+	RunSegmentStartedAt  int64  `json:"run_segment_started_at,omitempty"`
+	// AssessmentMode：白盒驱动评估模式。true 时任务结束必须经过程序完成判定契约
+	//（CompleteAssessment），Planner/Worker 的目标判定不再直接落 done。
+	AssessmentMode bool `json:"assessment_mode"`
+	// AssessmentPhase：评估阶段（''=传统模式/未启用）。与运行状态分离。
+	AssessmentPhase string                 `json:"assessment_phase"`
+	Store           *pgdb.ExplorationStore `json:"-"`
+	Guard           *guard.Guard           `json:"-"`
+	notify          chan struct{}
+	lifecycleMu     sync.RWMutex
+	llmMu           sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -1186,6 +1191,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		ActiveRunSeconds: pt.ActiveRunSeconds, RunSegmentStartedAt: unixOrZero(pt.RunSegmentStartedAt),
+		AssessmentMode: pt.AssessmentMode, AssessmentPhase: pt.AssessmentPhase,
 		Store: store, Guard: guard.NewWithInterceptor(ic).WithProject(pt.ProjectID), notify: make(chan struct{}, 1),
 	}
 }

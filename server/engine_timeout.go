@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -284,7 +285,19 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, reason string) {
 	// ⑥ 定终态(带守卫):met → done(completed);否则 timeout。若常规路径已先落 done,
 	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
 	status := "timeout"
-	if met {
+	if met && t.AssessmentMode {
+		// 白盒驱动评估模式：终局判定的 done 同样必须经过程序完成契约（§6.3）；
+		// 契约未通过的超时任务按 timeout 收场，不冒充全覆盖完成。
+		completed, report, cErr := e.m.CompleteAssessment(t)
+		switch {
+		case cErr != nil:
+			log.Printf("[assessment] task %s 收尾完成判定失败(按 timeout 收场): %v", t.ID, cErr)
+		case completed:
+			status = "done"
+		case report != nil:
+			log.Printf("[assessment] task %s 收尾完成契约未通过(按 timeout 收场): %s", t.ID, strings.Join(report.Reasons, "；"))
+		}
+	} else if met {
 		status = "done"
 	}
 	won, err := e.m.SetTaskStatusGuardedReason(t.ID, status, reason)

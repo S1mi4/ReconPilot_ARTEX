@@ -2126,3 +2126,179 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+-- =====================================================================
+-- 白盒驱动测试转型（docs/whitebox-driven-assessment-design.md §3/§9）。
+-- 评估轮次/代码目标/画像事实/证据引用/覆盖义务/测试尝试/事件。
+-- 存量任务不受影响：assessment_mode 默认 false，旧覆盖语义保持不变。
+-- =====================================================================
+
+-- assessment_mode：白盒驱动评估模式开关。false(默认)=传统探索语义；
+-- true=任务完成走程序完成判定契约（见 db.AssessmentCompletionCheck）。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assessment_mode BOOLEAN NOT NULL DEFAULT false;
+-- assessment_phase：评估阶段，与运行状态（paused/queued/failed 等）分离。
+-- ''=未启用/传统模式。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assessment_phase TEXT NOT NULL DEFAULT '';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conrelid='tasks'::regclass
+          AND conname='ck_tasks_assessment_phase'
+    ) THEN
+        ALTER TABLE tasks ADD CONSTRAINT ck_tasks_assessment_phase CHECK (
+            assessment_phase IN ('', 'material_check', 'profiling', 'coverage_planning',
+                                 'executing', 'reconciliation', 'completed')
+        );
+    END IF;
+END $$;
+
+-- 评估轮次：绑定本轮代码版本、环境版本、范围与标准版本，以及完成记录。
+-- 完成后出现新代码/部署版本应开新轮次，历史轮次保持原范围和结果不被覆盖。
+CREATE TABLE IF NOT EXISTS task_assessment_rounds (
+    id                  BIGSERIAL PRIMARY KEY,
+    task_id             BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    round_no            INTEGER NOT NULL CHECK (round_no > 0),
+    codebase_version    TEXT NOT NULL DEFAULT '',
+    environment_version TEXT NOT NULL DEFAULT '',
+    scope_version       TEXT NOT NULL DEFAULT '',
+    standard_version    TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open','completed','superseded')),
+    completion_report   JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at        TIMESTAMPTZ,
+    UNIQUE (task_id, round_no)
+);
+CREATE INDEX IF NOT EXISTS idx_task_assessment_rounds_task
+    ON task_assessment_rounds(task_id, round_no DESC);
+
+-- 证据引用：代码范围、反编译来源、流量、执行输出等。被画像断言、义务、尝试引用。
+CREATE TABLE IF NOT EXISTS task_evidence_refs (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL
+               CHECK (kind IN ('code_range','decompiled','traffic','execution_output','config','manual')),
+    reference  TEXT NOT NULL,
+    payload    JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_task_evidence_refs_task ON task_evidence_refs(task_id, id DESC);
+
+-- 代码目标/目标实体：模块、实例、入口、身份、业务对象等，关联既有资产 ID。
+-- gap=true 表示清单对账缺口（读取失败/无法分类等），不能静默从分母消失；
+-- resolved=true 表示该缺口已被处置（补齐或登记为明确例外）。
+CREATE TABLE IF NOT EXISTS task_target_entities (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    round_id          BIGINT REFERENCES task_assessment_rounds(id) ON DELETE SET NULL,
+    entity_type       TEXT NOT NULL
+                      CHECK (entity_type IN (
+                          'service','module','shared_library','entry','config','instance',
+                          'identity','business_object','protocol','external_dependency','runtime_asset')),
+    name              TEXT NOT NULL,
+    asset_id          BIGINT REFERENCES assets(id) ON DELETE SET NULL,
+    codebase_id       TEXT NOT NULL DEFAULT '',
+    version_id        TEXT NOT NULL DEFAULT '',
+    attributes        JSONB NOT NULL DEFAULT '{}',
+    gap               BOOLEAN NOT NULL DEFAULT false,
+    gap_reason        TEXT NOT NULL DEFAULT '',
+    resolved          BOOLEAN NOT NULL DEFAULT false,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_task_target_entities_task ON task_target_entities(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_target_entities_gaps
+    ON task_target_entities(task_id) WHERE gap AND NOT resolved;
+
+-- 画像事实/关系断言：主体-关系-客体 + 来源 + 证据 + 适用版本 + 确认/冲突状态。
+-- 密码、私钥、会话 Token 不进入画像文本；画像只保存身份语义及凭证引用。
+CREATE TABLE IF NOT EXISTS task_profile_claims (
+    id                  BIGSERIAL PRIMARY KEY,
+    task_id             BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    round_id            BIGINT REFERENCES task_assessment_rounds(id) ON DELETE SET NULL,
+    subject             TEXT NOT NULL,
+    relation            TEXT NOT NULL,
+    object_value        TEXT NOT NULL DEFAULT '',
+    source_type         TEXT NOT NULL
+                        CHECK (source_type IN ('user_declared','static_extraction','runtime_observation','model_inference')),
+    evidence_ref_id     BIGINT REFERENCES task_evidence_refs(id) ON DELETE SET NULL,
+    valid_code_version  TEXT NOT NULL DEFAULT '',
+    environment         TEXT NOT NULL DEFAULT '',
+    confirmation_status TEXT NOT NULL DEFAULT 'unverified'
+                        CHECK (confirmation_status IN ('unverified','confirmed','conflicted','unknown')),
+    conflict_note       TEXT NOT NULL DEFAULT '',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_task_profile_claims_task ON task_profile_claims(task_id, subject);
+
+-- 覆盖义务：为说明某对象已按本轮标准接受测试，必须完成的一项具体工作。
+-- 状态含义（§6.1）：satisfied=完成规定检查（可无发现）；blocked=前提缺失（不计入已覆盖）；
+-- stale=材料/环境/画像变化致证据失效；not_applicable=有可审计的不适用依据（须填 reason，
+-- Agent 不得为提高覆盖率任意设置）。
+CREATE TABLE IF NOT EXISTS task_coverage_obligations (
+    id                    BIGSERIAL PRIMARY KEY,
+    task_id               BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    round_id              BIGINT REFERENCES task_assessment_rounds(id) ON DELETE SET NULL,
+    dimension             TEXT NOT NULL
+                          CHECK (dimension IN ('code_audit','config_audit','entry_test',
+                                               'identity_resource','cross_module',
+                                               'runtime_asset','hypothesis')),
+    target_entity_id      BIGINT REFERENCES task_target_entities(id) ON DELETE SET NULL,
+    purpose               TEXT NOT NULL DEFAULT '',
+    required              BOOLEAN NOT NULL DEFAULT true,
+    status                TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','ready','running','satisfied','blocked','stale','not_applicable')),
+    -- 幂等标识：同一任务内 dedupe_key 唯一，重复规划不重复派工（§10 第 4 步）。
+    dedupe_key            TEXT NOT NULL DEFAULT '',
+    requires_credentials  BOOLEAN NOT NULL DEFAULT false,
+    credential_ref        TEXT NOT NULL DEFAULT '',
+    blocked_reason        TEXT NOT NULL DEFAULT '',
+    stale_reason          TEXT NOT NULL DEFAULT '',
+    not_applicable_reason TEXT NOT NULL DEFAULT '',
+    evidence_ref_id       BIGINT REFERENCES task_evidence_refs(id) ON DELETE SET NULL,
+    acceptance_rule       JSONB NOT NULL DEFAULT '{}',
+    dependency_ids        BIGINT[] NOT NULL DEFAULT '{}',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    satisfied_at          TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_coverage_obligations_dedupe
+    ON task_coverage_obligations(task_id, dedupe_key) WHERE dedupe_key <> '';
+CREATE INDEX IF NOT EXISTS idx_task_coverage_obligations_task
+    ON task_coverage_obligations(task_id, status);
+
+-- 测试尝试：关联意图/白盒运行，保存尝试序号、结果分类与输出。
+-- 结果分类（§7.2）：supported/disproved/unreproduced/env_mismatch/dependency_missing/failed。
+-- 单次异常响应不能自动确认漏洞；单次未复现不能自动否定漏洞。
+CREATE TABLE IF NOT EXISTS task_test_attempts (
+    id               BIGSERIAL PRIMARY KEY,
+    task_id          BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    obligation_id    BIGINT NOT NULL REFERENCES task_coverage_obligations(id) ON DELETE CASCADE,
+    attempt_no       INTEGER NOT NULL CHECK (attempt_no > 0),
+    intent_node_id   BIGINT,
+    code_audit_run_id BIGINT,
+    outcome          TEXT NOT NULL
+                     CHECK (outcome IN ('supported','disproved','unreproduced','env_mismatch',
+                                        'dependency_missing','failed')),
+    evidence_ref_id  BIGINT REFERENCES task_evidence_refs(id) ON DELETE SET NULL,
+    output           JSONB NOT NULL DEFAULT '{}',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (obligation_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_task_test_attempts_task ON task_test_attempts(task_id, id);
+
+-- 评估事件：新资产、新入口、画像变化、证据失效等可靠事件，驱动增量调度（§10 第 7 步）。
+CREATE TABLE IF NOT EXISTS task_assessment_events (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    round_id    BIGINT REFERENCES task_assessment_rounds(id) ON DELETE SET NULL,
+    event_type  TEXT NOT NULL
+                CHECK (event_type IN ('new_asset','new_entry','profile_change',
+                                      'evidence_invalidated','knowledge_conflict',
+                                      'code_version_change')),
+    payload     JSONB NOT NULL DEFAULT '{}',
+    processed   BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_task_assessment_events_pending
+    ON task_assessment_events(task_id, id) WHERE NOT processed;
