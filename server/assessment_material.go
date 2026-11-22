@@ -800,12 +800,12 @@ func classifyInspectedFileContentWithLabel(rel, displayPath string, data []byte,
 			langSeen[l] = true
 		}
 	}
-	if len(matchedLangs) > 0 && (kind == "source" || kind == "template") {
+	if len(matchedLangs) > 0 && (kind == "source" || kind == "java" || kind == "template") {
 		if !isValidTextCodeContent(rel, data) {
 			inv.InvalidCodeFiles = append(inv.InvalidCodeFiles, displayPath)
 			return
 		}
-		if kind == "source" {
+		if kind == "source" || kind == "java" {
 			inv.ValidSourceFiles++
 		} else {
 			inv.ValidTemplateFiles++

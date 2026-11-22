@@ -83,7 +83,12 @@ func step2TestServer(t *testing.T) (*Server, int64, string) {
 		t.Fatalf("NewManager failed: %v", err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
-	s := New(context.Background(), m, dir, dir, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, dir, dir, dir)
+	t.Cleanup(func() {
+		cancel()
+		s.Close()
+	})
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
 		t.Fatalf("signJWT failed: %v", err)
@@ -375,7 +380,12 @@ func TestStep2DraftLockedAcrossControlsRestartsAndLegacyParity(t *testing.T) {
 		t.Fatalf("reload manager failed: %v", err)
 	}
 	defer m2.Close()
-	s2 := New(context.Background(), m2, dataDir, dataDir, dataDir)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	s2 := New(ctx2, m2, dataDir, dataDir, dataDir)
+	defer func() {
+		cancel2()
+		s2.Close()
+	}()
 	token2, err := signJWT(s2.jwtKey)
 	if err != nil {
 		t.Fatal(err)

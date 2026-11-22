@@ -185,18 +185,22 @@ type AssessmentRound struct {
 	ScopeVersion       string          `json:"scope_version"`
 	StandardVersion    string          `json:"standard_version"`
 	Status             string          `json:"status"`
+	ProfileVersion     int             `json:"profile_version"`
+	ProfileBuiltAt     *time.Time      `json:"profile_built_at,omitempty"`
 	CompletionReport   json.RawMessage `json:"completion_report,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 	CompletedAt        *time.Time      `json:"completed_at,omitempty"`
 }
+
+const assessmentRoundCols = `id, task_id, round_no, codebase_version, environment_version, scope_version,
+       standard_version, status, profile_version, profile_built_at, completion_report, created_at, completed_at`
 
 // CreateAssessmentRound opens round_no = max(existing)+1 for the task.
 func (d *DB) CreateAssessmentRound(taskID int64) (*AssessmentRound, error) {
 	round, err := scanAssessmentRound(d.QueryRow(`
 INSERT INTO task_assessment_rounds(task_id, round_no)
 VALUES ($1, COALESCE((SELECT max(round_no) FROM task_assessment_rounds WHERE task_id=$1), 0) + 1)
-RETURNING id, task_id, round_no, codebase_version, environment_version, scope_version,
-          standard_version, status, completion_report, created_at, completed_at`, taskID))
+RETURNING `+assessmentRoundCols, taskID))
 	if err != nil {
 		return nil, err
 	}
@@ -207,11 +211,27 @@ RETURNING id, task_id, round_no, codebase_version, environment_version, scope_ve
 // 完成判定、义务生成、尝试写入都以当前 open 轮次为界；历史轮次保持原有范围和结果。
 func (d *DB) OpenAssessmentRound(taskID int64) (*AssessmentRound, error) {
 	round, err := scanAssessmentRound(d.QueryRow(`
-SELECT id, task_id, round_no, codebase_version, environment_version, scope_version,
-       standard_version, status, completion_report, created_at, completed_at
+SELECT `+assessmentRoundCols+`
 FROM task_assessment_rounds
 WHERE task_id=$1 AND status='open'
 ORDER BY round_no DESC LIMIT 1`, taskID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return round, nil
+}
+
+// LatestAssessmentRound returns the current open round if any, otherwise the
+// most recent round (e.g. for viewing completed or archived tasks).
+func (d *DB) LatestAssessmentRound(taskID int64) (*AssessmentRound, error) {
+	round, err := scanAssessmentRound(d.QueryRow(`
+SELECT `+assessmentRoundCols+`
+FROM task_assessment_rounds
+WHERE task_id=$1
+ORDER BY (status='open') DESC, round_no DESC LIMIT 1`, taskID))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -242,7 +262,8 @@ func scanAssessmentRound(sc interface{ Scan(...any) error }) (*AssessmentRound, 
 	var r AssessmentRound
 	var report []byte
 	if err := sc.Scan(&r.ID, &r.TaskID, &r.RoundNo, &r.CodebaseVersion, &r.EnvironmentVersion,
-		&r.ScopeVersion, &r.StandardVersion, &r.Status, &report, &r.CreatedAt, &r.CompletedAt); err != nil {
+		&r.ScopeVersion, &r.StandardVersion, &r.Status, &r.ProfileVersion, &r.ProfileBuiltAt,
+		&report, &r.CreatedAt, &r.CompletedAt); err != nil {
 		return nil, err
 	}
 	if len(report) > 0 {

@@ -73,6 +73,9 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolAttachTaskCodebase(),
 		s.toolCheckTaskMaterials(),
 		s.toolStartTask(),
+		s.toolGetTaskProfile(),
+		s.toolRebuildTaskProfile(),
+		s.toolRecordTaskProfileClaim(),
 		s.toolPauseTask(),
 		s.toolGetTaskGraph(),
 		s.toolListTaskFindings(),
@@ -726,6 +729,207 @@ func (s *Server) toolStartTask() actool.CoreTool {
 				"round":   round,
 				"report":  report,
 			})
+		})
+}
+
+func (s *Server) toolGetTaskProfile() actool.CoreTool {
+	return roTool("get_task_profile",
+		"读取白盒评估任务当前轮次的靶向画像切片（代码清单、共享库、入口、实例、断言、冲突、未知项与待对账缺口，附带 profile_version）。",
+		objSchema(map[string]any{
+			"task_id":     strParam("评估任务 id"),
+			"subjects":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：按目标 subject（如 service:order-service、instance:staging）筛选靶向切片"},
+			"entity_type": strParam("可选：按实体类型筛选（service/shared_library/module/entry/config/instance/identity/business_object/protocol）"),
+			"gap_only":    map[string]any{"type": "boolean", "description": "可选：仅查看清单缺口"},
+			"status":      strParam("可选：按断言状态筛选（conflicted/unknown/unverified/confirmed）"),
+			"source_type": strParam("可选：按断言来源筛选（static_extraction/user_declared/runtime_observation/model_inference）"),
+			"limit":       map[string]any{"type": "integer", "description": "可选：返回数量上限（默认 100）"},
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID     string   `json:"task_id"`
+				Subjects   []string `json:"subjects"`
+				EntityType string   `json:"entity_type"`
+				GapOnly    bool     `json:"gap_only"`
+				Status     string   `json:"status"`
+				SourceType string   `json:"source_type"`
+				Limit      int      `json:"limit"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !t.AssessmentMode {
+				return actool.Errorf(db.ErrTaskNotAssessmentMode.Error()), nil
+			}
+			taskNum, err := parseTaskID(t.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if len(a.Subjects) > 0 && a.EntityType == "" && !a.GapOnly && a.Status == "" && a.SourceType == "" {
+				round, rErr := s.m.pg.LatestAssessmentRound(taskNum)
+				if rErr != nil {
+					return actool.Errorf(rErr.Error()), nil
+				}
+				if round == nil {
+					return actool.Errorf("任务尚未开启评估轮次"), nil
+				}
+				slice, sErr := s.m.pg.QueryProfileContext(taskNum, round.ID, a.Subjects, a.Limit)
+				if sErr != nil {
+					return actool.Errorf(sErr.Error()), nil
+				}
+				return jsonResult(slice)
+			}
+			resp, _, bErr := s.buildAssessmentProfileResponse(t, 0,
+				db.TargetEntityFilter{EntityType: strings.TrimSpace(a.EntityType), GapOnly: a.GapOnly, Limit: a.Limit},
+				db.ProfileClaimFilter{ConfirmationStatus: strings.TrimSpace(a.Status), SourceType: strings.TrimSpace(a.SourceType), Limit: a.Limit},
+			)
+			if bErr != nil {
+				return actool.Errorf(bErr.Error()), nil
+			}
+			return jsonResult(resp)
+		})
+}
+
+func (s *Server) toolRebuildTaskProfile() actool.CoreTool {
+	return wrTool("rebuild_task_profile",
+		"在已启动的白盒评估任务上重新运行确定性代码清单清点、结构提取、部署映射与画像版本递增。",
+		objSchema(map[string]any{
+			"task_id":      strParam("已启动的评估任务 id"),
+			"enable_agent": map[string]any{"type": "boolean", "description": "可选：是否补充模型关联推断（默认 false）"},
+		}, "task_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID      string `json:"task_id"`
+				EnableAgent bool   `json:"enable_agent"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			resp, _, bErr := s.BuildAssessmentInitialProfile(ctx, t.ID, BuildProfileOptions{EnableAgent: a.EnableAgent})
+			if bErr != nil {
+				return actool.Errorf(bErr.Error()), nil
+			}
+			return jsonResult(resp)
+		})
+}
+
+func (s *Server) toolRecordTaskProfileClaim() actool.CoreTool {
+	return wrTool("record_task_profile_claim",
+		"为已启动的白盒评估任务登记带证据引用的画像断言（仅允许 model_inference 或 user_declared；严禁明文秘钥，严禁将 model_inference 标为 confirmed 或冒充 runtime_observation）。",
+		objSchema(map[string]any{
+			"task_id":             strParam("评估任务 id"),
+			"subject":             strParam("主体，如 service:order-service、entry:HTTP GET /api/orders、instance:staging"),
+			"relation":            strParam("关系/属性，如 auth_mechanism、auth_required、depends_on、deployed_to_instance"),
+			"object_value":        strParam("客体或属性值（严禁包含明文密码/Token/私钥）"),
+			"source_type":         map[string]any{"type": "string", "enum": []string{"model_inference", "user_declared"}, "description": "来源类型：仅允许 model_inference（默认）或 user_declared"},
+			"confirmation_status": map[string]any{"type": "string", "enum": []string{"unverified", "unknown"}, "description": "确认状态：unverified（默认）或 unknown；推断不能标为 confirmed"},
+			"evidence_ref_id":     map[string]any{"type": "integer", "description": "已有 task_evidence_refs ID（与 evidence_kind/evidence_reference 二选一）"},
+			"evidence_kind":       map[string]any{"type": "string", "enum": []string{"code_range", "decompiled", "config", "manual"}, "description": "新建证据引用类型"},
+			"evidence_reference":  strParam("新建证据引用位置，如 OrderController.java:42"),
+			"valid_code_version":  strParam("可选：适用代码版本"),
+			"environment":         strParam("可选：适用环境"),
+			"valid_config":        strParam("可选：适用配置文件"),
+			"conflict_note":       strParam("可选：不确定性或冲突说明"),
+		}, "task_id", "subject", "relation", "object_value"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				TaskID             string `json:"task_id"`
+				Subject            string `json:"subject"`
+				Relation           string `json:"relation"`
+				ObjectValue        string `json:"object_value"`
+				SourceType         string `json:"source_type"`
+				ConfirmationStatus string `json:"confirmation_status"`
+				EvidenceRefID      *int64 `json:"evidence_ref_id"`
+				EvidenceKind       string `json:"evidence_kind"`
+				EvidenceReference  string `json:"evidence_reference"`
+				ValidCodeVersion   string `json:"valid_code_version"`
+				Environment        string `json:"environment"`
+				ValidConfig        string `json:"valid_config"`
+				ConflictNote       string `json:"conflict_note"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数解析失败: " + err.Error()), nil
+			}
+			t, err := s.requireToolTask(ctx, a.TaskID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !t.AssessmentMode {
+				return actool.Errorf(db.ErrTaskNotAssessmentMode.Error()), nil
+			}
+			if t.IsDraft() {
+				return actool.Errorf("草稿任务尚未启动，不能写入画像断言"), nil
+			}
+			taskNum, err := parseTaskID(t.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			round, err := s.m.pg.OpenAssessmentRound(taskNum)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if round == nil {
+				return actool.Errorf("没有进行中的评估轮次"), nil
+			}
+
+			src := strings.TrimSpace(a.SourceType)
+			if src == "" {
+				src = db.ClaimSourceModelInference
+			}
+			if src != db.ClaimSourceModelInference && src != db.ClaimSourceUserDeclared {
+				return actool.Errorf(fmt.Sprintf("Agent 工具仅允许写入 model_inference 或 user_declared 断言，禁止冒充 %q", src)), nil
+			}
+			status := strings.TrimSpace(a.ConfirmationStatus)
+			if status == "" {
+				status = db.ClaimStatusUnverified
+			}
+			if status == db.ClaimStatusConfirmed && src == db.ClaimSourceModelInference {
+				return actool.Errorf(db.ErrInferenceCannotClaimConfirmed.Error()), nil
+			}
+
+			evID := a.EvidenceRefID
+			if evID == nil {
+				if strings.TrimSpace(a.EvidenceKind) == "" || strings.TrimSpace(a.EvidenceReference) == "" {
+					return actool.Errorf("必须提供有效的 evidence_ref_id 或 (evidence_kind + evidence_reference)"), nil
+				}
+				switch db.EvidenceRefKind(strings.TrimSpace(a.EvidenceKind)) {
+				case db.EvidenceCodeRange, db.EvidenceDecompiled, db.EvidenceConfig, db.EvidenceManual:
+				default:
+					return actool.Errorf(fmt.Sprintf("Agent 画像断言不允许伪造 %q 类型运行证据", a.EvidenceKind)), nil
+				}
+				id, evErr := s.m.pg.GetOrCreateEvidenceRef(taskNum, db.EvidenceRefKind(strings.TrimSpace(a.EvidenceKind)), a.EvidenceReference, nil)
+				if evErr != nil {
+					return actool.Errorf(evErr.Error()), nil
+				}
+				evID = &id
+			}
+
+			claim, created, cErr := s.m.pg.CreateProfileClaim(db.CreateProfileClaimInput{
+				TaskID:             taskNum,
+				RoundID:            &round.ID,
+				Subject:            a.Subject,
+				Relation:           a.Relation,
+				ObjectValue:        a.ObjectValue,
+				SourceType:         src,
+				EvidenceRefID:      evID,
+				ValidCodeVersion:   a.ValidCodeVersion,
+				Environment:        a.Environment,
+				ValidConfig:        a.ValidConfig,
+				ConfirmationStatus: status,
+				ConflictNote:       a.ConflictNote,
+				ExecutionRef:       "agent-tool:record_task_profile_claim",
+			})
+			if cErr != nil {
+				return actool.Errorf(cErr.Error()), nil
+			}
+			return jsonResult(map[string]any{"claim": claim, "created": created})
 		})
 }
 

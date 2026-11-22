@@ -806,8 +806,7 @@ WHERE id=$1`,
 	round, err := scanAssessmentRound(tx.QueryRow(`
 INSERT INTO task_assessment_rounds(task_id, round_no, codebase_version, environment_version, scope_version, standard_version)
 VALUES ($1, COALESCE((SELECT max(round_no) FROM task_assessment_rounds WHERE task_id=$1), 0) + 1, $2, $3, $4, $5)
-RETURNING id, task_id, round_no, codebase_version, environment_version, scope_version,
-          standard_version, status, completion_report, created_at, completed_at`,
+RETURNING `+assessmentRoundCols,
 		in.TaskID, in.CodebaseVersion, in.EnvironmentVersion, in.ScopeVersion, in.StandardVersion))
 	if err != nil {
 		return nil, nil, err

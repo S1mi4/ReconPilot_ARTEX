@@ -526,6 +526,13 @@ export const api = {
     del<{ deleted_versions: number; codebase_id: string }>(
       `/tasks/${encodeURIComponent(id)}/codebases/${encodeURIComponent(codebaseId)}`,
     ),
+  getTaskProfile: (id: string) =>
+    get<import("./types").AssessmentProfileResponse>(`/tasks/${encodeURIComponent(id)}/profile`),
+  rebuildTaskProfile: (id: string) =>
+    post<import("./types").AssessmentProfileResponse>(
+      `/tasks/${encodeURIComponent(id)}/profile/rebuild`,
+      {},
+    ),
   schedules: () => get<{ schedules: TaskSchedule[] }>("/schedules").then((r) => arr(r.schedules)),
   renameSchedule: (id: number, name: string) => patch<TaskSchedule>(`/schedules/${id}/metadata`, { name }),
   updateScheduleRemark: (id: number, remark: string) => patch<TaskSchedule>(`/schedules/${id}/remark`, { remark }),

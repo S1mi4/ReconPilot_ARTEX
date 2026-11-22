@@ -2353,3 +2353,18 @@ CREATE TABLE IF NOT EXISTS task_assessment_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_assessment_events_pending
     ON task_assessment_events(task_id, id) WHERE NOT processed;
+
+-- =====================================================================
+-- 白盒驱动测试转型第 3 步（§4/§9/§10）：代码清单与初始画像。
+-- 轮次快照版本号、断言适用配置/执行来源与画像查询索引（幂等迁移）。
+-- =====================================================================
+ALTER TABLE task_assessment_rounds ADD COLUMN IF NOT EXISTS profile_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_assessment_rounds ADD COLUMN IF NOT EXISTS profile_built_at TIMESTAMPTZ;
+ALTER TABLE task_profile_claims ADD COLUMN IF NOT EXISTS valid_config TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_profile_claims ADD COLUMN IF NOT EXISTS execution_ref TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_task_profile_claims_round_subject
+    ON task_profile_claims(task_id, round_id, subject, relation);
+CREATE INDEX IF NOT EXISTS idx_task_profile_claims_round_status
+    ON task_profile_claims(task_id, round_id, confirmation_status);
+CREATE INDEX IF NOT EXISTS idx_task_target_entities_round_type
+    ON task_target_entities(task_id, round_id, entity_type);

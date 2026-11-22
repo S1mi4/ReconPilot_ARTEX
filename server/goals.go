@@ -57,7 +57,15 @@ func (s *Server) startTaskEngine(t *Task) {
 	}
 	if t.AssessmentMode {
 		s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-			Summary: "白盒驱动评估已启动，进入画像构建阶段（profiling），不运行传统目标拆解"})
+			Summary: "白盒驱动评估已启动，进入画像构建阶段（profiling），开始代码清单清点与初始画像提取"})
+		if t.lifecycleSnapshot().AssessmentPhase == db.AssessmentPhaseProfiling {
+			if _, _, pErr := s.BuildAssessmentInitialProfile(ctx, t.ID, BuildProfileOptions{EnableAgent: true}); pErr != nil && ctx.Err() == nil && !s.engine.IsDeleting(t.ID) {
+				log.Printf("[assessment-profile] task %s 初始画像构建失败: %v", t.ID, pErr)
+			}
+		}
+		if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+			return
+		}
 		s.engine.Run(s.ctx, t)
 		return
 	}
@@ -317,7 +325,9 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 		if s.engine.IsPaused(t.ID) {
 			s.engine.Resume(t)
 		}
+		s.auditWG.Add(1)
 		go func() {
+			defer s.auditWG.Done()
 			defer s.engine.decInflight(t.ID)
 			s.startTaskEngine(t)
 		}()

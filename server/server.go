@@ -70,6 +70,9 @@ type Server struct {
 
 	// javaCodeDBProbe allows deterministic test injection for Step-2 binary package checks.
 	javaCodeDBProbe func() taskJavaCodeDBConfig
+	// javaCodeDBProfileProbe allows deterministic test injection for Step-3 binary profiling.
+	javaCodeDBProfileProbe func(ctx context.Context, versionDir string, version taskCodebaseVersion) (*javaBinaryProfileSummary, error)
+	profileBuildMu         sync.Mutex
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -940,6 +943,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}/draft", s.updateTaskDraftHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/material-check", s.materialCheckHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/start", s.startAssessmentTaskHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/profile", s.getTaskProfileHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/profile/entities", s.listTaskProfileEntitiesHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/profile/claims", s.listTaskProfileClaimsHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/profile/rebuild", s.rebuildTaskProfileHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/profile/claims", s.createTaskProfileClaimHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services/{serviceID}/audit-config", s.taskCodeAuditConfigHandler)

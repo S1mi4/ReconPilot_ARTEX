@@ -1384,6 +1384,29 @@ func (m *Manager) StartAssessmentTask(taskID string, in pgdb.AssessmentStartInpu
 	return m.syncTaskFromPG(taskID, updated), round, nil
 }
 
+// SetAssessmentPhase updates the task's assessment_phase in PostgreSQL and in
+// the in-memory lifecycle mirror under taskStateMu.
+func (m *Manager) SetAssessmentPhase(taskID, phase string) error {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return errors.New("invalid task id")
+	}
+	if err := m.pg.SetAssessmentPhase(id, phase); err != nil {
+		return err
+	}
+	m.mu.RLock()
+	task := m.tasks[taskID]
+	m.mu.RUnlock()
+	if task != nil {
+		task.updateLifecycle(func(state *taskLifecycleState) {
+			state.AssessmentPhase = phase
+		})
+	}
+	return nil
+}
+
 // CreateTask creates a task + its exploration and makes it active.
 // timeoutSeconds is the task-level wall-clock budget (0 = 不限时).
 func (m *Manager) CreateTask(projectID int64, description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {

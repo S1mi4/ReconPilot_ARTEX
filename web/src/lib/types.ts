@@ -181,6 +181,110 @@ export interface MaterialCheckReport {
   valid_environment_urls?: string[];
 }
 
+export interface AssessmentRound {
+  id: number;
+  task_id: number;
+  round_no: number;
+  codebase_version: string;
+  environment_version: string;
+  scope_version: string;
+  standard_version: string;
+  status: string;
+  profile_version: number;
+  profile_built_at?: string;
+  completion_report?: unknown;
+  created_at: string;
+  completed_at?: string;
+}
+
+export type TargetEntityType =
+  | "service"
+  | "shared_library"
+  | "module"
+  | "binary_artifact"
+  | "deployment_unit"
+  | "unknown_item"
+  | (string & {});
+
+export interface TargetEntity {
+  id: number;
+  task_id: number;
+  round_id?: number;
+  entity_type: TargetEntityType;
+  name: string;
+  asset_id?: number;
+  codebase_id: string;
+  version_id: string;
+  attributes?: Record<string, unknown>;
+  gap: boolean;
+  gap_reason: string;
+  gap_resolved: boolean;
+}
+
+export interface EvidenceRef {
+  id: number;
+  task_id: number;
+  kind: string;
+  reference: string;
+  payload?: unknown;
+  created_at: string;
+}
+
+export type ProfileClaimSourceType =
+  | "user_declared"
+  | "static_extraction"
+  | "runtime_observation"
+  | "model_inference";
+
+export type ProfileClaimStatus = "unverified" | "confirmed" | "conflicted" | "unknown";
+
+export interface ProfileClaim {
+  id: number;
+  task_id: number;
+  round_id?: number;
+  subject: string;
+  relation: string;
+  object_value: string;
+  source_type: ProfileClaimSourceType;
+  evidence_ref_id?: number;
+  evidence_ref?: EvidenceRef;
+  valid_code_version: string;
+  environment: string;
+  valid_config: string;
+  confirmation_status: ProfileClaimStatus;
+  conflict_note: string;
+  execution_ref?: string;
+  created_at: string;
+}
+
+export interface AssessmentProfileSummary {
+  round_id: number;
+  round_no: number;
+  profile_version: number;
+  profile_built_at?: string;
+  initial_profile_ready: boolean;
+  total_entities: number;
+  entity_counts: Record<string, number>;
+  gap_count: number;
+  unresolved_gap_count: number;
+  total_claims: number;
+  claim_source_counts: Record<string, number>;
+  claim_status_counts: Record<string, number>;
+  conflict_count: number;
+  unknown_count: number;
+  languages: string[];
+}
+
+export interface AssessmentProfileResponse {
+  task_id: string;
+  assessment_phase: AssessmentPhase;
+  round?: AssessmentRound;
+  summary?: AssessmentProfileSummary;
+  entities: TargetEntity[];
+  claims: ProfileClaim[];
+  evidence_refs: EvidenceRef[];
+}
+
 export interface TaskCategory {
   id: number;
   name: string;

@@ -52,6 +52,7 @@ import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
+import { ProfileTab } from "./_tabs/profile-tab";
 import { ReportTab } from "./_tabs/report-tab";
 import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
@@ -228,11 +229,29 @@ function TaskDetailInner() {
   const requestedTab = searchParams.get("tab") ?? "sessions";
   const normalizedRequestedTab = requestedTab === "http-history" ? "traffic" : requestedTab;
   const [tab, setTab] = React.useState(
-    TABS(ui).some((item) => item.value === normalizedRequestedTab) ? normalizedRequestedTab : "sessions",
+    TABS(ui).some((item) => item.value === normalizedRequestedTab) || normalizedRequestedTab === "profile"
+      ? normalizedRequestedTab
+      : "sessions",
   );
+  const visibleTabs = React.useMemo(() => {
+    const base = TABS(ui);
+    if (!task?.assessment_mode) return base;
+    const profileTab = { value: "profile", label: translate("taskUI.assessment.profile.tab") };
+    const idx = base.findIndex((item) => item.value === "overview");
+    if (idx >= 0) return [...base.slice(0, idx + 1), profileTab, ...base.slice(idx + 1)];
+    return [profileTab, ...base];
+  }, [ui, translate, task?.assessment_mode]);
   React.useEffect(() => {
+    if (normalizedRequestedTab === "profile") {
+      if (task?.assessment_mode) {
+        setTab("profile");
+      } else if (loaded && !task?.assessment_mode) {
+        setTab("sessions");
+      }
+      return;
+    }
     if (TABS(liveUI).some((item) => item.value === normalizedRequestedTab)) setTab(normalizedRequestedTab);
-  }, [normalizedRequestedTab, liveUI]);
+  }, [normalizedRequestedTab, liveUI, loaded, task?.assessment_mode]);
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -500,7 +519,7 @@ function TaskDetailInner() {
         {/* Tabs */}
         <div className="no-scrollbar min-w-0 overflow-x-auto">
           <TabsList variant="default" className="min-w-max">
-            {TABS(ui).map((t) => (
+            {visibleTabs.map((t) => (
               <TabsTrigger key={t.value} value={t.value}>
                 {t.label}
                 {t.value === "intercept" && interceptPendingCount > 0 && (
@@ -559,6 +578,11 @@ function TaskDetailInner() {
         <TabsContent value="assets" className="mt-0">
           <AssetsTab taskId={id} />
         </TabsContent>
+        {task.assessment_mode && (
+          <TabsContent value="profile" className="mt-0">
+            <ProfileTab task={task} />
+          </TabsContent>
+        )}
         <TabsContent value="coverage" className="mt-0">
           <CoverageGraphTab taskId={id} coverageEnabled={task?.coverage_enabled !== false} />
         </TabsContent>

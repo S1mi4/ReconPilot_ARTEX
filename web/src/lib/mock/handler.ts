@@ -12,6 +12,7 @@ import { filterAndSortFindings } from "../finding-severity";
 import type {
   Activity,
   ArchiveBatchItem,
+  AssessmentProfileResponse,
   Asset,
   BatchControlItem,
   Company,
@@ -57,6 +58,161 @@ const mockNotifications = createMockNotifications();
 const mockSchedules = createMockSchedules();
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
+const mockProfileVersions = new Map<string, number>();
+
+function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
+  const version = mockProfileVersions.get(task.id) ?? (task.draft ? 0 : 1);
+  if (task.draft) {
+    return {
+      task_id: task.id,
+      assessment_phase: task.assessment_phase ?? "material_check",
+      entities: [],
+      claims: [],
+      evidence_refs: [],
+    };
+  }
+  const now = new Date().toISOString();
+  const evidenceRefs: AssessmentProfileResponse["evidence_refs"] = [
+    {
+      id: 1,
+      task_id: Number(task.id) || 1,
+      kind: "code_snippet",
+      reference: "order-service/src/main/java/com/example/OrderApp.java#L1-L24",
+      payload: { summary: "SpringBootApplication main entrypoint" },
+      created_at: now,
+    },
+    {
+      id: 2,
+      task_id: Number(task.id) || 1,
+      kind: "config",
+      reference: "deploy/docker-compose.yml",
+      payload: { service: "order-service", port: "18080" },
+      created_at: now,
+    },
+    {
+      id: 3,
+      task_id: Number(task.id) || 1,
+      kind: "runtime_probe",
+      reference: "http://127.0.0.1:8080/actuator/info",
+      payload: { port: "8080" },
+      created_at: now,
+    },
+  ];
+  const entities: AssessmentProfileResponse["entities"] = [
+    {
+      id: 1,
+      task_id: Number(task.id) || 1,
+      round_id: 1,
+      entity_type: "service",
+      name: "order-service",
+      codebase_id: "cb-mock-1",
+      version_id: "v-mock-1",
+      attributes: { language: "java", framework: "spring-boot", runnable: true },
+      gap: false,
+      gap_reason: "",
+      gap_resolved: false,
+    },
+    {
+      id: 2,
+      task_id: Number(task.id) || 1,
+      round_id: 1,
+      entity_type: "shared_library",
+      name: "common-auth-sdk",
+      codebase_id: "cb-mock-1",
+      version_id: "v-mock-1",
+      attributes: { language: "java", self_developed: true, runnable: false },
+      gap: false,
+      gap_reason: "",
+      gap_resolved: false,
+    },
+    {
+      id: 3,
+      task_id: Number(task.id) || 1,
+      round_id: 1,
+      entity_type: "unknown_item",
+      name: "legacy-native-plugin.bin",
+      codebase_id: "cb-mock-1",
+      version_id: "v-mock-1",
+      attributes: { reason: "unclassified_or_unreadable" },
+      gap: true,
+      gap_reason: "unclassified binary artifact: manual confirmation required",
+      gap_resolved: false,
+    },
+  ];
+  const claims: AssessmentProfileResponse["claims"] = [
+    {
+      id: 1,
+      task_id: Number(task.id) || 1,
+      round_id: 1,
+      subject: "order-service",
+      relation: "listens_on",
+      object_value: "18080",
+      source_type: "static_extraction",
+      evidence_ref_id: 2,
+      evidence_ref: evidenceRefs[1],
+      valid_code_version: "v-mock-1",
+      environment: "http://127.0.0.1:8080",
+      valid_config: "docker-compose",
+      confirmation_status: "conflicted",
+      conflict_note: "static docker-compose declares port 18080 vs runtime observation 8080",
+      created_at: now,
+    },
+    {
+      id: 2,
+      task_id: Number(task.id) || 1,
+      round_id: 1,
+      subject: "order-service",
+      relation: "depends_on",
+      object_value: "common-auth-sdk",
+      source_type: "model_inference",
+      evidence_ref_id: 1,
+      evidence_ref: evidenceRefs[0],
+      valid_code_version: "v-mock-1",
+      environment: "default",
+      valid_config: "default",
+      confirmation_status: "unverified",
+      conflict_note: "",
+      created_at: now,
+    },
+  ];
+  return {
+    task_id: task.id,
+    assessment_phase: task.assessment_phase ?? "profiling",
+    round: {
+      id: 1,
+      task_id: Number(task.id) || 1,
+      round_no: 1,
+      codebase_version: "v-mock-1",
+      environment_version: "env-v1",
+      scope_version: "scope-v1",
+      standard_version: "whitebox-dynamic-v1",
+      status: "active",
+      profile_version: version,
+      profile_built_at: now,
+      created_at: now,
+    },
+    summary: {
+      round_id: 1,
+      round_no: 1,
+      profile_version: version,
+      profile_built_at: now,
+      initial_profile_ready: version > 0,
+      total_entities: entities.length,
+      entity_counts: { service: 1, shared_library: 1, unknown_item: 1 },
+      gap_count: 1,
+      unresolved_gap_count: 1,
+      total_claims: claims.length,
+      claim_source_counts: { static_extraction: 1, model_inference: 1 },
+      claim_status_counts: { conflicted: 1, unverified: 1 },
+      conflict_count: 1,
+      unknown_count: 0,
+      languages: ["java"],
+    },
+    entities,
+    claims,
+    evidence_refs: evidenceRefs,
+  };
+}
 
 // ── 关联流量证据(finding traffic) ─────────────────────────────────────────────
 // 后端把请求/响应快照独立存到 evidence 表,前端详情页用 FindingTrafficPanel 展示。
@@ -1418,6 +1574,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (seg[0] === "tasks" && seg[2] === "codebases" && seg.length === 4 && m === "DELETE") {
     return { deleted_versions: 1, codebase_id: seg[3] };
+  }
+  if (seg[0] === "tasks" && seg[2] === "profile" && seg.length === 3 && m === "GET") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    return buildMockTaskProfile(task);
+  }
+  if (seg[0] === "tasks" && seg[2] === "profile" && seg[3] === "rebuild" && seg.length === 4 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    if (task.draft) throw new Error("草稿任务尚未启动，无法重建画像");
+    mockProfileVersions.set(task.id, (mockProfileVersions.get(task.id) ?? 1) + 1);
+    return buildMockTaskProfile(task);
   }
   if (path === "/task-categories" && m === "GET") return { categories: mockTaskCategorySnapshot() };
   if (path === "/task-categories" && m === "POST") {
