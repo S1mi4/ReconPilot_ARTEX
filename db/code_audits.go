@@ -22,10 +22,16 @@ type TaskCodeAuditRun struct {
 	ID                 int64                    `json:"id"`
 	TaskID             int64                    `json:"task_id"`
 	CodeServiceID      int64                    `json:"code_service_id"`
+	TargetEntityID     *int64                   `json:"target_entity_id,omitempty"`
 	ServiceName        string                   `json:"service_name"`
+	TargetType         string                   `json:"target_type,omitempty"`
 	CodebaseID         string                   `json:"codebase_id"`
 	VersionID          string                   `json:"version_id"`
+	RelativePath       string                   `json:"relative_path,omitempty"`
 	ScopePath          string                   `json:"scope_path"`
+	Languages          []string                 `json:"languages,omitempty"`
+	ObligationID       *int64                   `json:"obligation_id,omitempty"`
+	ExecutionOrigin    string                   `json:"execution_origin,omitempty"`
 	Status             string                   `json:"status"`
 	ProfileID          *int64                   `json:"profile_id,omitempty"`
 	ProfileSource      string                   `json:"profile_source"`
@@ -51,6 +57,31 @@ type TaskCodeAuditRun struct {
 	UpdatedAt          time.Time                `json:"updated_at"`
 	Candidates         []TaskCodeAuditCandidate `json:"candidates,omitempty"`
 	Coverage           *TaskCodeAuditCoverage   `json:"coverage,omitempty"`
+}
+
+// CreateEngineCodeAuditInput creates or resumes an assessment-engine driven
+// whitebox audit run for any confirmed service, non-service module, or shared library.
+type CreateEngineCodeAuditInput struct {
+	TaskID             int64
+	ObligationID       int64
+	TargetEntityID     *int64
+	CodeServiceID      *int64
+	TargetName         string
+	TargetType         string
+	CodebaseID         string
+	VersionID          string
+	RelativePath       string
+	ScopePath          string
+	Languages          []string
+	ProfileID          *int64
+	ProfileSource      string
+	ProfileName        string
+	ProfileFormat      string
+	Model              string
+	Endpoint           string
+	SourceAcknowledged bool
+	BudgetTokens       int
+	ReuseRunID         *int64
 }
 
 type TaskCodeAuditCandidate struct {
@@ -142,25 +173,31 @@ type TaskCodeAuditProgress struct {
 	Summary         string
 }
 
-const taskCodeAuditRunColumns = `run.id,run.task_id,run.code_service_id,service.name,run.codebase_id,run.version_id,
-run.scope_path,run.status,run.profile_id,run.profile_source,run.profile_name,run.profile_format,run.model,run.endpoint,
+const taskCodeAuditRunColumns = `run.id,run.task_id,COALESCE(run.code_service_id,0),run.target_entity_id,
+COALESCE(NULLIF(service.name,''),NULLIF(run.target_name,''),run.relative_path),run.target_type,
+run.codebase_id,run.version_id,COALESCE(NULLIF(service.relative_path,''),run.relative_path),run.scope_path,
+array_to_json(CASE WHEN cardinality(run.languages)>0 THEN run.languages ELSE COALESCE(service.languages,'{}'::text[]) END),
+run.obligation_id,run.execution_origin,run.status,run.profile_id,run.profile_source,run.profile_name,run.profile_format,run.model,run.endpoint,
 run.source_acknowledged,run.files_total,run.files_analyzed,run.files_skipped,run.chunks_total,run.chunks_completed,
 run.next_file_index,run.budget_tokens,run.used_tokens,run.candidate_count,run.summary,run.error,run.created_at,
 run.started_at,run.completed_at,run.updated_at,run.coverage`
 
 func scanTaskCodeAuditRun(row interface{ Scan(...any) error }) (*TaskCodeAuditRun, error) {
 	var run TaskCodeAuditRun
-	var profileID sql.NullInt64
+	var profileID, targetEntityID, obligationID sql.NullInt64
 	var started, completed sql.NullTime
 	var coverageJSON []byte
-	err := row.Scan(&run.ID, &run.TaskID, &run.CodeServiceID, &run.ServiceName, &run.CodebaseID, &run.VersionID,
-		&run.ScopePath, &run.Status, &profileID, &run.ProfileSource, &run.ProfileName, &run.ProfileFormat, &run.Model,
+	var languages codeServiceLanguages
+	err := row.Scan(&run.ID, &run.TaskID, &run.CodeServiceID, &targetEntityID, &run.ServiceName, &run.TargetType,
+		&run.CodebaseID, &run.VersionID, &run.RelativePath, &run.ScopePath, &languages, &obligationID, &run.ExecutionOrigin,
+		&run.Status, &profileID, &run.ProfileSource, &run.ProfileName, &run.ProfileFormat, &run.Model,
 		&run.Endpoint, &run.SourceAcknowledged, &run.FilesTotal, &run.FilesAnalyzed, &run.FilesSkipped, &run.ChunksTotal,
 		&run.ChunksCompleted, &run.NextFileIndex, &run.BudgetTokens, &run.UsedTokens, &run.CandidateCount,
 		&run.Summary, &run.Error, &run.CreatedAt, &started, &completed, &run.UpdatedAt, &coverageJSON)
 	if err != nil {
 		return nil, err
 	}
+	run.Languages = []string(languages)
 	if len(coverageJSON) > 0 {
 		var coverage TaskCodeAuditCoverage
 		if err := json.Unmarshal(coverageJSON, &coverage); err != nil {
@@ -169,6 +206,14 @@ func scanTaskCodeAuditRun(row interface{ Scan(...any) error }) (*TaskCodeAuditRu
 		if len(coverage.Files) > 0 || coverage.JavaBinary != nil || coverage.SweepCompleted || coverage.SweepChunksCompleted > 0 {
 			run.Coverage = &coverage
 		}
+	}
+	if targetEntityID.Valid {
+		id := targetEntityID.Int64
+		run.TargetEntityID = &id
+	}
+	if obligationID.Valid {
+		id := obligationID.Int64
+		run.ObligationID = &id
 	}
 	if profileID.Valid {
 		id := profileID.Int64
@@ -227,9 +272,11 @@ func (d *DB) ClaimNextTaskCodeAudit() (*TaskCodeAuditRun, error) {
 	}
 	var runID, taskID int64
 	// One running audit per service: concurrent runs would share the same
-	// JavaCodeDB workspace (and its Lucene index lock).
-	err = tx.QueryRow(`SELECT id,task_id FROM task_code_audit_runs run WHERE run.status='queued'
-AND NOT EXISTS (SELECT 1 FROM task_code_audit_runs other WHERE other.status='running' AND other.code_service_id=run.code_service_id)
+	// JavaCodeDB workspace (and its Lucene index lock). Queue workers only claim
+	// legacy/manual execution_origin='queue' runs; assessment engine runs are
+	// driven inside Engine.runIntent.
+	err = tx.QueryRow(`SELECT id,task_id FROM task_code_audit_runs run WHERE run.status='queued' AND run.execution_origin='queue'
+AND NOT EXISTS (SELECT 1 FROM task_code_audit_runs other WHERE other.status='running' AND other.code_service_id IS NOT NULL AND other.code_service_id=run.code_service_id)
 ORDER BY run.created_at,run.id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&runID, &taskID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -248,9 +295,133 @@ completed_at=NULL,error='',updated_at=now() WHERE id=$1`, runID); err != nil {
 }
 
 func (d *DB) RequeueInterruptedTaskCodeAudits() error {
-	_, err := d.Exec(`UPDATE task_code_audit_runs SET status='queued',error='服务重启后从最近检查点恢复',updated_at=now()
-WHERE status='running'`)
+	if _, err := d.Exec(`UPDATE task_code_audit_runs SET status='queued',error='服务重启后从最近检查点恢复',updated_at=now()
+WHERE status='running' AND execution_origin='queue'`); err != nil {
+		return err
+	}
+	_, err := d.Exec(`UPDATE task_code_audit_runs SET status='incomplete',error='服务重启后保留检查点，等待评估意图恢复续跑',completed_at=now(),updated_at=now()
+WHERE status='running' AND execution_origin='engine'`)
 	return err
+}
+
+// CreateOrResumeEngineCodeAuditRun creates a new running engine-driven audit run
+// for any service, module, or shared library, or resumes an interrupted/incomplete
+// checkpoint for the same obligation/version scope.
+func (d *DB) CreateOrResumeEngineCodeAuditRun(in CreateEngineCodeAuditInput) (*TaskCodeAuditRun, bool, error) {
+	if in.TaskID <= 0 || strings.TrimSpace(in.CodebaseID) == "" || strings.TrimSpace(in.VersionID) == "" {
+		return nil, false, errors.New("task_id, codebase_id, and version_id are required")
+	}
+	relPath := strings.TrimSpace(in.RelativePath)
+	if relPath == "" {
+		relPath = "."
+	}
+	scopePath := strings.TrimSpace(in.ScopePath)
+	if scopePath == "" {
+		scopePath = "."
+	}
+	targetType := strings.TrimSpace(in.TargetType)
+	if targetType == "" {
+		targetType = "module"
+	}
+	targetName := strings.TrimSpace(in.TargetName)
+	if targetName == "" {
+		targetName = relPath
+	}
+	langsJSON, err := json.Marshal(normalizedCodeServiceLanguages(in.Languages))
+	if err != nil {
+		return nil, false, err
+	}
+	var profileID any
+	if in.ProfileID != nil && *in.ProfileID > 0 {
+		profileID = *in.ProfileID
+	}
+	var codeServiceID any
+	if in.CodeServiceID != nil && *in.CodeServiceID > 0 {
+		codeServiceID = *in.CodeServiceID
+	}
+	var targetEntityID any
+	if in.TargetEntityID != nil && *in.TargetEntityID > 0 {
+		targetEntityID = *in.TargetEntityID
+	}
+	var obligationID any
+	if in.ObligationID > 0 {
+		obligationID = in.ObligationID
+	}
+
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var assessmentMode bool
+	var taskStatus string
+	if err := tx.QueryRow(`SELECT assessment_mode, status FROM tasks WHERE id=$1 FOR UPDATE`, in.TaskID).Scan(&assessmentMode, &taskStatus); err != nil {
+		return nil, false, err
+	}
+	if assessmentMode && (taskStatus == "done" || taskStatus == "failed" || taskStatus == "timeout") {
+		return nil, false, ErrObligationAlreadyTerminal
+	}
+
+	var resumeID int64
+	if in.ReuseRunID != nil && *in.ReuseRunID > 0 {
+		err = tx.QueryRow(`SELECT id FROM task_code_audit_runs
+WHERE id=$1 AND task_id=$2 AND execution_origin='engine' AND codebase_id=$3 AND version_id=$4
+  AND relative_path=$5 AND scope_path=$6 AND status='incomplete' FOR UPDATE`,
+			*in.ReuseRunID, in.TaskID, in.CodebaseID, in.VersionID, relPath, scopePath).Scan(&resumeID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, err
+		}
+	}
+	if resumeID == 0 && in.ObligationID > 0 {
+		err = tx.QueryRow(`SELECT id FROM task_code_audit_runs
+WHERE task_id=$1 AND obligation_id=$2 AND execution_origin='engine'
+  AND codebase_id=$3 AND version_id=$4 AND relative_path=$5 AND scope_path=$6 AND status='incomplete'
+ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+			in.TaskID, in.ObligationID, in.CodebaseID, in.VersionID, relPath, scopePath).Scan(&resumeID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, err
+		}
+	}
+
+	if resumeID > 0 {
+		if _, err := tx.Exec(`UPDATE task_code_audit_runs
+SET status='running',
+    profile_id=$2, profile_source=$3, profile_name=$4, profile_format=$5, model=$6, endpoint=$7,
+    source_acknowledged=$8, started_at=COALESCE(started_at, now()), completed_at=NULL, error='', updated_at=now()
+WHERE id=$1`,
+			resumeID, profileID, in.ProfileSource, in.ProfileName, in.ProfileFormat, in.Model, in.Endpoint,
+			in.SourceAcknowledged); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		run, err := d.GetTaskCodeAudit(in.TaskID, resumeID)
+		return run, true, err
+	}
+
+	var newID int64
+	err = tx.QueryRow(`INSERT INTO task_code_audit_runs(
+    task_id, code_service_id, target_entity_id, target_name, target_type,
+    codebase_id, version_id, relative_path, scope_path, languages, obligation_id, execution_origin,
+    status, profile_id, profile_source, profile_name, profile_format, model, endpoint,
+    source_acknowledged, budget_tokens, started_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,ARRAY(SELECT jsonb_array_elements_text($10::jsonb)),$11,'engine',
+        'running',$12,$13,$14,$15,$16,$17,$18,$19,now())
+RETURNING id`,
+		in.TaskID, codeServiceID, targetEntityID, targetName, targetType,
+		in.CodebaseID, in.VersionID, relPath, scopePath, string(langsJSON), obligationID,
+		profileID, in.ProfileSource, in.ProfileName, in.ProfileFormat, in.Model, in.Endpoint,
+		in.SourceAcknowledged, in.BudgetTokens).Scan(&newID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	run, err := d.GetTaskCodeAudit(in.TaskID, newID)
+	return run, false, err
 }
 
 func (d *DB) UpdateTaskCodeAuditProgress(runID int64, progress TaskCodeAuditProgress) error {
@@ -573,7 +744,7 @@ completed_at=now(),updated_at=now() WHERE id=$1 AND status IN ('completed','inco
 
 func (d *DB) ListTaskCodeAudits(taskID int64) ([]TaskCodeAuditRun, error) {
 	rows, err := d.Query(`SELECT `+taskCodeAuditRunColumns+` FROM task_code_audit_runs run
-JOIN task_code_services service ON service.id=run.code_service_id WHERE run.task_id=$1
+LEFT JOIN task_code_services service ON service.id=run.code_service_id WHERE run.task_id=$1
 ORDER BY run.created_at DESC,run.id DESC LIMIT 100`, taskID)
 	if err != nil {
 		return nil, err
@@ -628,7 +799,7 @@ CASE WHEN candidate.candidate->>'registration_tier'='B' THEN 1 ELSE 0 END ELSE 2
 
 func (d *DB) GetTaskCodeAudit(taskID, runID int64) (*TaskCodeAuditRun, error) {
 	run, err := scanTaskCodeAuditRun(d.QueryRow(`SELECT `+taskCodeAuditRunColumns+` FROM task_code_audit_runs run
-JOIN task_code_services service ON service.id=run.code_service_id WHERE run.task_id=$1 AND run.id=$2`, taskID, runID))
+LEFT JOIN task_code_services service ON service.id=run.code_service_id WHERE run.task_id=$1 AND run.id=$2`, taskID, runID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
 	}
@@ -706,25 +877,47 @@ func (d *DB) RecordTaskCodeAuditFinding(ctx context.Context, taskID, runID int64
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var runStatus, codebaseID, versionID, scopePath, relativePath, serviceDecision, latestVersion string
+	var runStatus, codebaseID, versionID, scopePath, relativePath, executionOrigin string
 	var explorationID int64
-	var assetID sql.NullInt64
-	var latestPresent bool
-	err = tx.QueryRowContext(ctx, `SELECT run.status,run.codebase_id,run.version_id,run.scope_path,service.relative_path,
-service.decision,service.latest_version_id,service.latest_present,service.asset_id,task.exploration_id
-FROM task_code_audit_runs run JOIN task_code_services service ON service.id=run.code_service_id
-JOIN tasks task ON task.id=run.task_id WHERE run.task_id=$1 AND run.id=$2
-FOR UPDATE OF run,service`, taskID, runID).Scan(&runStatus, &codebaseID, &versionID, &scopePath, &relativePath,
-		&serviceDecision, &latestVersion, &latestPresent, &assetID, &explorationID)
+	var codeServiceID, targetEntityID, assetID sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT run.status,run.codebase_id,run.version_id,run.scope_path,run.relative_path,
+run.execution_origin,run.code_service_id,run.target_entity_id,task.exploration_id
+FROM task_code_audit_runs run
+JOIN tasks task ON task.id=run.task_id
+WHERE run.task_id=$1 AND run.id=$2
+FOR UPDATE OF run`, taskID, runID).Scan(&runStatus, &codebaseID, &versionID, &scopePath, &relativePath,
+		&executionOrigin, &codeServiceID, &targetEntityID, &explorationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTaskCodeAuditCandidateReviewConflict
 	}
 	if err != nil {
 		return nil, err
 	}
-	if runStatus != "running" || serviceDecision != "confirmed" || !latestPresent || latestVersion != versionID || !assetID.Valid ||
-		auditEvidence.CodebaseID != codebaseID || auditEvidence.VersionID != versionID || auditEvidence.RelativePath != relativePath {
-		return nil, ErrTaskCodeAuditCandidateReviewConflict
+	if codeServiceID.Valid {
+		var serviceDecision, latestVersion string
+		var latestPresent bool
+		err = tx.QueryRowContext(ctx, `SELECT relative_path,decision,latest_version_id,latest_present,asset_id
+FROM task_code_services WHERE id=$1 FOR UPDATE`, codeServiceID.Int64).
+			Scan(&relativePath, &serviceDecision, &latestVersion, &latestPresent, &assetID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrTaskCodeAuditCandidateReviewConflict
+		}
+		if err != nil {
+			return nil, err
+		}
+		if runStatus != "running" || serviceDecision != "confirmed" || !latestPresent || latestVersion != versionID || !assetID.Valid ||
+			auditEvidence.CodebaseID != codebaseID || auditEvidence.VersionID != versionID || auditEvidence.RelativePath != relativePath {
+			return nil, ErrTaskCodeAuditCandidateReviewConflict
+		}
+	} else {
+		if runStatus != "running" || executionOrigin != "engine" ||
+			auditEvidence.CodebaseID != codebaseID || auditEvidence.VersionID != versionID || auditEvidence.RelativePath != relativePath {
+			return nil, ErrTaskCodeAuditCandidateReviewConflict
+		}
+		if targetEntityID.Valid {
+			_ = tx.QueryRowContext(ctx, `SELECT asset_id FROM task_target_entities WHERE id=$1 AND task_id=$2`,
+				targetEntityID.Int64, taskID).Scan(&assetID)
+		}
 	}
 
 	identityKey, err := taskCodeAuditIdentityKey(input.VulnClass, input.CodeAuditEvidence)
@@ -787,10 +980,14 @@ AND $2::jsonb->>'registration_tier'='B' THEN verification_summary ELSE $4 END,up
 		if err != nil {
 			return nil, err
 		}
+		var findAssetIDs []int64
+		if assetID.Valid && assetID.Int64 > 0 {
+			findAssetIDs = []int64{assetID.Int64}
+		}
 		recorded, err := RecordFindingTx(ctx, tx, RecordFindingInput{
 			TaskID: taskID, ExplorationID: explorationID, VulnClass: input.VulnClass, Name: input.Name,
 			Severity: input.Severity, Summary: input.Summary, Evidence: input.Evidence, Worker: "whitebox_java_audit",
-			AssetIDs: []int64{assetID.Int64}, CodeAuditEvidence: initialEvidence,
+			AssetIDs: findAssetIDs, CodeAuditEvidence: initialEvidence,
 			VerifyLevel: "theoretical", ImpactObserved: "none",
 		}, nil)
 		if err != nil {
@@ -879,19 +1076,17 @@ func (d *DB) FinalizeTaskCodeAuditCandidateReview(ctx context.Context, taskID, r
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var status, runStatus, codebaseID, versionID, candidateKey, relativePath, serviceDecision, latestVersion string
+	var status, runStatus, codebaseID, versionID, candidateKey, relativePath, executionOrigin string
 	var explorationID int64
-	var assetID sql.NullInt64
-	var latestPresent bool
+	var codeServiceID, targetEntityID, assetID sql.NullInt64
 	err = tx.QueryRowContext(ctx, `SELECT candidate.review_status,run.status,run.codebase_id,run.version_id,candidate.candidate_key,
-service.relative_path,service.decision,service.latest_version_id,service.latest_present,service.asset_id,task.exploration_id
+run.relative_path,run.execution_origin,run.code_service_id,run.target_entity_id,task.exploration_id
 FROM task_code_audit_candidates candidate
 JOIN task_code_audit_runs run ON run.id=candidate.run_id
-JOIN task_code_services service ON service.id=run.code_service_id
 JOIN tasks task ON task.id=run.task_id
-WHERE run.task_id=$1 AND run.id=$2 AND candidate.id=$3 FOR UPDATE OF candidate`, taskID, runID, candidateID).
+WHERE run.task_id=$1 AND run.id=$2 AND candidate.id=$3 FOR UPDATE OF candidate, run`, taskID, runID, candidateID).
 		Scan(&status, &runStatus, &codebaseID, &versionID, &candidateKey, &relativePath,
-			&serviceDecision, &latestVersion, &latestPresent, &assetID, &explorationID)
+			&executionOrigin, &codeServiceID, &targetEntityID, &explorationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTaskCodeAuditCandidateReviewConflict
 	}
@@ -918,8 +1113,26 @@ WHERE run.task_id=$1 AND run.id=$2 AND candidate.id=$3 FOR UPDATE OF candidate`,
 		}
 		return result, nil
 	}
-	if serviceDecision != "confirmed" || !latestPresent || latestVersion != versionID || !assetID.Valid {
-		return nil, ErrTaskCodeAuditCandidateReviewConflict
+	if codeServiceID.Valid {
+		var serviceDecision, latestVersion string
+		var latestPresent bool
+		err = tx.QueryRowContext(ctx, `SELECT relative_path,decision,latest_version_id,latest_present,asset_id
+FROM task_code_services WHERE id=$1 FOR UPDATE`, codeServiceID.Int64).
+			Scan(&relativePath, &serviceDecision, &latestVersion, &latestPresent, &assetID)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && (serviceDecision != "confirmed" || !latestPresent || latestVersion != versionID || !assetID.Valid)) {
+			return nil, ErrTaskCodeAuditCandidateReviewConflict
+		}
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if executionOrigin != "engine" {
+			return nil, ErrTaskCodeAuditCandidateReviewConflict
+		}
+		if targetEntityID.Valid {
+			_ = tx.QueryRowContext(ctx, `SELECT asset_id FROM task_target_entities WHERE id=$1 AND task_id=$2`,
+				targetEntityID.Int64, taskID).Scan(&assetID)
+		}
 	}
 	var acceptedEvidence struct {
 		CandidateKey string `json:"candidate_key"`
@@ -992,7 +1205,10 @@ WHERE id=$1 AND kind='finding'`, existing.nodeID.Int64, string(payload)); err !=
 	if err != nil {
 		return nil, err
 	}
-	assets := []int64{assetID.Int64}
+	var assets []int64
+	if assetID.Valid && assetID.Int64 > 0 {
+		assets = []int64{assetID.Int64}
+	}
 	recorded, err := RecordFindingTx(ctx, tx, RecordFindingInput{
 		TaskID: taskID, ExplorationID: explorationID, VulnClass: input.VulnClass, Name: input.Name,
 		Severity: input.Severity, Summary: input.Summary, Evidence: input.Evidence, Worker: "whitebox_java_audit",
@@ -1656,20 +1872,32 @@ func hasTaskCodeAuditHistoryEvent(history []any, kind string, runID int64, candi
 }
 
 func reconcileTaskCodeAuditFindingsTx(ctx context.Context, tx *sql.Tx, runID int64) error {
-	var taskID, codeServiceID int64
+	var taskID int64
+	var codeServiceIDNullable sql.NullInt64
 	var codebaseID, relativePath, versionID, scopePath, runStatus, latestVersionID string
 	var latestPresent bool
 	var filesTotal, filesAnalyzed, filesSkipped, chunksTotal, chunksCompleted int
 	var coverageJSON []byte
-	err := tx.QueryRowContext(ctx, `SELECT run.task_id,run.code_service_id,run.codebase_id,service.relative_path,run.version_id,run.scope_path,
+	err := tx.QueryRowContext(ctx, `SELECT run.task_id,run.code_service_id,run.codebase_id,run.relative_path,run.version_id,run.scope_path,
 run.status,run.files_total,run.files_analyzed,run.files_skipped,run.chunks_total,run.chunks_completed,run.coverage
-FROM task_code_audit_runs run JOIN task_code_services service ON service.id=run.code_service_id
-WHERE run.id=$1 FOR UPDATE OF run`, runID).Scan(&taskID, &codeServiceID, &codebaseID, &relativePath, &versionID, &scopePath,
+FROM task_code_audit_runs run
+WHERE run.id=$1 FOR UPDATE`, runID).Scan(&taskID, &codeServiceIDNullable, &codebaseID, &relativePath, &versionID, &scopePath,
 		&runStatus, &filesTotal, &filesAnalyzed, &filesSkipped, &chunksTotal, &chunksCompleted, &coverageJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if !codeServiceIDNullable.Valid || codeServiceIDNullable.Int64 <= 0 {
+		return nil
+	}
+	codeServiceID := codeServiceIDNullable.Int64
+	if err := tx.QueryRowContext(ctx, `SELECT relative_path,latest_version_id,latest_present
+FROM task_code_services WHERE id=$1 FOR UPDATE`, codeServiceID).Scan(&relativePath, &latestVersionID, &latestPresent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 	if runStatus != "completed" || filesTotal <= 0 ||
@@ -1689,10 +1917,6 @@ ORDER BY completed_at DESC,id DESC LIMIT 1 FOR UPDATE`, codeServiceID, versionID
 	}
 	if !taskCodeAuditCoverageAllowsReconciliation(coverageJSON, filesTotal) {
 		return nil
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT relative_path,latest_version_id,latest_present
-FROM task_code_services WHERE id=$1 FOR UPDATE`, codeServiceID).Scan(&relativePath, &latestVersionID, &latestPresent); err != nil {
-		return err
 	}
 	if !latestPresent || latestVersionID != versionID {
 		return nil

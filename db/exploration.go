@@ -1180,6 +1180,60 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id
 	return n == 1, nil
 }
 
+// IntentAssessmentMeta extracts whitebox-assessment routing and attempt metadata
+// from an exploration intent node payload (returns zero value for legacy intents).
+type IntentAssessmentMeta struct {
+	ExecutionMode  string          `json:"execution_mode,omitempty"`
+	ObligationID   int64           `json:"obligation_id,omitempty"`
+	RoundID        int64           `json:"round_id,omitempty"`
+	AttemptID      int64           `json:"attempt_id,omitempty"`
+	AttemptUID     string          `json:"attempt_uid,omitempty"`
+	ProfileVersion int             `json:"profile_version,omitempty"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	CodeAuditRunID int64           `json:"code_audit_run_id,omitempty"`
+	TargetEntityID int64           `json:"target_entity_id,omitempty"`
+	Dimension      string          `json:"dimension,omitempty"`
+	WorkOrder      json.RawMessage `json:"work_order,omitempty"`
+}
+
+// ParseIntentAssessmentMeta decodes assessment scheduling fields from an intent payload.
+func ParseIntentAssessmentMeta(payload json.RawMessage) IntentAssessmentMeta {
+	var meta IntentAssessmentMeta
+	if len(payload) == 0 {
+		return meta
+	}
+	_ = json.Unmarshal(payload, &meta)
+	meta.ExecutionMode = strings.TrimSpace(meta.ExecutionMode)
+	meta.Dimension = strings.TrimSpace(meta.Dimension)
+	return meta
+}
+
+// CountRunningIntentsByMode counts running intents whose payload specifies execution_mode.
+func (s *ExplorationStore) CountRunningIntentsByMode(execMode string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+SELECT count(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='running'
+  AND COALESCE(payload->>'execution_mode','') = $2`,
+		s.expID, strings.TrimSpace(execMode)).Scan(&count)
+	return count, err
+}
+
+// ListActiveIntents returns open, running, or paused intents ordered by priority desc.
+func (s *ExplorationStore) ListActiveIntents(limit int) ([]*Node, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running','paused')
+ORDER BY (state='running') DESC, priority DESC, id ASC LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // Stats returns node counts grouped by kind (for dashboard).
 func (s *ExplorationStore) Stats() (map[string]int, error) {
 	rows, err := s.db.Query(`SELECT kind, count(*) FROM exploration_nodes WHERE exploration_id=$1 GROUP BY kind`, s.expID)

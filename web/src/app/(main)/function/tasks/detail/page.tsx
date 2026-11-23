@@ -549,7 +549,12 @@ function TaskDetailInner() {
           </div>
         )}
         <TabsContent value="sessions" className="mt-0">
-          <SessionsTab key={id} taskId={id} requestedSession={searchParams.get("session") ?? ""} />
+          <SessionsTab
+            key={id}
+            taskId={id}
+            requestedSession={searchParams.get("session") ?? ""}
+            assessmentMode={Boolean(task.assessment_mode)}
+          />
         </TabsContent>
         <TabsContent value="traffic" className="mt-0">
           <TrafficHistory taskId={id} />

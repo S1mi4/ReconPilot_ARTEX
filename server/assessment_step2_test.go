@@ -299,8 +299,17 @@ func TestStep2MaterialCheckRealInspectionAndGating(t *testing.T) {
 		Round db.AssessmentRound `json:"round"`
 	}
 	_ = json.Unmarshal(startOK.Body.Bytes(), &startResp)
-	if startResp.Task.Draft || startResp.Task.AssessmentPhase != db.AssessmentPhaseProfiling || startResp.Round.RoundNo != 1 {
+	if startResp.Task.Draft || !isValidStartedAssessmentPhase(startResp.Task.AssessmentPhase) || startResp.Round.RoundNo != 1 {
 		t.Fatalf("unexpected started response: %+v", startResp)
+	}
+}
+
+func isValidStartedAssessmentPhase(phase string) bool {
+	switch phase {
+	case db.AssessmentPhaseProfiling, db.AssessmentPhaseCoveragePlanning, db.AssessmentPhaseExecuting:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -523,7 +532,7 @@ func TestStep2AgentToolsUnifiedFlow(t *testing.T) {
 	}
 
 	finalTask, _ := s.m.Task(spawned.TaskID)
-	if finalTask == nil || finalTask.IsDraft() || finalTask.lifecycleSnapshot().AssessmentPhase != db.AssessmentPhaseProfiling {
+	if finalTask == nil || finalTask.IsDraft() || !isValidStartedAssessmentPhase(finalTask.lifecycleSnapshot().AssessmentPhase) {
 		t.Fatalf("unexpected task state after agent start: %+v", finalTask)
 	}
 	draftCheckRes, err := s.toolGetTaskDraft().Call(ctx, checkIn, nil)

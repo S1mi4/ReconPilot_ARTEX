@@ -147,6 +147,54 @@ var effectiveAttemptOutcomes = map[string]struct{}{
 	AttemptSupported: {}, AttemptDisproved: {}, AttemptUnreproduced: {},
 }
 
+// ---------- 执行器路由模式（§7.4/§8.2） ----------
+
+const (
+	// ExecModeCodeAuditBatch：Engine workCtx 内直接驱动的批量静态审计内核。
+	ExecModeCodeAuditBatch = "code_audit_batch"
+	// ExecModeCodeInvestigate：只读白盒定向调查 Worker（无 Bash/无网络）。
+	ExecModeCodeInvestigate = "code_investigate"
+	// ExecModeDynamicVerify：动态验证 Worker（Bash/HTTP/浏览器/流量 + 只读代码切片）。
+	ExecModeDynamicVerify = "dynamic_verify"
+)
+
+var validExecutionModes = map[string]struct{}{
+	ExecModeCodeAuditBatch:  {},
+	ExecModeCodeInvestigate: {},
+	ExecModeDynamicVerify:   {},
+}
+
+// IsValidExecutionMode reports whether mode is one of the 3 specialized executor modes.
+func IsValidExecutionMode(mode string) bool {
+	_, ok := validExecutionModes[mode]
+	return ok
+}
+
+// ---------- 覆盖义务来源与尝试生命周期 ----------
+
+const (
+	ObligationOriginProgram = "program"
+	ObligationOriginPlanner = "planner"
+	ObligationOriginUser    = "user"
+
+	AttemptStatusDispatched = "dispatched"
+	AttemptStatusRunning    = "running"
+	AttemptStatusCompleted  = "completed"
+	AttemptStatusCancelled  = "cancelled"
+	AttemptStatusSuperseded = "superseded"
+)
+
+var validObligationOrigins = map[string]struct{}{
+	ObligationOriginProgram: {},
+	ObligationOriginPlanner: {},
+	ObligationOriginUser:    {},
+}
+
+func isValidObligationOrigin(origin string) bool {
+	_, ok := validObligationOrigins[origin]
+	return ok
+}
+
 // ---------- 画像断言来源（§4.2） ----------
 
 const (
@@ -163,6 +211,15 @@ var (
 	ErrObligationStatusInvalid    = errors.New("invalid obligation status")
 	ErrObligationDimensionInvalid = errors.New("invalid coverage dimension")
 	ErrAttemptOutcomeInvalid      = errors.New("invalid attempt outcome")
+	ErrExecutionModeInvalid       = errors.New("invalid execution mode")
+	ErrObligationDependencyUnmet  = errors.New("obligation has unmet dependencies")
+	ErrObligationDependencyCycle  = errors.New("obligation dependency cycle detected")
+	// ErrObligationProtectedByProgram 表示 Planner/Worker 越权删除或跳过必需义务（§8.3 分母护栏）。
+	ErrObligationProtectedByProgram = errors.New("required coverage obligation cannot be deleted or marked not_applicable by agent")
+	// ErrObligationAlreadyTerminal 表示义务已满足或不适用，不能再派发执行。
+	ErrObligationAlreadyTerminal = errors.New("obligation is already terminal")
+	// ErrAttemptStaleOrSuperseded 表示迟到/被替代的执行尝试试图回写结果（§8.4 迟到结果写入保护）。
+	ErrAttemptStaleOrSuperseded = errors.New("attempt is stale, cancelled, or superseded")
 	// ErrObligationStateConflict 表示 CAS 状态推进落空（状态已被并发修改）。
 	ErrObligationStateConflict = errors.New("obligation state conflict")
 	// ErrObligationEvidenceMissing 表示不满足"证据要求"的终态推进被拒绝。
@@ -398,6 +455,8 @@ type CoverageObligation struct {
 	RoundID             *int64          `json:"round_id,omitempty"`
 	Dimension           string          `json:"dimension"`
 	TargetEntityID      *int64          `json:"target_entity_id,omitempty"`
+	TargetName          string          `json:"target_name,omitempty"`
+	TargetType          string          `json:"target_type,omitempty"`
 	Purpose             string          `json:"purpose"`
 	Required            bool            `json:"required"`
 	Status              string          `json:"status"`
@@ -409,6 +468,17 @@ type CoverageObligation struct {
 	NotApplicableReason string          `json:"not_applicable_reason,omitempty"`
 	EvidenceRefID       *int64          `json:"evidence_ref_id,omitempty"`
 	AcceptanceRule      json.RawMessage `json:"acceptance_rule,omitempty"`
+	ExecutionMode       string          `json:"execution_mode,omitempty"`
+	Origin              string          `json:"origin,omitempty"`
+	Priority            int             `json:"priority"`
+	ProfileVersion      int             `json:"profile_version,omitempty"`
+	ContextSnapshot     json.RawMessage `json:"context_snapshot,omitempty"`
+	DependencyIDs       []int64         `json:"dependency_ids,omitempty"`
+	UnmetDependencyIDs  []int64         `json:"unmet_dependency_ids,omitempty"`
+	ActiveAttemptID     *int64          `json:"active_attempt_id,omitempty"`
+	CreatedAt           time.Time       `json:"created_at,omitempty"`
+	UpdatedAt           time.Time       `json:"updated_at,omitempty"`
+	SatisfiedAt         *time.Time      `json:"satisfied_at,omitempty"`
 }
 
 // CreateCoverageObligationInput creates an obligation. dedupeKey provides
@@ -422,11 +492,28 @@ type CreateCoverageObligationInput struct {
 	Required            bool
 	DedupeKey           string
 	RequiresCredentials bool
+	CredentialRef       string
+	InitialStatus       string
+	BlockedReason       string
 	AcceptanceRule      json.RawMessage
+	ExecutionMode       string
+	Origin              string
+	Priority            int
+	ProfileVersion      int
+	DependencyIDs       []int64
+	ContextSnapshot     json.RawMessage
 }
 
+const coverageObligationSelectCols = `id, task_id, round_id, dimension, target_entity_id, purpose, required, status,
+          dedupe_key, requires_credentials, credential_ref, blocked_reason, stale_reason,
+          not_applicable_reason, evidence_ref_id, acceptance_rule, execution_mode, origin,
+          priority, profile_version, context_snapshot,
+          COALESCE(to_jsonb(dependency_ids), '[]'::jsonb), active_attempt_id,
+          created_at, updated_at, satisfied_at`
+
 // CreateCoverageObligation inserts an obligation; when dedupeKey already exists
-// in the same round it returns the existing row unchanged (idempotent replan).
+// in the same round it returns the existing row without resetting advanced states
+// or active attempt bindings (idempotent replan).
 // 去重作用域是 (task, round)（§6.4）：新一轮次可以用相同 key 为同一对象重建
 // 义务，而不会命中历史轮次的记录。
 func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*CoverageObligation, error) {
@@ -445,21 +532,111 @@ func (d *DB) CreateCoverageObligation(in CreateCoverageObligationInput) (*Covera
 	if in.RoundID == nil {
 		return nil, errors.New("coverage obligation must be bound to an assessment round")
 	}
+	execMode := strings.TrimSpace(in.ExecutionMode)
+	if execMode != "" && !IsValidExecutionMode(execMode) {
+		return nil, fmt.Errorf("%w: %q", ErrExecutionModeInvalid, execMode)
+	}
+	origin := strings.TrimSpace(in.Origin)
+	if origin == "" {
+		origin = ObligationOriginProgram
+	} else if !isValidObligationOrigin(origin) {
+		return nil, fmt.Errorf("invalid obligation origin %q", origin)
+	}
+	priority := normalizeObligationPriority(in.Priority)
+	initStatus := strings.TrimSpace(in.InitialStatus)
+	if initStatus == "" {
+		initStatus = ObligationPending
+	}
+	switch initStatus {
+	case ObligationPending, ObligationReady, ObligationBlocked:
+	default:
+		return nil, fmt.Errorf("%w: invalid initial status %q", ErrObligationStatusInvalid, initStatus)
+	}
+	if initStatus == ObligationBlocked && strings.TrimSpace(in.BlockedReason) == "" {
+		return nil, fmt.Errorf("%w: initial status blocked requires blocked_reason", ErrObligationEvidenceMissing)
+	}
+	if err := rejectSecretInProfileText(in.CredentialRef, in.BlockedReason, in.Purpose); err != nil {
+		return nil, err
+	}
+
 	rule := "{}"
 	if len(in.AcceptanceRule) > 0 {
 		rule = string(in.AcceptanceRule)
 	}
-	obligation, err := scanCoverageObligation(d.QueryRow(`
-INSERT INTO task_coverage_obligations(task_id, round_id, dimension, target_entity_id,
-                                      purpose, required, dedupe_key, requires_credentials, acceptance_rule)
-VALUES ($1,$2,$3,$4,$5,true,$6,$7,$8::jsonb)
-ON CONFLICT (task_id, COALESCE(round_id, 0), dedupe_key) WHERE dedupe_key <> '' DO UPDATE SET updated_at=now()
-RETURNING id, task_id, round_id, dimension, target_entity_id, purpose, required, status,
-          dedupe_key, requires_credentials, credential_ref, blocked_reason, stale_reason,
-          not_applicable_reason, evidence_ref_id, acceptance_rule`,
-		in.TaskID, in.RoundID, in.Dimension, in.TargetEntityID, in.Purpose, in.DedupeKey,
-		in.RequiresCredentials, rule))
+	ctxSnap := "{}"
+	if len(in.ContextSnapshot) > 0 {
+		ctxSnap = string(in.ContextSnapshot)
+	}
+	deps := normalizePositiveIDs(in.DependencyIDs)
+
+	tx, err := d.Begin()
 	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Serialize obligation creation / dependency validation per round.
+	var lockedRound int64
+	if err := tx.QueryRow(`SELECT id FROM task_assessment_rounds WHERE id=$1 AND task_id=$2 FOR UPDATE`,
+		*in.RoundID, in.TaskID).Scan(&lockedRound); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrObligationOwnershipMismatch
+		}
+		return nil, err
+	}
+	if in.TargetEntityID != nil {
+		var entTask int64
+		var entRound sql.NullInt64
+		err := tx.QueryRow(`SELECT task_id, round_id FROM task_target_entities WHERE id=$1`, *in.TargetEntityID).
+			Scan(&entTask, &entRound)
+		if err == sql.ErrNoRows || (err == nil && (entTask != in.TaskID || (entRound.Valid && entRound.Int64 != *in.RoundID))) {
+			return nil, fmt.Errorf("%w: target entity %d does not belong to task %d round %d",
+				ErrObligationOwnershipMismatch, *in.TargetEntityID, in.TaskID, *in.RoundID)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateObligationDependenciesTx(tx, in.TaskID, *in.RoundID, 0, deps); err != nil {
+		return nil, err
+	}
+	var existingID int64
+	err = tx.QueryRow(`
+SELECT id FROM task_coverage_obligations
+WHERE task_id=$1 AND COALESCE(round_id, 0)=$2 AND dedupe_key=$3`,
+		in.TaskID, *in.RoundID, in.DedupeKey).Scan(&existingID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if existingID > 0 {
+		if err := validateObligationDependenciesTx(tx, in.TaskID, *in.RoundID, existingID, deps); err != nil {
+			return nil, err
+		}
+	}
+
+	depsLiteral := formatBigIntArray(deps)
+	obligation, err := scanCoverageObligation(tx.QueryRow(`
+INSERT INTO task_coverage_obligations(
+    task_id, round_id, dimension, target_entity_id, purpose, required, status,
+    dedupe_key, requires_credentials, credential_ref, blocked_reason, acceptance_rule,
+    execution_mode, origin, priority, profile_version, context_snapshot, dependency_ids)
+VALUES ($1,$2,$3,$4,$5,true,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb,$17::bigint[])
+ON CONFLICT (task_id, COALESCE(round_id, 0), dedupe_key) WHERE dedupe_key <> '' DO UPDATE
+SET updated_at = now(),
+    profile_version = GREATEST(task_coverage_obligations.profile_version, EXCLUDED.profile_version),
+    execution_mode = CASE WHEN task_coverage_obligations.execution_mode='' THEN EXCLUDED.execution_mode ELSE task_coverage_obligations.execution_mode END,
+    credential_ref = CASE WHEN btrim(task_coverage_obligations.credential_ref)='' THEN EXCLUDED.credential_ref ELSE task_coverage_obligations.credential_ref END,
+    target_entity_id = COALESCE(task_coverage_obligations.target_entity_id, EXCLUDED.target_entity_id),
+    context_snapshot = CASE WHEN task_coverage_obligations.context_snapshot='{}'::jsonb AND EXCLUDED.context_snapshot<>'{}'::jsonb THEN EXCLUDED.context_snapshot ELSE task_coverage_obligations.context_snapshot END,
+    dependency_ids = CASE WHEN task_coverage_obligations.status IN ('pending','blocked') AND cardinality(EXCLUDED.dependency_ids) > 0 THEN EXCLUDED.dependency_ids ELSE task_coverage_obligations.dependency_ids END
+RETURNING `+coverageObligationSelectCols,
+		in.TaskID, in.RoundID, in.Dimension, in.TargetEntityID, in.Purpose, initStatus,
+		in.DedupeKey, in.RequiresCredentials, strings.TrimSpace(in.CredentialRef), strings.TrimSpace(in.BlockedReason), rule,
+		execMode, origin, priority, in.ProfileVersion, ctxSnap, depsLiteral))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return obligation, nil
@@ -467,14 +644,24 @@ RETURNING id, task_id, round_id, dimension, target_entity_id, purpose, required,
 
 func scanCoverageObligation(sc interface{ Scan(...any) error }) (*CoverageObligation, error) {
 	var o CoverageObligation
-	var rule []byte
-	if err := sc.Scan(&o.ID, &o.TaskID, &o.RoundID, &o.Dimension, &o.TargetEntityID, &o.Purpose,
+	var rule, ctxSnap, depsJSON []byte
+	if err := sc.Scan(
+		&o.ID, &o.TaskID, &o.RoundID, &o.Dimension, &o.TargetEntityID, &o.Purpose,
 		&o.Required, &o.Status, &o.DedupeKey, &o.RequiresCredentials, &o.CredentialRef,
-		&o.BlockedReason, &o.StaleReason, &o.NotApplicableReason, &o.EvidenceRefID, &rule); err != nil {
+		&o.BlockedReason, &o.StaleReason, &o.NotApplicableReason, &o.EvidenceRefID,
+		&rule, &o.ExecutionMode, &o.Origin, &o.Priority, &o.ProfileVersion, &ctxSnap,
+		&depsJSON, &o.ActiveAttemptID, &o.CreatedAt, &o.UpdatedAt, &o.SatisfiedAt,
+	); err != nil {
 		return nil, err
 	}
 	if len(rule) > 0 {
 		o.AcceptanceRule = json.RawMessage(rule)
+	}
+	if len(ctxSnap) > 0 {
+		o.ContextSnapshot = json.RawMessage(ctxSnap)
+	}
+	if len(depsJSON) > 0 {
+		_ = json.Unmarshal(depsJSON, &o.DependencyIDs)
 	}
 	return &o, nil
 }
@@ -500,7 +687,7 @@ type TransitionObligationOptions struct {
 // 须属于本任务的探索图、白盒运行须属于本任务、执行输出证据须属于本任务。
 // 关联列没有外键，只查 ID 非空会让已删除/不存在/他人的记录蒙混过关；
 // 只有结果枚举、没有任何执行关联的"裸尝试"不算已执行（§5.3）。
-const effectiveAttemptCondition = `outcome IN ('supported','disproved','unreproduced')
+const effectiveAttemptCondition = `attempt.status='completed' AND attempt.outcome IN ('supported','disproved','unreproduced')
   AND (
        (intent_node_id IS NOT NULL AND EXISTS (
             SELECT 1 FROM exploration_nodes n
@@ -608,8 +795,9 @@ func (d *DB) RecordTestAttempt(in RecordTestAttemptInput) (int64, error) {
 	// 串行化编号分配：锁住义务行，两个并发的登记事务在此排队，
 	// 后到的事务提交前必能看到先到者写入的 attempt_no。
 	var obligationTask int64
-	if err := tx.QueryRow(`SELECT task_id FROM task_coverage_obligations WHERE id=$1 FOR UPDATE`,
-		in.ObligationID).Scan(&obligationTask); err != nil {
+	var obligationRound sql.NullInt64
+	if err := tx.QueryRow(`SELECT task_id, round_id FROM task_coverage_obligations WHERE id=$1 FOR UPDATE`,
+		in.ObligationID).Scan(&obligationTask, &obligationRound); err != nil {
 		return 0, err
 	}
 	if obligationTask != in.TaskID {
@@ -674,14 +862,19 @@ WHERE id=$1 AND task_id=$2`, *in.CodeAuditRunID, in.TaskID).Scan(&n); err != nil
 				ErrObligationEvidenceMissing)
 		}
 	}
+	var roundPtr *int64
+	if obligationRound.Valid {
+		rid := obligationRound.Int64
+		roundPtr = &rid
+	}
 	var id int64
 	err = tx.QueryRow(`
-INSERT INTO task_test_attempts(task_id, obligation_id, attempt_no, intent_node_id,
-                                code_audit_run_id, outcome, evidence_ref_id, output)
-VALUES ($1,$2,
-        (SELECT COALESCE(max(attempt_no),0)+1 FROM task_test_attempts WHERE obligation_id=$2),
-        $3,$4,$5,$6,$7::jsonb)
-RETURNING id`, in.TaskID, in.ObligationID, in.IntentNodeID, in.CodeAuditRunID,
+INSERT INTO task_test_attempts(task_id, round_id, obligation_id, attempt_no, intent_node_id,
+                                code_audit_run_id, status, outcome, evidence_ref_id, output, completed_at)
+VALUES ($1,$2,$3,
+        (SELECT COALESCE(max(attempt_no),0)+1 FROM task_test_attempts WHERE obligation_id=$3),
+        $4,$5,'completed',$6,$7,$8::jsonb,now())
+RETURNING id`, in.TaskID, roundPtr, in.ObligationID, in.IntentNodeID, in.CodeAuditRunID,
 		in.Outcome, in.EvidenceRefID, output).Scan(&id)
 	if err != nil {
 		return 0, err
@@ -700,7 +893,7 @@ RETURNING id`, in.TaskID, in.ObligationID, in.IntentNodeID, in.CodeAuditRunID,
 func (d *DB) RecordAssessmentEvent(taskID int64, eventType string, payload json.RawMessage) (int64, error) {
 	switch eventType {
 	case "new_asset", "new_entry", "profile_change", "evidence_invalidated",
-		"knowledge_conflict", "code_version_change":
+		"knowledge_conflict", "code_version_change", "code_audit_chunk_completed":
 	default:
 		return 0, fmt.Errorf("invalid assessment event type %q", eventType)
 	}
@@ -920,15 +1113,16 @@ SELECT
 		addReason("存在 %d 条未绑定轮次的遗留必需义务未了结（迁移或补录所属轮次前不能判为完成）", report.UnboundLegacyObligations)
 	}
 
-	// 尝试统计按当前轮次：历史轮次的尝试不参与本轮"只有失败尝试"判定。
+	// 尝试统计按当前轮次：历史轮次的尝试与尚未结算（dispatched/running/cancelled）的尝试
+	// 不参与本轮"只有失败尝试"判定。
 	err = d.QueryRow(`
 SELECT
   count(*),
   count(*) FILTER (WHERE `+effectiveAttemptCondition+`),
-  count(*) FILTER (WHERE attempt.outcome IN ('env_mismatch','dependency_missing','failed'))
+  count(*) FILTER (WHERE attempt.status='completed' AND attempt.outcome IN ('env_mismatch','dependency_missing','failed'))
 FROM task_test_attempts attempt
 JOIN task_coverage_obligations o ON o.id=attempt.obligation_id
-WHERE attempt.task_id=$1 AND o.required AND o.round_id=$2`, taskID, round.ID).Scan(
+WHERE attempt.task_id=$1 AND o.required AND o.round_id=$2 AND attempt.status='completed'`, taskID, round.ID).Scan(
 		&report.TotalAttempts, &report.EffectiveAttempts, &report.FailedAttempts)
 	if err != nil {
 		return nil, err

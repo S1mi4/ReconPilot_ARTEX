@@ -199,6 +199,8 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", ev.OldGoal, ev.NewGoal))
 		case "finding":
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
+		case "code_audit_chunk_completed":
+			b.WriteString(fmt.Sprintf("\n- 白盒批量审计分片完成（意图 #%d）：%s —— 模块仍在继续推进后续分片，若已有新线索/候选可立即派发动态验证或定向查码，无需等待整模块结束。", ev.IntentID, ev.Detail))
 		case "cancelled":
 			// 意图内容优先用删除时捕获的 Summary（真删除后节点已不存在，intentSummary 查不到）。
 			sm := ev.Summary

@@ -208,6 +208,12 @@ func rejectSecretInProfileText(fields ...string) error {
 	return nil
 }
 
+// ValidateAssessmentTextSafe rejects plaintext passwords, tokens, JWTs, or
+// private keys in free-form assessment text.
+func ValidateAssessmentTextSafe(fields ...string) error {
+	return rejectSecretInProfileText(fields...)
+}
+
 // GetOrCreateEvidenceRef returns an existing evidence ref with matching task,
 // kind, reference, and payload, or creates a new one.
 func (d *DB) GetOrCreateEvidenceRef(taskID int64, kind EvidenceRefKind, reference string, payload json.RawMessage) (int64, error) {

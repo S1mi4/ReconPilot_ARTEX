@@ -320,6 +320,11 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, reason strin
 	if e.IsDeleting(t.ID) {
 		return false
 	}
+	if t != nil && t.AssessmentMode {
+		// 白盒驱动评估模式的超时收尾由程序契约（CompleteAssessment）直接裁定，
+		// 不进入传统目标拆解/goal-driven planner.Plan。
+		return false
+	}
 	planner, _ := e.snapshotFor(t)
 	for planner == nil {
 		if sleepCtx(ctx, deadlinePollInterval) {

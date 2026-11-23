@@ -650,6 +650,7 @@ type taskCodeAuditChunkOutcome struct {
 	LowConfidence int
 	Incomplete    int
 	ReportFailed  int
+	FindingIDs    []int64
 }
 
 func (s *Server) processTaskCodeAuditCandidates(ctx context.Context, run *pgdb.TaskCodeAuditRun, service pgdb.TaskCodeService,
@@ -732,6 +733,9 @@ func (s *Server) processTaskCodeAuditCandidates(ctx context.Context, run *pgdb.T
 			continue
 		}
 		outcome.Registered++
+		if result.FindingID > 0 {
+			outcome.FindingIDs = append(outcome.FindingIDs, result.FindingID)
+		}
 		if candidate.RegistrationTier == "B" {
 			outcome.LowConfidence++
 			s.emitTaskCodeAuditActivity(run.TaskID, activityWorker, pgdb.Activity{Kind: "result",
@@ -1684,8 +1688,15 @@ func taskCodeAuditBudgetLabel(budget int) string {
 }
 
 func (s *Server) executeTaskCodeAudit(ctx context.Context, run *pgdb.TaskCodeAuditRun, workerID int) error {
+	return s.executeTaskCodeAuditWithHooks(ctx, run, workerID, nil)
+}
+
+func (s *Server) executeTaskCodeAuditWithHooks(ctx context.Context, run *pgdb.TaskCodeAuditRun, workerID int, hooks *taskCodeAuditExecHooks) error {
 	activityWorker := taskCodeAuditWorkerActivityKey(run.ID)
-	s.emitTaskCodeAuditActivity(run.TaskID, activityWorker, pgdb.Activity{Kind: "text",
+	if hooks != nil && strings.TrimSpace(hooks.ActivityWorker) != "" {
+		activityWorker = strings.TrimSpace(hooks.ActivityWorker)
+	}
+	s.emitCodeAuditActivityWithHooks(run.TaskID, activityWorker, hooks, pgdb.Activity{Kind: "text",
 		Summary: fmt.Sprintf("正在确认服务 %s 的最新代码版本和审计范围。", run.ServiceName)})
 	service, err := s.m.pg.ValidateTaskCodeAuditService(run.TaskID, run.CodeServiceID)
 	if err != nil || service.CodebaseID != run.CodebaseID || service.LatestVersionID != run.VersionID {
@@ -1695,12 +1706,16 @@ func (s *Server) executeTaskCodeAudit(ctx context.Context, run *pgdb.TaskCodeAud
 	if err != nil || version.CodebaseID != run.CodebaseID {
 		return errors.New("codebase snapshot is unavailable")
 	}
+	return s.executeTaskCodeAuditForTarget(ctx, run, workerID, service, version, hooks)
+}
+
+func (s *Server) executeTaskCodeAuditForTarget(ctx context.Context, run *pgdb.TaskCodeAuditRun, workerID int, service pgdb.TaskCodeService, version taskCodebaseVersion, hooks *taskCodeAuditExecHooks) error {
 	codebase, err := s.loadTaskCodeAuditCodebase(ctx, run.TaskID, service, version, run.ScopePath)
 	if err != nil {
 		return err
 	}
 	if codebase.BinaryOnly() {
-		return s.executeBinaryTaskCodeAudit(ctx, run, workerID, version, service, codebase)
+		return s.executeBinaryTaskCodeAuditWithHooks(ctx, run, workerID, version, service, codebase, hooks)
 	}
 	if countAuditProductionFiles(codebase.Files) == 0 {
 		progress := taskAuditProgressFromRun(run)
@@ -1710,12 +1725,18 @@ func (s *Server) executeTaskCodeAudit(ctx context.Context, run *pgdb.TaskCodeAud
 		progress.Summary = "当前版本没有可审计的生产源码；未生成审计结论。"
 		return s.m.pg.IncompleteTaskCodeAudit(run.ID, progress, "未发现可审计的 Java、Python、C 生产源码；请检查所选服务范围")
 	}
-	provider, _, err := s.taskCodeAuditRuntime(run)
-	if err != nil {
-		return err
+	var provider llm.Provider
+	if hooks != nil && hooks.Provider != nil {
+		provider = hooks.Provider
+	} else {
+		var err error
+		provider, _, err = s.taskCodeAuditRuntime(run)
+		if err != nil {
+			return err
+		}
 	}
 	if len(codebase.BinaryClassFiles) > 0 && codebase.supportsJavaBinary() && countAuditFiles(codebase.Files, "java") == 0 {
-		if err := s.executeSourceTaskCodeAuditPhase(ctx, run, workerID, service, codebase, provider, false); err != nil {
+		if err := s.executeSourceTaskCodeAuditPhaseWithHooks(ctx, run, workerID, service, codebase, provider, false, hooks); err != nil {
 			return err
 		}
 		updatedRun, err := s.m.pg.GetTaskCodeAudit(run.TaskID, run.ID)
@@ -1733,14 +1754,21 @@ func (s *Server) executeTaskCodeAudit(ctx context.Context, run *pgdb.TaskCodeAud
 			progress.Summary = trimAuditText(progress.Summary+"\n源码阶段已完成；Java class/JAR 阶段尚未执行："+taskJavaCodeDBNotice(javaCodeDB), 3000)
 			return s.m.pg.IncompleteTaskCodeAudit(run.ID, progress, taskJavaCodeDBNotice(javaCodeDB))
 		}
-		return s.executeBinaryTaskCodeAudit(ctx, updatedRun, workerID, version, service, codebase)
+		return s.executeBinaryTaskCodeAuditWithHooks(ctx, updatedRun, workerID, version, service, codebase, hooks)
 	}
-	return s.executeSourceTaskCodeAudit(ctx, run, workerID, service, codebase, provider)
+	return s.executeSourceTaskCodeAuditPhaseWithHooks(ctx, run, workerID, service, codebase, provider, true, hooks)
 }
 
 func (s *Server) executeBinaryTaskCodeAudit(ctx context.Context, run *pgdb.TaskCodeAuditRun, workerID int, version taskCodebaseVersion, service pgdb.TaskCodeService, codebase *taskCodeAuditCodebase) error {
+	return s.executeBinaryTaskCodeAuditWithHooks(ctx, run, workerID, version, service, codebase, nil)
+}
+
+func (s *Server) executeBinaryTaskCodeAuditWithHooks(ctx context.Context, run *pgdb.TaskCodeAuditRun, workerID int, version taskCodebaseVersion, service pgdb.TaskCodeService, codebase *taskCodeAuditCodebase, hooks *taskCodeAuditExecHooks) error {
 	activityWorker := taskCodeAuditWorkerActivityKey(run.ID)
-	s.emitTaskCodeAuditActivity(run.TaskID, activityWorker, pgdb.Activity{Kind: "text",
+	if hooks != nil && strings.TrimSpace(hooks.ActivityWorker) != "" {
+		activityWorker = strings.TrimSpace(hooks.ActivityWorker)
+	}
+	s.emitCodeAuditActivityWithHooks(run.TaskID, activityWorker, hooks, pgdb.Activity{Kind: "text",
 		Summary: "检测到 Java 部署包，正在启动 JavaCodeDB 建立索引并反编译服务类。"})
 	config := configuredTaskJavaCodeDB()
 	if !config.Ready {
@@ -1768,9 +1796,15 @@ func (s *Server) executeBinaryTaskCodeAudit(ctx context.Context, run *pgdb.TaskC
 		progress.Summary = "JavaCodeDB 未索引到可审计的 Java class；未生成审计结论。"
 		return s.m.pg.IncompleteTaskCodeAudit(run.ID, progress, "JavaCodeDB 未发现可审计的 class 文件")
 	}
-	provider, _, err := s.taskCodeAuditRuntime(run)
-	if err != nil {
-		return err
+	var provider llm.Provider
+	if hooks != nil && hooks.Provider != nil {
+		provider = hooks.Provider
+	} else {
+		var err error
+		provider, _, err = s.taskCodeAuditRuntime(run)
+		if err != nil {
+			return err
+		}
 	}
 	state := &taskCodeAuditToolState{
 		codebase: codebase, prodFiles: map[string]bool{}, readFiles: map[string]bool{},
@@ -1890,11 +1924,15 @@ func (s *Server) executeBinaryTaskCodeAudit(ctx context.Context, run *pgdb.TaskC
 			visible: map[string]map[int]bool{}, lines: map[string]map[int]string{}, javaCodeDB: client, ctx: ctx,
 		}
 		classLines := make([]string, 0, len(chunk))
+		classPaths := make([]string, 0, len(chunk))
 		for _, class := range chunk {
-			classLines = append(classLines, fmt.Sprintf("- %s | artifact=%s | entry=%s | path=%s", class.ClassName, class.Artifact, class.Entry, taskJavaCodeDBSourcePath(class.Artifact, class.Entry)))
+			srcPath := taskJavaCodeDBSourcePath(class.Artifact, class.Entry)
+			classLines = append(classLines, fmt.Sprintf("- %s | artifact=%s | entry=%s | path=%s", class.ClassName, class.Artifact, class.Entry, srcPath))
+			classPaths = append(classPaths, srcPath)
 		}
-		messages := []llm.Message{llm.UserText(fmt.Sprintf("任务：对白盒审计服务 %s，版本 %s，范围 %s。当前分析组必须使用 read_class 读取以下 class，并结合调用图和入口索引追踪 source-to-sink；测试代码不作为漏洞证据。\n%s\n完成本组分析后返回约定 JSON。",
-			run.ServiceName, run.VersionID, run.ScopePath, strings.Join(classLines, "\n")))}
+		chunkPrompt := appendCodeAuditHooksToPrompt(fmt.Sprintf("任务：对白盒审计服务 %s，版本 %s，范围 %s。当前分析组必须使用 read_class 读取以下 class，并结合调用图和入口索引追踪 source-to-sink；测试代码不作为漏洞证据。\n%s\n完成本组分析后返回约定 JSON。",
+			run.ServiceName, run.VersionID, run.ScopePath, strings.Join(classLines, "\n")), hooks)
+		messages := []llm.Message{llm.UserText(chunkPrompt)}
 		analysisText, usage, err := s.runTaskCodeAuditLLM(ctx, provider, run.TaskID, workerID, activityWorker, agentPrompt, messages, chunkState, taskCodeAuditRemainingTokens(run.BudgetTokens, progress.UsedTokens), taskCodeAuditMaxToolRounds)
 		progress.UsedTokens += usage.InputTokens + usage.OutputTokens
 		if err != nil {
@@ -1951,6 +1989,20 @@ func (s *Server) executeBinaryTaskCodeAudit(ctx context.Context, run *pgdb.TaskC
 		}
 		if err := s.m.pg.UpdateTaskCodeAuditProgress(run.ID, progress); err != nil {
 			return err
+		}
+		if hooks != nil && hooks.OnChunkCompleted != nil {
+			hooks.OnChunkCompleted(taskCodeAuditChunkEvent{
+				ChunkIndex:           progress.ChunksCompleted,
+				ChunksTotal:          progress.ChunksTotal,
+				FilesAnalyzed:        progress.FilesAnalyzed,
+				FilesTotal:           progress.FilesTotal,
+				AssignedItems:        classPaths,
+				Summary:              trimAuditText(analysis.Summary, 400),
+				RegisteredFindingIDs: append([]int64(nil), outcome.FindingIDs...),
+				CandidatesRegistered: outcome.Registered,
+				CandidatesIncomplete: outcome.Incomplete,
+				BinaryPhase:          true,
+			})
 		}
 	}
 	if binaryCoverage.NextClassIndex < len(classes) {

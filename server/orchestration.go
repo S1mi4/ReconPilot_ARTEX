@@ -76,6 +76,8 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolGetTaskProfile(),
 		s.toolRebuildTaskProfile(),
 		s.toolRecordTaskProfileClaim(),
+		s.toolGetTaskCoveragePlan(),
+		s.toolGenerateTaskCoveragePlan(),
 		s.toolPauseTask(),
 		s.toolGetTaskGraph(),
 		s.toolListTaskFindings(),

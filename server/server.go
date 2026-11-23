@@ -72,7 +72,10 @@ type Server struct {
 	javaCodeDBProbe func() taskJavaCodeDBConfig
 	// javaCodeDBProfileProbe allows deterministic test injection for Step-3 binary profiling.
 	javaCodeDBProfileProbe func(ctx context.Context, versionDir string, version taskCodebaseVersion) (*javaBinaryProfileSummary, error)
-	profileBuildMu         sync.Mutex
+	// assessmentAuditProviderOverride allows deterministic test injection for Step-5 batch audit execution.
+	assessmentAuditProviderOverride func(taskID int64) (taskCodeAuditLLMConfig, llm.Provider, bool)
+	profileBuildMu                  sync.Mutex
+	coveragePlanMu                  sync.Mutex
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -195,6 +198,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
+	s.engine.SetAssessmentPlanBuilder(func(ctx context.Context, taskID string) error {
+		_, _, err := s.BuildAssessmentCoveragePlan(ctx, taskID)
+		return err
+	})
+	s.engine.SetCodeAuditBatchExecutor(s.runAssessmentCodeAuditBatch)
+	s.engine.SetCodeInvestigateExecutor(s.runAssessmentCodeInvestigate)
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
@@ -350,6 +359,13 @@ func (s *Server) restoreTaskRuntimes() {
 		// owns them) so they re-claim instead of spinning forever in the UI.
 		if n, _ := t.Store.ResetRunningIntents(); n > 0 {
 			log.Printf("[engine] task %s 重置 %d 个残留 running 意图为 open", t.ID, n)
+		}
+		if t.AssessmentMode && m.pg != nil {
+			if taskIDInt, err := strconv.ParseInt(t.ID, 10, 64); err == nil && taskIDInt > 0 {
+				if n, rerr := m.pg.ResetInterruptedAssessmentAttempts(taskIDInt); rerr == nil && n > 0 {
+					log.Printf("[assessment] task %s 重置 %d 个中断 running 尝试为 paused", t.ID, n)
+				}
+			}
 		}
 		if lifecycle.Paused {
 			s.engine.Pause(t.ID, agent.AbortPausedOnReload)
@@ -948,6 +964,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/profile/claims", s.listTaskProfileClaimsHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/profile/rebuild", s.rebuildTaskProfileHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/profile/claims", s.createTaskProfileClaimHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/coverage-plan", s.getTaskCoveragePlanHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/coverage-plan/generate", s.generateTaskCoveragePlanHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services/{serviceID}/audit-config", s.taskCodeAuditConfigHandler)
@@ -4350,9 +4368,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// 注意:任务暂停(paused)不拦截主 Agent 对话。主 Agent 编排会话独立于 planner/
 	// worker 的暂停,暂停中仍可继续对话(暂停只终止其正在进行的那一轮,见 control())。
 	var req struct {
-		Message     string           `json:"message"`
-		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
-		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
+		Message            string           `json:"message"`
+		Attachments        []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
+		Seg                *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
+		SourceAcknowledged bool             `json:"source_acknowledged,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -4430,7 +4449,42 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			taskDir := s.m.taskDataDir(t.ProjectID, maTaskID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(t.ProjectID), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			var err error
+			if t.AssessmentMode && s.m.pg != nil {
+				round, _ := s.m.pg.OpenAssessmentRound(maTaskID)
+				var roundID int64
+				var roundNo, profileVer int
+				if round != nil {
+					roundID = round.ID
+					roundNo = round.RoundNo
+					profileVer = round.ProfileVersion
+				}
+				lifecycle := t.lifecycleSnapshot()
+				execMode := strings.TrimSpace(lifecycle.AssessmentConfig.ExecutionMode)
+				if execMode == "" {
+					execMode = db.AssessmentExecDynamic
+				}
+				ac := agent.AssessmentMainContext{
+					PlannerContext: agent.AssessmentPlannerContext{
+						PG:               s.m.pg,
+						TaskID:           maTaskID,
+						RoundID:          roundID,
+						RoundNo:          roundNo,
+						ProfileVersion:   profileVer,
+						ExecutionMode:    execMode,
+						AssessmentPhase:  lifecycle.AssessmentPhase,
+						BusinessOverview: lifecycle.AssessmentConfig.BusinessOverview,
+						BusinessFocus:    lifecycle.AssessmentConfig.BusinessFocus,
+						ScopeNotes:       lifecycle.AssessmentConfig.ScopeNotes,
+						WorkerSlots:      s.engine.taskSlotCount(t),
+					},
+					SourceAcknowledged: req.SourceAcknowledged,
+					ExtraTools:         s.assessmentMainAgentTools(t, maTaskID, round, req.SourceAcknowledged),
+				}
+				_, err = ma.ChatAssessment(ctx, ac, mainSeg, s.m.Assets(t.ProjectID), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyHint)
+			} else {
+				_, err = ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(t.ProjectID), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			}
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})

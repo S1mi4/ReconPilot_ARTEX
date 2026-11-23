@@ -37,6 +37,15 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		} else if tg, ok := p["target_id"]; ok && tg != nil && tg != "" {
 			m["asset_ids"] = []any{tg}
 		}
+		if mode, ok := p["execution_mode"].(string); ok && mode != "" {
+			m["execution_mode"] = mode
+		}
+		if obID, ok := p["obligation_id"]; ok && obID != nil {
+			m["obligation_id"] = obID
+		}
+		if attID, ok := p["attempt_id"]; ok && attID != nil {
+			m["attempt_id"] = attID
+		}
 		if ps := parentsOf[n.ID]; len(ps) > 0 {
 			m["parents"] = ps // 上游：本意图派生自哪些节点（多个事实可共同产生一个意图）
 		}
@@ -110,7 +119,13 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
+	// assessment, if non-nil, binds this ToolSet to an open assessment round for the
+	// Assessment Planner's slice queries, obligation dispatches, and completion checks.
+	assessment *AssessmentPlannerContext
 }
+
+// SetAssessmentContext binds the active assessment planner context onto this ToolSet.
+func (t *ToolSet) SetAssessmentContext(ac *AssessmentPlannerContext) { t.assessment = ac }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.

@@ -85,6 +85,10 @@ func (s *Server) taskCodeAuditAgentChatHandler(w http.ResponseWriter, r *http.Re
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	if task.AssessmentMode {
+		writeErr(w, http.StatusConflict, "白盒驱动评估模式下白盒审计会话已并入任务主 Agent，请通过任务主 Agent 对话查询或调度白盒审计")
+		return
+	}
 	var req taskCodeAuditAgentChatRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式无效")

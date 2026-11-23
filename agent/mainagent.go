@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -196,6 +197,152 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	}
 	// C2: this session is fresh each turn; re-unlock skill-gated MCPs from prior
 	// Skill() calls in the reloaded history so revealed tools stay callable.
+	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
+	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
+		if emit != nil {
+			r.Worker = "mainagent"
+			emit(r)
+		}
+	})
+	return text, err
+}
+
+// AssessmentMainContext binds MainAgent.ChatAssessment to the active
+// assessment round, whitebox dispatch confirmation state, and host tools.
+type AssessmentMainContext struct {
+	PlannerContext     AssessmentPlannerContext
+	SourceAcknowledged bool
+	ExtraTools         []actool.CoreTool
+	SystemAddendum     string
+}
+
+var forbiddenAssessmentMainTools = map[string]bool{
+	"add_intent":                    true,
+	"set_goals":                     true,
+	"bash":                          true,
+	"write":                         true,
+	"edit":                          true,
+	"multiedit":                     true,
+	"sleep":                         true,
+	"web_fetch":                     true,
+	"webfetch":                      true,
+	"web_search":                    true,
+	"websearch":                     true,
+	"dispatch_assessment_intent":    true,
+	"request_assessment_completion": true,
+}
+
+func filterAssessmentMainTools(in []actool.CoreTool) []actool.CoreTool {
+	seen := map[string]bool{}
+	out := make([]actool.CoreTool, 0, len(in))
+	for _, tl := range in {
+		if tl == nil {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(tl.Name()))
+		if key == "" || forbiddenAssessmentMainTools[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, tl)
+	}
+	return out
+}
+
+func assessmentMainSystem(ac AssessmentMainContext, goal, dataDir, workDir string) string {
+	base := renderSystem("mainagent", mainAgentDefaultTmpl, MainVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
+	pc := ac.PlannerContext
+	ackLabel := "false（未确认源码范围/授权）"
+	if ac.SourceAcknowledged {
+		ackLabel = "true（已确认源码范围与白盒审计授权）"
+	}
+	var b strings.Builder
+	b.WriteString(base)
+	b.WriteString("\n\n【白盒驱动评估模式收敛规则（已接管原独立白盒审计会话）】\n")
+	b.WriteString(fmt.Sprintf("- 当前处于 assessment_mode=true：轮次 #%d，画像版本 v%d，执行模式 %s，并发槽位 %d，源码确认状态：%s。\n",
+		pc.RoundNo, pc.ProfileVersion, pc.ExecutionMode, pc.WorkerSlots, ackLabel))
+	b.WriteString("- 原独立“白盒审计 Agent”对话已并入当前主 Agent。查询代码模块与批量审计进展使用 `list_code_modules`、`list_code_audits`、`list_code_audit_coverage`、`list_coverage_obligations`、`query_profile_slice`、`list_findings`。\n")
+	b.WriteString("- 用户想调整重点或纠偏时，使用 `update_obligation_priority`、`add_exploration_obligation`、`steer_work`、`add_hint`、`set_constraints`。\n")
+	b.WriteString("- 如需主动派发白盒批量审计（`code_audit_batch`）或定向只读查码（`code_investigate`），必须满足两个硬前提：① 本轮已获得用户明确确认；② `source_acknowledged=true`，随后再调用 `dispatch_assessment_work(confirm=true, ...)`；禁止未经确认直接派工或停止审计，停止运行中批量审计请用 `stop_code_audit`。\n")
+	b.WriteString("- 不再使用 `add_intent` / `set_goals`；静态审计线索与理论 Finding 不得表述为已动态验证成功。")
+	if strings.TrimSpace(ac.SystemAddendum) != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(ac.SystemAddendum))
+	}
+	b.WriteString(artifactSpec(workDir))
+	return b.String()
+}
+
+// ChatAssessment handles one human turn for assessment_mode=true tasks,
+// converging whitebox audit querying, priority steering, confirmed dispatch,
+// and steer_work/constraints into MainAgent while leaving legacy Chat intact.
+func (m *MainAgent) ChatAssessment(ctx context.Context, ac AssessmentMainContext, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyHint func([]string)) (string, error) {
+	tsx := NewToolSet(ts, "human")
+	pc := ac.PlannerContext
+	tsx.SetAssessmentContext(&pc)
+	tsx.SetFindingRecorder(m.findingRecorder)
+	tsx.SetEscalationRecorder(m.escalations)
+	if as != nil {
+		tsx.SetAssetStore(as, as.Companies())
+	}
+	tsx.SetTaskID(pc.TaskID)
+	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(pc.TaskID))
+	tsx.SetNotify(notify)
+	tsx.SetResumeTask(resume)
+	tsx.SetNotifyHint(notifyHint)
+	tsx.steerWork = m.steerWork
+
+	rawBase := append(tsx.AssessmentMainTools(), ac.ExtraTools...)
+	rawBase = append(rawBase, defaultToolsExcept("Bash", "Write", "Edit", "MultiEdit", "Sleep")...)
+	ctx = WithRunInfo(ctx, RunInfo{TaskID: pc.TaskID, ExplorationID: explorationID(ts)})
+	tools, def, cleanup := AugmentTools(ctx, "mainagent", rawBase)
+	defer cleanup()
+	tools = filterAssessmentMainTools(tools)
+
+	mainDir := ensureRunDir(m.workDir, pc.TaskID, 0)
+	ctx = intercept.WithReviewContext(ctx, mainDir, intercept.ReviewBackground{})
+	system, boundary := deferredSystem(assessmentMainSystem(ac, goal, m.workDir, mainDir), def)
+
+	opts := agentcore.Options{
+		Provider:        m.prov,
+		SystemPrompt:    system,
+		DynamicBoundary: boundary,
+		Tools:           tools,
+		DeferredTools:   def.Deferred,
+		UnlockSet:       def.Unlock,
+		PermissionMode:  permission.ModeBypass,
+		EnableWebFetch:  false,
+		EnableWebSearch: false,
+		BashEnv:         nil,
+		WorkingDir:      mainDir,
+		ToolOutputDir:   cmdOutDir(mainDir),
+		MaxTurns:        m.maxTurns,
+		Compaction:      compactionConfig(m.compactionWindow()),
+		Todos:           actool.NewTodoStore(),
+		Settlement:      wrapupSettlement("mainagent", nil),
+		NonStreaming:    m.nonStreaming(),
+		MaxTokens:       m.maxTokens(),
+	}
+	if m.tx != nil && ts != nil {
+		opts.Transcript = m.tx
+		opts.SessionID = fmt.Sprintf("exp%d-main", ts.ID())
+		if mainSeg > 0 {
+			opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
+		}
+	}
+	if ts != nil {
+		noaSession := fmt.Sprintf("exp%d-main", ts.ID())
+		if mainSeg > 0 {
+			noaSession = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
+		}
+		enableNoa(&opts, m.noaEnabledFn, m.workDir, noaSession, noaWarn(noaSession))
+	}
+	ctx = attachSideCapture(ctx, &opts)
+	s := agentcore.NewSession(opts)
+	defer s.Close()
+	if m.tx != nil && opts.SessionID != "" {
+		_ = s.Resume(opts.SessionID)
+	}
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
 		if emit != nil {

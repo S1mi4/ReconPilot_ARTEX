@@ -153,6 +153,11 @@ type Engine struct {
 	workerResolve        func(t *Task, slot WorkerSlot) (*agent.Worker, error)
 	slotState            sync.Map // task/slot -> slotAvailability
 	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
+	claimMu              sync.Map // taskID -> *sync.Mutex (serializes assessment claim/quota checks)
+	// assessment mode specialized executor hooks (Step 5 / tests) and catch-up plan builder:
+	codeAuditBatchExec    AssessmentExecutorFunc
+	codeInvestigateExec   AssessmentExecutorFunc
+	assessmentPlanBuilder func(ctx context.Context, taskID string) error
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness    func() bool
@@ -302,6 +307,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
 	e.slotPlans.Delete(taskID)
+	e.claimMu.Delete(taskID)
 	e.slotState.Range(func(key, _ any) bool {
 		keyText, ok := key.(string)
 		if ok && strings.HasPrefix(keyText, taskID+"/") {
@@ -949,40 +955,28 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
-		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
-		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
-		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
-		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
-		if t.AssessmentMode {
-			if t.IsDraft() {
-				return
-			}
-			t.drainTriggers()
-			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
-				e.completeAssessmentIfEligible(t, "assessment 收尾")
-			}
-			return // 白盒驱动评估模式永不退化为发散式 goal-driven planner.Plan
+		if t.AssessmentMode && t.IsDraft() {
+			return
 		}
-		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
-			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
-			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
-				// 白盒驱动评估模式：frontier 抽干不等于完成，完成判定走程序契约
-				//（覆盖义务/尝试/事件/白盒队列逐项核对，§6.3）。契约未通过则任务
-				// 保持运行，等待覆盖工作被派发；每次唤醒/心跳都会复查。
-				if t.AssessmentMode {
-					e.completeAssessmentIfEligible(t, "goalless 收尾")
-					return
+		if !t.AssessmentMode {
+			// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
+			// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
+			// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
+			// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
+			if open, err := t.Store.HasOpenGoal(); err == nil && !open {
+				t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
+				if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+					// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
+					// pause/delete/超时收尾的状态转换。
+					if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
+						log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
+					} else if won {
+						e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+							Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
+					}
 				}
-				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
-				// pause/delete/超时收尾的状态转换。
-				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
-					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
-				} else if won {
-					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
-				}
+				return // goalless 分支永不进入 planner.Plan
 			}
-			return // goalless 分支永不进入 planner.Plan
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -1001,6 +995,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
+			return
+		}
+		if t.AssessmentMode {
+			log.Printf("[assessment-planner] task %s 评估规划中…(%s 触发)", t.ID, src)
+			e.runAssessmentPlannerRound(ectx, t, planner, emit)
 			return
 		}
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
@@ -1159,7 +1158,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.emitActivity(t, r)
 	}
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	meta := db.ParseIntentAssessmentMeta(intent.Payload)
+	isBoundAssessment := t.AssessmentMode && meta.ObligationID > 0 && meta.AttemptID > 0 && wTaskID > 0 && e.m != nil && e.m.pg != nil
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
+		if isBoundAssessment {
+			_ = e.m.pg.PauseObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID)
+		}
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1190,39 +1195,53 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
 	}
-	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
-	if hasChatMessage {
-		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-	} else {
-		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
-	}
-	if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
-		e.proxyFailure(t.ID, err)
-	}
-	e.EndLLMCall(t.ID)
-	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
-	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
-	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
-	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
-	for attempt := 1; attempt <= maxRetries &&
-		retryableWorkerModelError(reason, err) &&
-		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
-		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
-		if sleepCtx(workCtx, retryBackoff) {
-			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
+	var ranSpecialized bool
+	var specRes AssessmentExecResult
+	if t.AssessmentMode && !hasChatMessage &&
+		(meta.ExecutionMode == db.ExecModeCodeAuditBatch || meta.ExecutionMode == db.ExecModeCodeInvestigate) {
+		ranSpecialized = true
+		execFn := e.codeInvestigateExec
+		if meta.ExecutionMode == db.ExecModeCodeAuditBatch {
+			execFn = e.codeAuditBatchExec
 		}
+		specRes, err = e.runSpecializedAssessmentExecutor(workCtx, t, name, intent, meta, taskEmit, execFn, meta.ExecutionMode)
+		if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
+			e.proxyFailure(t.ID, err)
+		}
+	} else {
 		e.BeginLLMCall(t.ID)
 		if hasChatMessage {
 			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
 		} else {
 			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 		}
+		if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
+			e.proxyFailure(t.ID, err)
+		}
 		e.EndLLMCall(t.ID)
+		// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
+		// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
+		// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
+		maxRetries, retryBackoff := e.modelErrorRetryPolicy()
+		for attempt := 1; attempt <= maxRetries &&
+			retryableWorkerModelError(reason, err) &&
+			workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+			log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
+				name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
+			if sleepCtx(workCtx, retryBackoff) {
+				break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
+			}
+			e.BeginLLMCall(t.ID)
+			if hasChatMessage {
+				reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+			} else {
+				reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+			}
+			e.EndLLMCall(t.ID)
+		}
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
@@ -1246,6 +1265,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var controlErr error
 	defer func() { completeWork(controlErr) }()
 	if action == "pause" {
+		if isBoundAssessment {
+			_ = e.m.pg.PauseObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID)
+		}
 		controlErr = transitionIntentState(t.Store, intent.ID, "running", "paused")
 		if controlErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 暂停状态落库失败: %v", name, t.ID, intent.ID, controlErr)
@@ -1256,6 +1278,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		return true
 	}
 	if action == "cancel" {
+		if isBoundAssessment {
+			_ = e.m.pg.CancelObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID, "cancelled_by_user")
+		}
 		// Park the stopped run in paused before handing cleanup to the API. If the
 		// request disconnects after cancellation, the intent remains recoverable and
 		// a later cancel can finish cleanup instead of leaving a phantom running row.
@@ -1272,6 +1297,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// so it is re-claimed on resume — the worker will resume the prior LLM
 	// conversation from its transcript instead of restarting from scratch.
 	if ectx.Err() != nil && taskExecutionPaused(context.Cause(ectx)) {
+		if isBoundAssessment {
+			_ = e.m.pg.PauseObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID)
+		}
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 任务暂停回退失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1280,6 +1308,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 任务超时收尾的硬兜底 cancel(非 pause、非 kill)取消了本 run → 归为 exhausted(已收尾),
 	// 不要误标 blocked。此时 worker 通常已在 settlement 阶段把结果写回。
 	if ectx.Err() != nil && e.isSettling(t.ID) {
+		if isBoundAssessment {
+			_ = e.m.pg.CancelObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID, "task_settling")
+		}
 		if err := transitionIntentState(t.Store, intent.ID, "running", "exhausted"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 超时收尾状态落库失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1290,6 +1321,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 任务已判完成(done via 常规路径)→ 上面 cancelExec 取消了本 run。意图结果已无意义,
 	// 标 stopped(不是 blocked),别污染已完成任务的意图状态。
 	if ectx.Err() != nil && isTerminalStatus(e.m.TaskStatus(t.ID)) {
+		if isBoundAssessment {
+			_ = e.m.pg.CancelObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID, "task_terminal")
+		}
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1299,6 +1333,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// killed by the planner: mark stopped (don't write back results, don't auto-reclaim).
 	if killed {
+		if isBoundAssessment {
+			_ = e.m.pg.CancelObligationAttempt(wTaskID, meta.ObligationID, meta.AttemptID, "killed_by_planner")
+		}
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1315,20 +1352,30 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	state := "done"
 	blockedReason := ""
 	blockedSummary := ""
-	switch {
-	case err != nil:
-		state = "blocked"
-	case reason == harness.ReasonMaxTurns:
-		state = "exhausted"
-		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
-	case reason == harness.ReasonTimeout:
-		state = "exhausted"
-		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
-	}
-	if state == "done" && wrote.Total() == 0 && toolUses.Load() == 0 {
-		state = "blocked"
-		blockedReason = db.IntentBlockedNoProgress
-		blockedSummary = "Worker 未调用任何工具，也未写回事实、资产或 Finding；意图已阻塞，等待规划器调整方向。"
+	if ranSpecialized {
+		state = e.settleAssessmentSpecializedResult(t, intent, meta, specRes, err)
+		if state == "blocked" {
+			blockedReason = strings.TrimSpace(specRes.BlockedReason)
+		}
+	} else {
+		switch {
+		case err != nil:
+			state = "blocked"
+		case reason == harness.ReasonMaxTurns:
+			state = "exhausted"
+			log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
+		case reason == harness.ReasonTimeout:
+			state = "exhausted"
+			log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
+		}
+		if state == "done" && wrote.Total() == 0 && toolUses.Load() == 0 {
+			state = "blocked"
+			blockedReason = db.IntentBlockedNoProgress
+			blockedSummary = "Worker 未调用任何工具，也未写回事实、资产或 Finding；意图已阻塞，等待规划器调整方向。"
+		}
+		if isBoundAssessment {
+			e.settleAssessmentDynamicWorker(t, intent, meta, state, wrote, err)
+		}
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
@@ -1411,6 +1458,12 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 		return fmt.Errorf("%w: 意图不再是 paused 状态", db.ErrIntentStateConflict)
 	}
 	node.State, node.Owner = "running", "chat"
+	if t.AssessmentMode && e.m != nil && e.m.pg != nil {
+		meta := db.ParseIntentAssessmentMeta(node.Payload)
+		if taskIDInt, pErr := strconv.ParseInt(t.ID, 10, 64); pErr == nil && taskIDInt > 0 && meta.ObligationID > 0 && meta.AttemptID > 0 {
+			_, _ = e.m.pg.MarkObligationAttemptRunning(taskIDInt, meta.ObligationID, meta.AttemptID)
+		}
+	}
 	// Record the human turn as a visible activity BEFORE the run starts, so it is
 	// ordered ahead of any worker step and never appears without the run happening.
 	// Keep the UI copy concise; ExecuteWithMessage writes the server-resolved
@@ -1449,6 +1502,9 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
+	if t != nil && t.AssessmentMode {
+		return e.claimNextAssessment(t, name)
+	}
 	fr, _ := t.Store.Frontier(20)
 	for _, in := range fr {
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {

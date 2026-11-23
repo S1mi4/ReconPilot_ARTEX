@@ -26,22 +26,30 @@ var WrapupMaxTurnsOverride func(agentKey string) (int, bool)
 // 内置默认收尾提示词,按 agent key 索引。worker 复用历史上硬编码的 settleWrapUpPrompt
 // (定义在 worker.go),planner/mainagent 各有一版;未命中的(自定义 agent)走通用兜底。
 var wrapupDefaults = map[string]string{
-	"worker":    settleWrapUpPrompt,
-	"planner":   plannerWrapUpDefault,
-	"mainagent": mainAgentWrapUpDefault,
+	"worker":             settleWrapUpPrompt,
+	"code_investigate":   codeInvestigateWrapUpDefault,
+	"planner":            plannerWrapUpDefault,
+	"assessment_planner": assessmentPlannerWrapUpDefault,
+	"mainagent":          mainAgentWrapUpDefault,
 }
 
 // wrapupTurnDefaults: 各 agent 收尾阶段【自身】的轮数预算内置默认(可被后台 >0 覆盖)。
 // 均给 10 轮,保证收尾阶段有足够步数落库。未命中走 genericWrapupTurns。
 var wrapupTurnDefaults = map[string]int{
-	"worker":    10,
-	"planner":   10,
-	"mainagent": 10,
+	"worker":             10,
+	"code_investigate":   10,
+	"planner":            10,
+	"assessment_planner": 10,
+	"mainagent":          10,
 }
 
 const genericWrapupTurns = 10
 
+const codeInvestigateWrapUpDefault = "你本次定向代码排查的步数/时长即将用尽。不要再展开新的大范围读码。请立刻：(1) 基于本次已真实读取并核验的文件与行号，调用 submit_investigation_result 提交最终排查结论与证据锚点（如有缺口如实保留）；(2) 若有必要写入关键事实，补充简明 record_fact；(3) 最后用一句话纯文本概括排查结论。"
+
 const plannerWrapUpDefault = "你本轮规划的步数即将用尽——注意只是【这一轮】结束,系统之后仍会随态势变化再次唤醒你继续规划,并非任务终止,你无需在此收束整个规划。请把本轮已经想清楚的结论落地、别让这一轮白跑,但也【不要为了收尾硬凑意图】(本轮 0 个意图仍是完全正常的结果)：(1) 若已判断出【当前就该派发】的探索方向,用一次 add_intent 批量提交(想好的别憋着不发);(2) 对已被某发现/事实证明达成的目标,调 prove_goal 标记 met(别漏判);(3) 若识别出需要分步的串行利用链,用 TodoWrite 记下,便于下次唤醒接着派。做完直接结束本轮,无需输出总结文本。"
+
+const assessmentPlannerWrapUpDefault = "你本轮评估规划的步数即将用尽——系统之后仍会随执行结果、分片完成和心跳再次唤醒你继续统筹。请把本轮已经想清楚的调度动作落地：(1) 若有就绪的覆盖义务待派发，调用 dispatch_assessment_intent 批量提交；(2) 若已识别需要深入排查的线索义务，调用 add_exploration_obligation 登记；(3) 若判断本轮覆盖与对账均已就绪，调用 request_assessment_completion 校验完成契约；(4) 用 TodoWrite 保留多步调度上下文。不要输出冗长总结文本。"
 
 const mainAgentWrapUpDefault = "你的步数即将用尽,本次交互就要结束。不要再发起新的探索/操作。请**单独用一句话纯文本**向用户总结当前进展、关键结论,以及建议的下一步。"
 
@@ -113,13 +121,19 @@ var (
 )
 
 var taskTimeoutWrapupDefaults = map[string]string{
-	"worker":  workerTaskTimeoutDefault,
-	"planner": plannerTaskTimeoutDefault,
+	"worker":             workerTaskTimeoutDefault,
+	"code_investigate":   codeInvestigateTaskTimeoutDefault,
+	"planner":            plannerTaskTimeoutDefault,
+	"assessment_planner": assessmentPlannerTaskTimeoutDefault,
 }
+
+const codeInvestigateTaskTimeoutDefault = "**整个评估任务已到达超时上限，即将结束**。不要再读取新文件。请立刻基于本次已真实读取并核验的代码证据调用 submit_investigation_result 落库结论（无法确认的明确标明未完成/待确认），最后单独用一句话总结本次代码排查结论。"
 
 const workerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是你这次 run 的预算，是整场探索到点了）。这是最后机会：(1) 把你已识别但还没写回的内容【全部】落库——新资产 insert_assets、探索结论/事实 record_fact、确认漏洞 report_finding；(2) 不要再启动任何新命令/探测；(3) **最后单独用一句话纯文本**总结你在本意图上的关键结论。"
 
 const plannerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是本轮，是整个任务终止）。请基于当前【全部】事实与发现，做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**（此时派意图也不会再被执行）。判定完即收束，无需输出总结文本。"
+
+const assessmentPlannerTaskTimeoutDefault = "**整个评估任务已到达超时上限，即将结束**。**不要再派发任何新意图**。如当前轮次必需覆盖与证据均已就绪，调用一次 request_assessment_completion 提交程序验收（最终由程序完成判定契约裁定 done 或 timeout）；做完即结束，无需输出冗长文本。"
 
 // TaskTimeoutWrapupDefault 返回某 agent 的任务超时内置默认收尾词（供后台占位/恢复默认）。
 func TaskTimeoutWrapupDefault(agentKey string) string {

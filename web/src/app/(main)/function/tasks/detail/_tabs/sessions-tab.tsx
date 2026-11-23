@@ -898,7 +898,15 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
-export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string; requestedSession?: string }) {
+export function SessionsTab({
+  taskId,
+  requestedSession = "",
+  assessmentMode = false,
+}: {
+  taskId: string;
+  requestedSession?: string;
+  assessmentMode?: boolean;
+}) {
   const { ui, liveUI } = useUITranslation();
 
   const approvalFocus = useApprovalFocus({ taskId });
@@ -907,6 +915,11 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const hasRequestedSession = React.useRef(false);
   hasRequestedSession.current =
     /^(intent:[1-9]\d*|main:\d+|plan|whitebox_(?:java_)?audit|code_audit_run:[1-9]\d*)$/.test(requestedSession);
+  React.useEffect(() => {
+    if (assessmentMode && isWhiteboxAuditWorker(selectedSessionId)) {
+      setActiveId(MAIN_ID);
+    }
+  }, [assessmentMode, selectedSessionId]);
   React.useEffect(() => {
     let session: Session | undefined;
     if (/^intent:[1-9]\d*$/.test(requestedSession)) {
@@ -924,7 +937,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       const seg = Number(requestedSession.slice(5));
       session = { ...MAIN_SESSION(liveUI), id: mainSessionId(seg), seg, title: mainSessionTitle(seg, liveUI) };
     } else if (requestedSession === "plan") session = PLANNER_SESSION(liveUI);
-    else if (isWhiteboxAuditWorker(requestedSession)) session = WHITEBOX_AUDIT_SESSION(false, "");
+    else if (isWhiteboxAuditWorker(requestedSession))
+      session = assessmentMode ? MAIN_SESSION(liveUI) : WHITEBOX_AUDIT_SESSION(false, "");
     else if (/^code_audit_run:[1-9]\d*$/.test(requestedSession)) {
       const runID = Number(requestedSession.slice("code_audit_run:".length));
       session = {
@@ -939,7 +953,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     }
     setLinkedSession(session);
     if (session) setActiveId(session.id);
-  }, [requestedSession, liveUI]);
+  }, [requestedSession, liveUI, assessmentMode]);
   const focusSession = React.useMemo<Session | undefined>(() => {
     const source = approvalFocus.state?.source;
     if (!source) return undefined;
@@ -1801,13 +1815,14 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     const items = [
       ...mainSessions,
       { ...PLANNER_SESSION(ui), live: plannerLive },
-      WHITEBOX_AUDIT_SESSION(auditAgentRunning, store.whitebox_audit?.lastTs ?? ""),
+      ...(assessmentMode ? [] : [WHITEBOX_AUDIT_SESSION(auditAgentRunning, store.whitebox_audit?.lastTs ?? "")]),
       ...auditWorkerSessions,
       ...workerSessions,
       SYSTEM_SESSION(ui),
     ];
     const located = focusSession ?? retainedSession ?? linkedSession;
-    if (located && !items.some((s) => s.id === located.id)) items.push(located);
+    if (located && !items.some((s) => s.id === located.id) && !(assessmentMode && isWhiteboxAuditWorker(located.role)))
+      items.push(located);
     return items;
   }, [
     mainSessions,
@@ -1819,6 +1834,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     focusSession,
     retainedSession,
     linkedSession,
+    assessmentMode,
     ui,
   ]);
 

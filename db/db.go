@@ -198,6 +198,12 @@ var builtinAgents = []builtinAgent{
 		{"Goal", "任务总目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "资产计数/类型分布摘要(可选)", "domain:3 ip:5 site:2", "distilled"},
 	}, false, nil},
+	{"assessment_planner", "评估规划", "planner", "白盒驱动评估模式的全局统筹大脑：依据轮次画像与覆盖义务切片，协调静态审计、定向查码与动态验证。", []promptVar{
+		{"BusinessOverview", "业务说明与测试重点", "电商订单系统，核心资产为订单与支付接口", "exploration"},
+		{"ExecutionMode", "评估执行模式(dynamic/offline)", "dynamic", "runtime"},
+		{"RoundNo", "当前评估轮次编号", "1", "runtime"},
+		{"ProfileVersion", "当前画像快照版本", "1", "runtime"},
+	}, false, nil},
 	{"mainagent", "主", "main", "人机接口：观察进展，把人的意图落成 hint 或高优先级意图。", []promptVar{
 		{"Goal", "当前任务目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "开局态势摘要(可选)", "domain:3 ip:5", "distilled"},
@@ -214,6 +220,11 @@ var builtinAgents = []builtinAgent{
 	{"codebase_discovery", "代码服务发现", "assistant", "仅根据代码库目录和有限构建元数据识别任务内的 Java、Python、C 服务候选；不读取源代码、不执行代码、不创建漏洞发现。", nil, false, nil},
 	{"whitebox_audit", "白盒审计", "assistant", "按用户选择的服务只读审计 Java、Python、C 源码；不预设漏洞类型，不执行代码。", nil, false, nil},
 	{"whitebox_java_audit", "Java 白盒审计（兼容）", "assistant", "按用户手动选择的服务只读分析 Java 污点路径；不执行代码，不直接写入 Findings。", nil, false, nil},
+	{"code_investigate", "定向代码调查", "worker", "严格只读的白盒定向调查 Worker：追踪跨模块调用、配置冲突与鉴权链路；无 Bash 与网络权限。", []promptVar{
+		{"RoundNo", "当前评估轮次编号", "1", "runtime"},
+		{"ProfileVersion", "当前画像快照版本", "1", "runtime"},
+		{"Scope", "当前评估范围说明", "仅审计已上传模块", "runtime"},
+	}, false, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
 	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
 }

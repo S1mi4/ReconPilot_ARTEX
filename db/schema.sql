@@ -2368,3 +2368,156 @@ CREATE INDEX IF NOT EXISTS idx_task_profile_claims_round_status
     ON task_profile_claims(task_id, round_id, confirmation_status);
 CREATE INDEX IF NOT EXISTS idx_task_target_entities_round_type
     ON task_target_entities(task_id, round_id, entity_type);
+
+-- =====================================================================
+-- 白盒驱动测试转型第 4 步（§5/§6/§8/§9/§10）：覆盖义务生成、统一意图路由与
+-- 评估 Planner 统筹。幂等列扩展、约束迁移、尝试状态机与活动意图去重索引。
+-- =====================================================================
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'program';
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS profile_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS context_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE task_coverage_obligations ADD COLUMN IF NOT EXISTS active_attempt_id BIGINT;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_coverage_obligations'::regclass
+          AND conname = 'ck_task_coverage_obligations_exec_mode'
+    ) THEN
+        ALTER TABLE task_coverage_obligations ADD CONSTRAINT ck_task_coverage_obligations_exec_mode
+            CHECK (execution_mode IN ('','code_audit_batch','code_investigate','dynamic_verify'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_coverage_obligations'::regclass
+          AND conname = 'ck_task_coverage_obligations_origin'
+    ) THEN
+        ALTER TABLE task_coverage_obligations ADD CONSTRAINT ck_task_coverage_obligations_origin
+            CHECK (origin IN ('program','planner','user'));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_task_coverage_obligations_round_sched
+    ON task_coverage_obligations(task_id, round_id, status, priority DESC, id ASC);
+
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS round_id BIGINT REFERENCES task_assessment_rounds(id) ON DELETE SET NULL;
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS attempt_uid TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS profile_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed';
+ALTER TABLE task_test_attempts ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+DO $$
+DECLARE cname text;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_test_attempts'::regclass
+          AND conname = 'ck_task_test_attempts_outcome_status'
+    ) THEN
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'task_test_attempts'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%outcome%'
+              AND conname <> 'ck_task_test_attempts_outcome_status'
+        LOOP
+            EXECUTE 'ALTER TABLE task_test_attempts DROP CONSTRAINT ' || quote_ident(cname);
+        END LOOP;
+        ALTER TABLE task_test_attempts ADD CONSTRAINT ck_task_test_attempts_outcome_status
+            CHECK (
+                (status = 'completed' AND outcome IN ('supported','disproved','unreproduced','env_mismatch','dependency_missing','failed'))
+                OR (status IN ('dispatched','running','cancelled','superseded') AND outcome = '')
+            );
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_test_attempts'::regclass
+          AND conname = 'ck_task_test_attempts_exec_mode'
+    ) THEN
+        ALTER TABLE task_test_attempts ADD CONSTRAINT ck_task_test_attempts_exec_mode
+            CHECK (execution_mode IN ('','code_audit_batch','code_investigate','dynamic_verify'));
+    END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_test_attempts_uid
+    ON task_test_attempts(task_id, attempt_uid) WHERE attempt_uid <> '';
+CREATE INDEX IF NOT EXISTS idx_task_test_attempts_obligation_status
+    ON task_test_attempts(obligation_id, status, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_expnodes_active_idempotency
+    ON exploration_nodes(exploration_id, (payload->>'idempotency_key'))
+    WHERE kind='intent'
+      AND state IN ('open','running','paused')
+      AND COALESCE(payload->>'idempotency_key', '') <> '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_expnodes_active_obligation
+    ON exploration_nodes(exploration_id, (payload->>'obligation_id'))
+    WHERE kind='intent'
+      AND state IN ('open','running','paused')
+      AND COALESCE(payload->>'obligation_id', '') ~ '^[1-9][0-9]*$';
+
+-- ============================================================================
+-- 第 5 步：白盒执行器下沉（code_audit_batch / code_investigate）与 MainAgent 融合
+-- ============================================================================
+
+ALTER TABLE task_code_audit_runs ALTER COLUMN code_service_id DROP NOT NULL;
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS target_entity_id BIGINT REFERENCES task_target_entities(id) ON DELETE SET NULL;
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS target_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'service';
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS relative_path TEXT NOT NULL DEFAULT '.';
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS languages TEXT[] NOT NULL DEFAULT '{}'::text[];
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS obligation_id BIGINT REFERENCES task_coverage_obligations(id) ON DELETE SET NULL;
+ALTER TABLE task_code_audit_runs ADD COLUMN IF NOT EXISTS execution_origin TEXT NOT NULL DEFAULT 'queue';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_code_audit_runs'::regclass
+          AND conname = 'ck_task_code_audit_runs_exec_origin'
+    ) THEN
+        ALTER TABLE task_code_audit_runs ADD CONSTRAINT ck_task_code_audit_runs_exec_origin
+            CHECK (execution_origin IN ('queue','engine'));
+    END IF;
+END $$;
+
+UPDATE task_code_audit_runs r
+SET target_name = COALESCE(NULLIF(r.target_name, ''), s.name),
+    relative_path = CASE WHEN r.relative_path = '.' AND s.relative_path <> '' THEN s.relative_path ELSE r.relative_path END,
+    languages = CASE WHEN cardinality(r.languages) = 0 THEN COALESCE(s.languages, '{}'::text[]) ELSE r.languages END
+FROM task_code_services s
+WHERE r.code_service_id = s.id AND r.target_name = '';
+
+CREATE INDEX IF NOT EXISTS idx_task_code_audit_runs_obligation
+    ON task_code_audit_runs(task_id, obligation_id, id DESC)
+    WHERE obligation_id IS NOT NULL;
+
+DO $$
+DECLARE cname text;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'task_assessment_events'::regclass
+          AND conname = 'ck_task_assessment_events_event_type'
+    ) THEN
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'task_assessment_events'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%event_type%'
+              AND conname <> 'ck_task_assessment_events_event_type'
+        LOOP
+            EXECUTE 'ALTER TABLE task_assessment_events DROP CONSTRAINT ' || quote_ident(cname);
+        END LOOP;
+        ALTER TABLE task_assessment_events ADD CONSTRAINT ck_task_assessment_events_event_type
+            CHECK (event_type IN (
+                'new_asset','new_entry','profile_change',
+                'evidence_invalidated','knowledge_conflict',
+                'code_version_change','code_audit_chunk_completed'
+            ));
+    END IF;
+END $$;

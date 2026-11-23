@@ -66,6 +66,15 @@ func (s *Server) startTaskEngine(t *Task) {
 		if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 			return
 		}
+		curPhase := t.lifecycleSnapshot().AssessmentPhase
+		if curPhase == db.AssessmentPhaseProfiling || curPhase == db.AssessmentPhaseCoveragePlanning {
+			if _, _, cErr := s.BuildAssessmentCoveragePlan(ctx, t.ID); cErr != nil && ctx.Err() == nil && !s.engine.IsDeleting(t.ID) {
+				log.Printf("[assessment-plan] task %s 确定性覆盖计划生成失败: %v", t.ID, cErr)
+			}
+		}
+		if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+			return
+		}
 		s.engine.Run(s.ctx, t)
 		return
 	}
