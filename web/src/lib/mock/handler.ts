@@ -12,7 +12,9 @@ import { filterAndSortFindings } from "../finding-severity";
 import type {
   Activity,
   ArchiveBatchItem,
+  AssessmentCoveragePlanResponse,
   AssessmentProfileResponse,
+  AssessmentRound,
   Asset,
   BatchControlItem,
   Company,
@@ -23,6 +25,7 @@ import type {
   FindingTraffic,
   FindingTrafficBinding,
   IntentAsset,
+  OpenRoundResponse,
   ScopeRow,
   Task,
   TaskArchive,
@@ -59,8 +62,35 @@ const mockSchedules = createMockSchedules();
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
 const mockProfileVersions = new Map<string, number>();
+const mockTaskRounds = new Map<string, AssessmentRound[]>();
+const mockStaleObligations = new Map<string, Set<number>>();
 
-function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
+function ensureMockRounds(task: Task): AssessmentRound[] {
+  const existing = mockTaskRounds.get(task.id);
+  if (existing && existing.length > 0) return existing;
+  const now = new Date().toISOString();
+  const initial: AssessmentRound[] = task.draft
+    ? []
+    : [
+        {
+          id: 1,
+          task_id: Number(task.id) || 1,
+          round_no: 1,
+          codebase_version: "v-mock-1",
+          environment_version: "env-v1",
+          scope_version: "scope-v1",
+          standard_version: "whitebox-dynamic-v1",
+          status: "active",
+          profile_version: mockProfileVersions.get(task.id) ?? 1,
+          profile_built_at: now,
+          created_at: now,
+        },
+      ];
+  mockTaskRounds.set(task.id, initial);
+  return initial;
+}
+
+function buildMockTaskProfile(task: Task, requestedRoundId?: number): AssessmentProfileResponse {
   const version = mockProfileVersions.get(task.id) ?? (task.draft ? 0 : 1);
   if (task.draft) {
     return {
@@ -71,6 +101,11 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
       evidence_refs: [],
     };
   }
+  const rounds = ensureMockRounds(task);
+  const selectedRound =
+    (requestedRoundId ? rounds.find((r) => r.id === requestedRoundId) : undefined) ?? rounds[rounds.length - 1];
+  const roundId = selectedRound?.id ?? 1;
+  const roundNo = selectedRound?.round_no ?? 1;
   const now = new Date().toISOString();
   const evidenceRefs: AssessmentProfileResponse["evidence_refs"] = [
     {
@@ -102,11 +137,11 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     {
       id: 1,
       task_id: Number(task.id) || 1,
-      round_id: 1,
+      round_id: roundId,
       entity_type: "service",
       name: "order-service",
       codebase_id: "cb-mock-1",
-      version_id: "v-mock-1",
+      version_id: selectedRound?.codebase_version || "v-mock-1",
       attributes: { language: "java", framework: "spring-boot", runnable: true },
       gap: false,
       gap_reason: "",
@@ -115,11 +150,11 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     {
       id: 2,
       task_id: Number(task.id) || 1,
-      round_id: 1,
+      round_id: roundId,
       entity_type: "shared_library",
       name: "common-auth-sdk",
       codebase_id: "cb-mock-1",
-      version_id: "v-mock-1",
+      version_id: selectedRound?.codebase_version || "v-mock-1",
       attributes: { language: "java", self_developed: true, runnable: false },
       gap: false,
       gap_reason: "",
@@ -128,11 +163,11 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     {
       id: 3,
       task_id: Number(task.id) || 1,
-      round_id: 1,
+      round_id: roundId,
       entity_type: "unknown_item",
       name: "legacy-native-plugin.bin",
       codebase_id: "cb-mock-1",
-      version_id: "v-mock-1",
+      version_id: selectedRound?.codebase_version || "v-mock-1",
       attributes: { reason: "unclassified_or_unreadable" },
       gap: true,
       gap_reason: "unclassified binary artifact: manual confirmation required",
@@ -143,15 +178,15 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     {
       id: 1,
       task_id: Number(task.id) || 1,
-      round_id: 1,
+      round_id: roundId,
       subject: "order-service",
       relation: "listens_on",
       object_value: "18080",
       source_type: "static_extraction",
       evidence_ref_id: 2,
       evidence_ref: evidenceRefs[1],
-      valid_code_version: "v-mock-1",
-      environment: "http://127.0.0.1:8080",
+      valid_code_version: selectedRound?.codebase_version || "v-mock-1",
+      environment: selectedRound?.environment_version || "http://127.0.0.1:8080",
       valid_config: "docker-compose",
       confirmation_status: "conflicted",
       conflict_note: "static docker-compose declares port 18080 vs runtime observation 8080",
@@ -160,14 +195,14 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     {
       id: 2,
       task_id: Number(task.id) || 1,
-      round_id: 1,
+      round_id: roundId,
       subject: "order-service",
       relation: "depends_on",
       object_value: "common-auth-sdk",
       source_type: "model_inference",
       evidence_ref_id: 1,
       evidence_ref: evidenceRefs[0],
-      valid_code_version: "v-mock-1",
+      valid_code_version: selectedRound?.codebase_version || "v-mock-1",
       environment: "default",
       valid_config: "default",
       confirmation_status: "unverified",
@@ -178,22 +213,24 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
   return {
     task_id: task.id,
     assessment_phase: task.assessment_phase ?? "profiling",
-    round: {
-      id: 1,
-      task_id: Number(task.id) || 1,
-      round_no: 1,
-      codebase_version: "v-mock-1",
-      environment_version: "env-v1",
-      scope_version: "scope-v1",
-      standard_version: "whitebox-dynamic-v1",
-      status: "active",
-      profile_version: version,
-      profile_built_at: now,
-      created_at: now,
-    },
+    round: selectedRound
+      ? { ...selectedRound, profile_version: version }
+      : {
+          id: roundId,
+          task_id: Number(task.id) || 1,
+          round_no: roundNo,
+          codebase_version: "v-mock-1",
+          environment_version: "env-v1",
+          scope_version: "scope-v1",
+          standard_version: "whitebox-dynamic-v1",
+          status: "active",
+          profile_version: version,
+          profile_built_at: now,
+          created_at: now,
+        },
     summary: {
-      round_id: 1,
-      round_no: 1,
+      round_id: roundId,
+      round_no: roundNo,
       profile_version: version,
       profile_built_at: now,
       initial_profile_ready: version > 0,
@@ -211,6 +248,324 @@ function buildMockTaskProfile(task: Task): AssessmentProfileResponse {
     entities,
     claims,
     evidence_refs: evidenceRefs,
+  };
+}
+
+function buildMockAssessmentPlan(
+  task: Task,
+  requestedRoundId?: number,
+  q?: URLSearchParams,
+): AssessmentCoveragePlanResponse {
+  const profile = buildMockTaskProfile(task, requestedRoundId);
+  const rounds = ensureMockRounds(task);
+  const activeRound = profile.round ?? rounds[rounds.length - 1];
+  const staleSet = mockStaleObligations.get(task.id) ?? new Set<number>();
+  const now = new Date().toISOString();
+  const taskIdNum = Number(task.id) || 1;
+  const offline = task.assessment_config?.execution_mode === "offline";
+
+  const status103 = (() => {
+    if (staleSet.has(103)) return "stale" as const;
+    if (offline) return "not_applicable" as const;
+    return "ready" as const;
+  })();
+  const obligations: AssessmentCoveragePlanResponse["obligations"] = task.draft
+    ? []
+    : [
+        {
+          id: 101,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "code_audit",
+          target_entity_id: 1,
+          target_name: "order-service",
+          target_type: "service",
+          purpose: "Full whitebox code audit across order-service controllers, service layer, and auth filters",
+          required: true,
+          status: staleSet.has(101) ? "stale" : "satisfied",
+          stale_reason: staleSet.has(101) ? "codebase version updated; re-audit required" : undefined,
+          evidence_ref_id: 1,
+          requires_credentials: false,
+          execution_mode: "code_audit_batch",
+          origin: "program",
+          priority: 100,
+          profile_version: profile.summary?.profile_version ?? 1,
+          created_at: now,
+          updated_at: now,
+        },
+        {
+          id: 102,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "code_audit",
+          target_entity_id: 2,
+          target_name: "common-auth-sdk",
+          target_type: "shared_library",
+          purpose: "Audit self-developed shared library common-auth-sdk for JWT verification and deserialization sinks",
+          required: true,
+          status: staleSet.has(102) ? "stale" : "running",
+          stale_reason: staleSet.has(102) ? "shared library changed; re-audit required" : undefined,
+          requires_credentials: false,
+          execution_mode: "code_audit_batch",
+          origin: "program",
+          priority: 95,
+          profile_version: profile.summary?.profile_version ?? 1,
+          active_attempt_id: 202,
+          created_at: now,
+          updated_at: now,
+        },
+        {
+          id: 103,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "entry_test",
+          target_entity_id: 1,
+          target_name: "POST /api/v1/orders/{id}/export",
+          target_type: "entry",
+          purpose: "Verify object-level authorization and tenant isolation on order export endpoint",
+          required: true,
+          status: status103,
+          stale_reason: staleSet.has(103) ? "profile invalidated" : undefined,
+          not_applicable_reason: offline ? "offline execution mode: no reachable runtime target" : undefined,
+          requires_credentials: true,
+          credential_ref: "role:standard-user",
+          execution_mode: "dynamic_verify",
+          origin: "planner",
+          priority: 90,
+          dependency_ids: [101],
+          unmet_dependency_ids: [],
+          created_at: now,
+          updated_at: now,
+        },
+        {
+          id: 104,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "identity_resource",
+          target_name: "admin-role-token",
+          target_type: "identity",
+          purpose: "Test privilege boundary between standard-user and admin-role-token",
+          required: true,
+          status: offline ? "not_applicable" : "blocked",
+          blocked_reason: offline ? undefined : "missing_credentials: admin-role-token secret not configured",
+          not_applicable_reason: offline ? "offline execution mode" : undefined,
+          requires_credentials: true,
+          credential_ref: "role:admin",
+          execution_mode: "dynamic_verify",
+          origin: "program",
+          priority: 85,
+          created_at: now,
+          updated_at: now,
+        },
+        {
+          id: 105,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "config_audit",
+          target_name: "deploy/docker-compose.yml",
+          target_type: "config",
+          purpose: "Verify actuator exposure, CORS, and profile conflict between static port 18080 and runtime 8080",
+          required: true,
+          status: staleSet.has(105) ? "stale" : "pending",
+          stale_reason: staleSet.has(105) ? "config version invalidated" : undefined,
+          requires_credentials: false,
+          execution_mode: "code_investigate",
+          origin: "program",
+          priority: 80,
+          created_at: now,
+          updated_at: now,
+        },
+        {
+          id: 106,
+          task_id: taskIdNum,
+          round_id: activeRound?.id ?? 1,
+          dimension: "runtime_asset",
+          target_name: "actuator",
+          target_type: "runtime_asset",
+          purpose: "Runtime asset checks skipped in offline mode",
+          required: false,
+          status: "not_applicable",
+          not_applicable_reason: offline
+            ? "offline execution mode disables runtime asset probing"
+            : "no standalone runtime asset declared",
+          requires_credentials: false,
+          execution_mode: "dynamic_verify",
+          origin: "program",
+          priority: 40,
+          created_at: now,
+          updated_at: now,
+        },
+      ];
+
+  const dims = [
+    "code_audit",
+    "config_audit",
+    "entry_test",
+    "identity_resource",
+    "cross_module",
+    "runtime_asset",
+    "hypothesis",
+  ];
+  const summary: AssessmentCoveragePlanResponse["summary"] = dims.map((dim) => {
+    const items = obligations.filter((o) => o.dimension === dim);
+    const req = items.filter((o) => o.required).length;
+    const na = items.filter((o) => o.status === "not_applicable").length;
+    const sat = items.filter((o) => o.status === "satisfied").length;
+    const pend = items.filter((o) => o.status === "pending").length;
+    const rdy = items.filter((o) => o.status === "ready").length;
+    const run = items.filter((o) => o.status === "running").length;
+    const blk = items.filter((o) => o.status === "blocked").length;
+    const st = items.filter((o) => o.status === "stale").length;
+    const app = req - items.filter((o) => o.required && o.status === "not_applicable").length;
+    return {
+      dimension: dim,
+      required_total: req,
+      applicable_total: Math.max(app, 0),
+      satisfied: sat,
+      not_applicable: na,
+      pending: pend,
+      ready: rdy,
+      running: run,
+      blocked: blk,
+      stale: st,
+      not_applicable_dimension: items.length === 0 || (req > 0 && app === 0 && na > 0) || (req === 0 && na > 0),
+    };
+  });
+
+  const statusFilter = q?.get("status") ?? "";
+  const dimFilter = q?.get("dimension") ?? "";
+  const modeFilter = q?.get("execution_mode") ?? "";
+  const filteredObligations = obligations.filter((item) => {
+    if (statusFilter && item.status !== statusFilter) return false;
+    if (dimFilter && item.dimension !== dimFilter) return false;
+    if (modeFilter && item.execution_mode !== modeFilter) return false;
+    return true;
+  });
+
+  const counts = {
+    satisfied: obligations.filter((o) => o.status === "satisfied").length,
+    not_applicable: obligations.filter((o) => o.status === "not_applicable").length,
+    pending: obligations.filter((o) => o.status === "pending").length,
+    ready: obligations.filter((o) => o.status === "ready").length,
+    running: obligations.filter((o) => o.status === "running").length,
+    blocked: obligations.filter((o) => o.status === "blocked").length,
+    stale: obligations.filter((o) => o.status === "stale").length,
+    missing_credentials: offline ? 0 : 1,
+    evidence_backed_satisfied: obligations.filter((o) => o.status === "satisfied" && o.evidence_ref_id).length,
+    not_applicable_without_reason: 0,
+  };
+  const reasons: string[] = [];
+  if (counts.running > 0) reasons.push(`running obligations remaining: ${counts.running}`);
+  if (counts.ready > 0) reasons.push(`ready obligations remaining: ${counts.ready}`);
+  if (counts.pending > 0) reasons.push(`pending obligations remaining: ${counts.pending}`);
+  if (counts.blocked > 0) reasons.push(`blocked obligations remaining: ${counts.blocked}`);
+  if (counts.stale > 0) reasons.push(`stale obligations requiring reconciliation: ${counts.stale}`);
+  if (profile.summary && profile.summary.unresolved_gap_count > 0) {
+    reasons.push(`unresolved profile gaps remaining: ${profile.summary.unresolved_gap_count}`);
+  }
+
+  return {
+    task_id: task.id,
+    assessment_phase: task.assessment_phase ?? "executing",
+    execution_mode: task.assessment_config?.execution_mode ?? "whitebox_dynamic",
+    round: activeRound,
+    rounds,
+    summary,
+    obligations: filteredObligations,
+    recent_attempts: task.draft
+      ? []
+      : [
+          {
+            id: 201,
+            task_id: taskIdNum,
+            round_id: activeRound?.id ?? 1,
+            obligation_id: 101,
+            attempt_no: 1,
+            code_audit_run_id: 11,
+            execution_mode: "code_audit_batch",
+            status: "completed",
+            outcome: "effective",
+            evidence_ref_id: 1,
+            created_at: now,
+            completed_at: now,
+          },
+          {
+            id: 202,
+            task_id: taskIdNum,
+            round_id: activeRound?.id ?? 1,
+            obligation_id: 102,
+            attempt_no: 1,
+            code_audit_run_id: 12,
+            execution_mode: "code_audit_batch",
+            status: "running",
+            outcome: "in_progress",
+            created_at: now,
+          },
+        ],
+    code_audits: task.draft
+      ? []
+      : [
+          {
+            run_id: 11,
+            service_id: 1,
+            service_name: "order-service",
+            target_type: "service",
+            relative_path: "services/order-service",
+            codebase_id: "cb-mock-1",
+            version_id: activeRound?.codebase_version || "v-mock-1",
+            scope_path: "services/order-service",
+            execution_origin: "assessment_program",
+            status: "completed",
+            files_total: 42,
+            files_analyzed: 42,
+            files_skipped: 0,
+            chunks_total: 6,
+            chunks_completed: 6,
+            next_file_index: 42,
+            candidate_count: 3,
+          },
+          {
+            run_id: 12,
+            service_id: 2,
+            service_name: "common-auth-sdk",
+            target_type: "shared_library",
+            relative_path: "libs/common-auth-sdk",
+            codebase_id: "cb-mock-1",
+            version_id: activeRound?.codebase_version || "v-mock-1",
+            scope_path: "libs/common-auth-sdk",
+            execution_origin: "assessment_program",
+            status: "running",
+            files_total: 18,
+            files_analyzed: 11,
+            files_skipped: 0,
+            chunks_total: 3,
+            chunks_completed: 2,
+            next_file_index: 11,
+            candidate_count: 1,
+          },
+        ],
+    evidence_refs: profile.evidence_refs,
+    completion_check: {
+      task_id: taskIdNum,
+      round_id: activeRound?.id ?? 1,
+      round_no: activeRound?.round_no ?? 1,
+      profile_version: profile.summary?.profile_version ?? 1,
+      can_complete: reasons.length === 0,
+      reasons,
+      obligations: counts,
+      target_count: profile.entities.length,
+      unresolved_gaps: profile.summary?.unresolved_gap_count ?? 0,
+      unbound_legacy_gaps: 0,
+      unbound_legacy_obligations: 0,
+      unprocessed_events: 0,
+      active_whitebox_runs: 1,
+      active_intents: 0,
+      open_goals: 0,
+      total_attempts: 2,
+      effective_attempts: 1,
+      failed_attempts: 0,
+    },
+    unresolved_gaps: profile.summary?.unresolved_gap_count ?? 0,
   };
 }
 
@@ -1578,7 +1933,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "tasks" && seg[2] === "profile" && seg.length === 3 && m === "GET") {
     const task = mockTasks.find((item) => item.id === seg[1]);
     if (!task) throw new Error("task not found");
-    return buildMockTaskProfile(task);
+    const rid = Number(q.get("round_id")) || undefined;
+    return buildMockTaskProfile(task, rid);
   }
   if (seg[0] === "tasks" && seg[2] === "profile" && seg[3] === "rebuild" && seg.length === 4 && m === "POST") {
     const task = mockTasks.find((item) => item.id === seg[1]);
@@ -1586,6 +1942,97 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (task.draft) throw new Error("草稿任务尚未启动，无法重建画像");
     mockProfileVersions.set(task.id, (mockProfileVersions.get(task.id) ?? 1) + 1);
     return buildMockTaskProfile(task);
+  }
+  if (seg[0] === "tasks" && seg[2] === "assessment-rounds" && seg.length === 3 && m === "GET") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    return { rounds: ensureMockRounds(task) };
+  }
+  if (seg[0] === "tasks" && seg[2] === "assessment-rounds" && seg.length === 3 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    const rounds = ensureMockRounds(task);
+    const prev = rounds[rounds.length - 1];
+    const now = new Date().toISOString();
+    if (prev) {
+      prev.status = "completed";
+      prev.completed_at = now;
+    }
+    const nextNo = (prev?.round_no ?? 0) + 1;
+    const nextRound: AssessmentRound = {
+      id: (prev?.id ?? 0) + 1,
+      task_id: Number(task.id) || 1,
+      round_no: nextNo,
+      codebase_version:
+        typeof b.codebase_version === "string" && b.codebase_version ? b.codebase_version : `v-mock-${nextNo}`,
+      environment_version:
+        typeof b.environment_version === "string" && b.environment_version ? b.environment_version : `env-v${nextNo}`,
+      scope_version: prev?.scope_version ?? "scope-v1",
+      standard_version: prev?.standard_version ?? "whitebox-dynamic-v1",
+      status: "active",
+      profile_version: (mockProfileVersions.get(task.id) ?? 1) + 1,
+      profile_built_at: now,
+      created_at: now,
+    };
+    mockProfileVersions.set(task.id, nextRound.profile_version ?? 1);
+    rounds.push(nextRound);
+    const plan = buildMockAssessmentPlan(task, nextRound.id);
+    const resp: OpenRoundResponse = {
+      previous_round_id: prev?.id,
+      new_round: nextRound,
+      profile_summary: buildMockTaskProfile(task, nextRound.id).summary,
+      coverage_summary: plan.summary,
+    };
+    return resp;
+  }
+  if (seg[0] === "tasks" && seg[2] === "coverage-plan" && seg.length === 3 && m === "GET") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    const rid = Number(q.get("round_id")) || undefined;
+    return buildMockAssessmentPlan(task, rid, q);
+  }
+  if (seg[0] === "tasks" && seg[2] === "coverage-plan" && seg[3] === "generate" && seg.length === 4 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    return buildMockAssessmentPlan(task);
+  }
+  if (seg[0] === "tasks" && seg[2] === "coverage-plan" && seg[3] === "reconcile" && seg.length === 4 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    const stale = mockStaleObligations.get(task.id) ?? new Set<number>();
+    const reopenedIds = [...stale];
+    stale.clear();
+    mockStaleObligations.set(task.id, stale);
+    const plan = buildMockAssessmentPlan(task);
+    const roundId = plan.round?.id ?? 1;
+    return {
+      round_id: roundId,
+      reopened: { round_id: roundId, reopened_ids: reopenedIds, ready_count: reopenedIds.length },
+      merged_hypotheses: { round_id: roundId, merged_pairs: 0 },
+      summary: plan.summary,
+    };
+  }
+  if (seg[0] === "tasks" && seg[2] === "assessment" && seg[3] === "invalidate" && seg.length === 4 && m === "POST") {
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    const stale = mockStaleObligations.get(task.id) ?? new Set<number>();
+    const ids =
+      Array.isArray(b.obligation_ids) && b.obligation_ids.length > 0 ? b.obligation_ids.map(Number) : [101, 103];
+    for (const id of ids) stale.add(id);
+    mockStaleObligations.set(task.id, stale);
+    const nextVersion = b.bump_profile_version
+      ? (mockProfileVersions.get(task.id) ?? 1) + 1
+      : (mockProfileVersions.get(task.id) ?? 1);
+    if (b.bump_profile_version) {
+      mockProfileVersions.set(task.id, nextVersion);
+    }
+    const rounds = ensureMockRounds(task);
+    const activeRoundId = rounds[rounds.length - 1]?.id ?? 1;
+    return {
+      round_id: activeRoundId,
+      new_profile_version: nextVersion,
+      invalidated_ids: ids,
+    };
   }
   if (path === "/task-categories" && m === "GET") return { categories: mockTaskCategorySnapshot() };
   if (path === "/task-categories" && m === "POST") {

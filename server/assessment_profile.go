@@ -667,15 +667,12 @@ func (s *Server) buildAssessmentProfileResponse(t *Task, roundID int64, entFilte
 	}
 	var round *pgdb.AssessmentRound
 	if roundID > 0 {
-		round, err = s.m.pg.OpenAssessmentRound(taskNum)
+		round, err = s.m.pg.GetAssessmentRound(taskNum, roundID)
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
-		if round == nil || round.ID != roundID {
-			round, err = s.m.pg.LatestAssessmentRound(taskNum)
-			if err != nil {
-				return nil, http.StatusInternalServerError, err
-			}
+		if round == nil {
+			return nil, http.StatusNotFound, errors.New("未找到指定的评估轮次")
 		}
 	} else {
 		round, err = s.m.pg.LatestAssessmentRound(taskNum)

@@ -230,11 +230,7 @@ export interface EvidenceRef {
   created_at: string;
 }
 
-export type ProfileClaimSourceType =
-  | "user_declared"
-  | "static_extraction"
-  | "runtime_observation"
-  | "model_inference";
+export type ProfileClaimSourceType = "user_declared" | "static_extraction" | "runtime_observation" | "model_inference";
 
 export type ProfileClaimStatus = "unverified" | "confirmed" | "conflicted" | "unknown";
 
@@ -283,6 +279,158 @@ export interface AssessmentProfileResponse {
   entities: TargetEntity[];
   claims: ProfileClaim[];
   evidence_refs: EvidenceRef[];
+}
+
+export type CoverageDimension =
+  | "code_audit"
+  | "config_audit"
+  | "entry_test"
+  | "identity_resource"
+  | "cross_module"
+  | "runtime_asset"
+  | "hypothesis";
+
+export type ObligationStatus = "pending" | "ready" | "running" | "satisfied" | "blocked" | "stale" | "not_applicable";
+
+export type ObligationExecutionMode = "code_audit_batch" | "code_investigate" | "dynamic_verify";
+
+export interface DimensionCoverageSummary {
+  dimension: CoverageDimension | (string & {});
+  required_total: number;
+  applicable_total: number;
+  satisfied: number;
+  not_applicable: number;
+  pending: number;
+  ready: number;
+  running: number;
+  blocked: number;
+  stale: number;
+  not_applicable_dimension: boolean;
+}
+
+export interface CoverageObligation {
+  id: number;
+  task_id: number;
+  round_id?: number;
+  dimension: CoverageDimension | (string & {});
+  target_entity_id?: number;
+  target_name?: string;
+  target_type?: string;
+  purpose: string;
+  required: boolean;
+  status: ObligationStatus;
+  dedupe_key?: string;
+  requires_credentials: boolean;
+  credential_ref?: string;
+  blocked_reason?: string;
+  stale_reason?: string;
+  not_applicable_reason?: string;
+  evidence_ref_id?: number;
+  acceptance_rule?: Record<string, unknown>;
+  execution_mode?: ObligationExecutionMode | (string & {});
+  origin?: "program" | "planner" | "user" | (string & {});
+  priority: number;
+  profile_version?: number;
+  context_snapshot?: Record<string, unknown>;
+  dependency_ids?: number[];
+  unmet_dependency_ids?: number[];
+  active_attempt_id?: number;
+  created_at?: string;
+  updated_at?: string;
+  satisfied_at?: string;
+}
+
+export interface TestAttempt {
+  id: number;
+  task_id: number;
+  round_id?: number;
+  obligation_id: number;
+  attempt_no: number;
+  intent_node_id?: number;
+  code_audit_run_id?: number;
+  execution_mode?: string;
+  attempt_uid?: string;
+  profile_version?: number;
+  status: string;
+  outcome: string;
+  evidence_ref_id?: number;
+  output?: Record<string, unknown>;
+  created_at: string;
+  completed_at?: string;
+}
+
+export interface CodeAuditCoverageSummary {
+  run_id: number;
+  service_id: number;
+  service_name: string;
+  target_type?: string;
+  relative_path?: string;
+  codebase_id: string;
+  version_id: string;
+  scope_path: string;
+  execution_origin?: string;
+  status: string;
+  files_total: number;
+  files_analyzed: number;
+  files_skipped: number;
+  chunks_total: number;
+  chunks_completed: number;
+  next_file_index: number;
+  candidate_count: number;
+}
+
+export interface AssessmentCompletionReport {
+  task_id: number;
+  round_id?: number;
+  round_no?: number;
+  profile_version?: number;
+  can_complete: boolean;
+  reasons?: string[];
+  obligations: {
+    satisfied: number;
+    not_applicable: number;
+    pending: number;
+    ready: number;
+    running: number;
+    blocked: number;
+    stale: number;
+    missing_credentials: number;
+    evidence_backed_satisfied: number;
+    not_applicable_without_reason: number;
+  };
+  target_count: number;
+  unresolved_gaps: number;
+  unbound_legacy_gaps: number;
+  unbound_legacy_obligations: number;
+  unprocessed_events: number;
+  active_whitebox_runs: number;
+  active_intents: number;
+  open_goals: number;
+  total_attempts: number;
+  effective_attempts: number;
+  failed_attempts: number;
+}
+
+export interface AssessmentCoveragePlanResponse {
+  task_id: string;
+  assessment_phase: AssessmentPhase;
+  execution_mode: AssessmentExecutionMode | (string & {});
+  round?: AssessmentRound;
+  rounds?: AssessmentRound[];
+  summary: DimensionCoverageSummary[];
+  obligations: CoverageObligation[];
+  recent_attempts: TestAttempt[];
+  code_audits?: CodeAuditCoverageSummary[];
+  evidence_refs?: EvidenceRef[];
+  completion_check?: AssessmentCompletionReport;
+  unresolved_gaps: number;
+}
+
+export interface OpenRoundResponse {
+  previous_round_id?: number;
+  new_round?: AssessmentRound;
+  profile_summary?: AssessmentProfileSummary;
+  coverage_summary?: DimensionCoverageSummary[];
 }
 
 export interface TaskCategory {

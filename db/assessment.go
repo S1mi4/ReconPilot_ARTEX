@@ -315,6 +315,47 @@ WHERE id=$2 AND task_id=$1 AND status='open'`, taskID, roundID, string(report))
 	return nil
 }
 
+// ListAssessmentRounds lists all assessment rounds for taskID newest first.
+func (d *DB) ListAssessmentRounds(taskID int64) ([]AssessmentRound, error) {
+	rows, err := d.Query(`
+SELECT `+assessmentRoundCols+`
+FROM task_assessment_rounds
+WHERE task_id=$1
+ORDER BY round_no DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AssessmentRound
+	for rows.Next() {
+		r, err := scanAssessmentRound(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
+// GetAssessmentRound returns a specific round (open, completed, or superseded) for taskID.
+func (d *DB) GetAssessmentRound(taskID, roundID int64) (*AssessmentRound, error) {
+	if taskID <= 0 || roundID <= 0 {
+		return nil, nil
+	}
+	r, err := scanAssessmentRound(d.QueryRow(`
+SELECT `+assessmentRoundCols+`
+FROM task_assessment_rounds
+WHERE task_id=$1 AND id=$2`, taskID, roundID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 func scanAssessmentRound(sc interface{ Scan(...any) error }) (*AssessmentRound, error) {
 	var r AssessmentRound
 	var report []byte

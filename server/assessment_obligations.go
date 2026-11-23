@@ -20,14 +20,18 @@ const maxUngroupedConfigAuditObligations = 25
 // AssessmentCoveragePlanResponse is returned by BuildAssessmentCoveragePlan and the
 // coverage-plan HTTP / orchestration endpoints.
 type AssessmentCoveragePlanResponse struct {
-	TaskID          string                          `json:"task_id"`
-	AssessmentPhase string                          `json:"assessment_phase"`
-	ExecutionMode   string                          `json:"execution_mode"`
-	Round           *pgdb.AssessmentRound           `json:"round,omitempty"`
-	Summary         []pgdb.DimensionCoverageSummary `json:"summary"`
-	Obligations     []pgdb.CoverageObligation       `json:"obligations"`
-	RecentAttempts  []pgdb.TestAttempt              `json:"recent_attempts"`
-	UnresolvedGaps  int                             `json:"unresolved_gaps"`
+	TaskID          string                           `json:"task_id"`
+	AssessmentPhase string                           `json:"assessment_phase"`
+	ExecutionMode   string                           `json:"execution_mode"`
+	Round           *pgdb.AssessmentRound            `json:"round,omitempty"`
+	Rounds          []pgdb.AssessmentRound           `json:"rounds,omitempty"`
+	Summary         []pgdb.DimensionCoverageSummary  `json:"summary"`
+	Obligations     []pgdb.CoverageObligation        `json:"obligations"`
+	RecentAttempts  []pgdb.TestAttempt               `json:"recent_attempts"`
+	CodeAudits      []pgdb.CodeAuditCoverageSummary  `json:"code_audits,omitempty"`
+	EvidenceRefs    []pgdb.EvidenceRef               `json:"evidence_refs,omitempty"`
+	CompletionCheck *pgdb.AssessmentCompletionReport `json:"completion_check,omitempty"`
+	UnresolvedGaps  int                              `json:"unresolved_gaps"`
 }
 
 // BuildAssessmentCoveragePlan deterministically builds required baseline coverage
@@ -544,11 +548,14 @@ func (s *Server) buildAssessmentCoveragePlanResponse(t *Task, roundID int64, fil
 	}
 	var round *pgdb.AssessmentRound
 	if roundID > 0 {
-		if open, err := s.m.pg.OpenAssessmentRound(taskNum); err == nil && open != nil && open.ID == roundID {
-			round = open
+		round, err = s.m.pg.GetAssessmentRound(taskNum, roundID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
 		}
-	}
-	if round == nil {
+		if round == nil {
+			return nil, http.StatusNotFound, errors.New("未找到指定的评估轮次")
+		}
+	} else {
 		round, err = s.m.pg.LatestAssessmentRound(taskNum)
 		if err != nil {
 			return nil, http.StatusInternalServerError, err
@@ -594,6 +601,19 @@ func (s *Server) buildAssessmentCoveragePlanResponse(t *Task, roundID int64, fil
 		}
 	}
 
+	rounds, _ := s.m.pg.ListAssessmentRounds(taskNum)
+	codeAudits, _ := s.m.pg.ListCodeAuditCoverageSummaries(taskNum, 100)
+	evidenceRefs, _ := s.m.pg.ListEvidenceRefs(taskNum, nil, "")
+	var completionCheck *pgdb.AssessmentCompletionReport
+	if round.Status == "open" {
+		completionCheck, _ = s.m.pg.AssessmentCompletionCheck(taskNum)
+	} else if len(round.CompletionReport) > 0 {
+		var historical pgdb.AssessmentCompletionReport
+		if json.Unmarshal(round.CompletionReport, &historical) == nil && historical.TaskID > 0 {
+			completionCheck = &historical
+		}
+	}
+
 	lifecycle := t.lifecycleSnapshot()
 	execMode := strings.TrimSpace(lifecycle.AssessmentConfig.ExecutionMode)
 	if execMode == "" {
@@ -604,9 +624,13 @@ func (s *Server) buildAssessmentCoveragePlanResponse(t *Task, roundID int64, fil
 		AssessmentPhase: lifecycle.AssessmentPhase,
 		ExecutionMode:   execMode,
 		Round:           round,
+		Rounds:          rounds,
 		Summary:         summary,
 		Obligations:     obligations,
 		RecentAttempts:  attempts,
+		CodeAudits:      codeAudits,
+		EvidenceRefs:    evidenceRefs,
+		CompletionCheck: completionCheck,
 		UnresolvedGaps:  unresolvedGaps,
 	}, http.StatusOK, nil
 }

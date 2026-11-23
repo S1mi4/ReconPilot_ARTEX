@@ -8,6 +8,8 @@ import {
   CheckIcon,
   ClockIcon,
   CoinsIcon,
+  FileCode2Icon,
+  LayersIcon,
   ListChecksIcon,
   PencilIcon,
   PlusIcon,
@@ -20,15 +22,18 @@ import {
 } from "lucide-react";
 
 import { StatusBadge } from "@/components/status-badge";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
+import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type {
+  AssessmentCoveragePlanResponse,
   AssetInterceptKind,
   AssetInterceptRule,
   Finding,
@@ -104,10 +109,30 @@ function StatCard({
   );
 }
 
-export function OverviewTab({ taskId }: { taskId: string }) {
+export function OverviewTab({ taskId, onSwitchTab }: { taskId: string; onSwitchTab?: (tab: string) => void }) {
   const { ui } = useUITranslation();
 
+  const { t: translate } = useLiveTranslation();
   const [task, setTask] = React.useState<Task | null>(null);
+  const [assessmentPlan, setAssessmentPlan] = React.useState<AssessmentCoveragePlanResponse | null>(null);
+  React.useEffect(() => {
+    if (!task?.assessment_mode || task.draft) {
+      setAssessmentPlan(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getTaskCoveragePlan(taskId)
+      .then((res) => {
+        if (!cancelled) setAssessmentPlan(res);
+      })
+      .catch(() => {
+        // Keep overview resilient if plan is still initializing.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task?.assessment_mode, task?.draft, taskId]);
   const [stats, setStats] = React.useState<Stats | null>(null);
   const [intents, setIntents] = React.useState<TaskNode[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
@@ -436,6 +461,111 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   return (
     <div className="flex flex-col gap-4">
       {/* 原始任务描述与目标(创建时填写的),置顶便于随时回看。 */}
+      {task?.assessment_mode && !task.draft && (
+        <Card>
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="space-y-1">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <LayersIcon className="size-4 text-primary" />
+                {translate("taskUI.assessment.overview.title")}
+              </CardTitle>
+              <CardDescription>{translate("taskUI.assessment.overview.subtitle")}</CardDescription>
+              <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
+                {(assessmentPlan?.assessment_phase || task.assessment_phase) && (
+                  <Badge variant="outline">
+                    {translate("taskUI.assessment.overview.phaseLabel")}:{" "}
+                    {translate(`taskUI.assessment.phase.${assessmentPlan?.assessment_phase || task.assessment_phase}`)}
+                  </Badge>
+                )}
+                {task.assessment_config?.execution_mode && (
+                  <Badge variant="outline">
+                    {translate("taskUI.assessment.overview.executionMode")}:{" "}
+                    {task.assessment_config.execution_mode === "offline"
+                      ? translate("taskUI.assessment.execOffline")
+                      : translate("taskUI.assessment.execDynamic")}
+                  </Badge>
+                )}
+                {assessmentPlan?.round && (
+                  <Badge variant="secondary">
+                    {translate("taskUI.assessment.profile.round")} #{assessmentPlan.round.round_no} · v
+                    {assessmentPlan.round.profile_version}
+                  </Badge>
+                )}
+                {assessmentPlan?.completion_check && (
+                  <Badge variant={assessmentPlan.completion_check.can_complete ? "default" : "destructive"}>
+                    {assessmentPlan.completion_check.can_complete
+                      ? translate("taskUI.assessment.overview.gatePassed")
+                      : translate("taskUI.assessment.overview.gateBlocked")}
+                  </Badge>
+                )}
+              </div>
+            </div>
+            {onSwitchTab && (
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <Button type="button" size="sm" onClick={() => onSwitchTab("assessment-plan")}>
+                  <LayersIcon data-icon="inline-start" />
+                  {translate("taskUI.assessment.overview.openPlan")}
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={() => onSwitchTab("profile")}>
+                  <FileCode2Icon data-icon="inline-start" />
+                  {translate("taskUI.assessment.overview.openProfile")}
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={() => onSwitchTab("sessions")}>
+                  {translate("taskUI.assessment.overview.openSessions")}
+                </Button>
+              </div>
+            )}
+          </CardHeader>
+          {(task.assessment_config?.business_overview ||
+            (task.assessment_config?.business_focus?.length ?? 0) > 0 ||
+            (task.source_task_ids?.length ?? 0) > 0) && (
+            <CardContent className="grid grid-cols-1 gap-3 border-t pt-4 text-sm sm:grid-cols-2">
+              {task.assessment_config?.business_overview && (
+                <div className="space-y-1">
+                  <div className="font-medium text-muted-foreground text-xs">
+                    {translate("taskUI.assessment.businessOverview")}
+                  </div>
+                  <p className="text-foreground text-xs leading-relaxed">{task.assessment_config.business_overview}</p>
+                </div>
+              )}
+              {((task.assessment_config?.business_focus?.length ?? 0) > 0 ||
+                (task.source_task_ids?.length ?? 0) > 0) && (
+                <div className="space-y-2">
+                  {(task.assessment_config?.business_focus?.length ?? 0) > 0 && (
+                    <div className="space-y-1">
+                      <div className="font-medium text-muted-foreground text-xs">
+                        {translate("taskUI.assessment.overview.businessFocus")}
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {task.assessment_config?.business_focus?.map((item) => (
+                          <Badge key={item} variant="secondary" className="text-[11px]">
+                            {item}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {(task.source_task_ids?.length ?? 0) > 0 && (
+                    <div className="space-y-1">
+                      <div className="font-medium text-muted-foreground text-xs">
+                        {translate("taskUI.assessment.overview.sourceTasks")}
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {task.source_task_ids?.map((sid) => (
+                          <Badge key={sid} variant="outline" className="font-mono text-[11px]">
+                            #{sid}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          )}
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -455,127 +585,134 @@ export function OverviewTab({ taskId }: { taskId: string }) {
       </Card>
       {/* 目标管理：查看/新增/修改/删除本任务的探索目标。新增与修改会通知规划者并复活任务，
           删除仅通知规划者（不复活）。目标 = 最终可交付/可核验的结果，不是攻击步骤或侦察动作。 */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <ListChecksIcon className="size-4 text-primary" /> {ui("screen.5cb4a135cb1231")}
-            <span className="text-muted-foreground text-xs font-normal">
-              {ui("screen.414cc950518ecd")}
-              {goals.length} {ui("screen.d968fad4df505c")}
-            </span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {/* 新增表单 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              className="h-7 min-w-56 flex-1 text-sm"
-              placeholder={ui("screen.27c7741caebcad")}
-              value={goalText}
-              onChange={(e) => setGoalText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void addGoal();
-              }}
-              disabled={goalBusy}
-            />
-            <Input
-              className="h-7 w-32 text-sm"
-              placeholder={ui("screen.bded0a7d463a70")}
-              value={goalVuln}
-              onChange={(e) => setGoalVuln(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void addGoal();
-              }}
-              disabled={goalBusy}
-            />
-            <Button size="sm" variant="outline" disabled={goalBusy || !goalText.trim()} onClick={() => void addGoal()}>
-              <PlusIcon className="size-3.5" /> {ui("screen.7a8a11ead50742")}
-            </Button>
-            {goalErr && <span className="text-xs text-red-500">{goalErr}</span>}
-          </div>
-          {/* 目标列表 */}
-          {goals.length > 0 ? (
-            <div className="flex flex-col gap-1.5">
-              {goals.map((g) =>
-                editingGoalId === g.id ? (
-                  <div key={g.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5">
-                    <Input
-                      className="h-7 min-w-56 flex-1 text-sm"
-                      value={editText}
-                      onChange={(e) => setEditText(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void saveEditGoal(g);
-                        if (e.key === "Escape") cancelEditGoal();
-                      }}
-                      disabled={goalBusy}
-                      autoFocus
-                    />
-                    <Input
-                      className="h-7 w-32 text-sm"
-                      placeholder={ui("screen.bded0a7d463a70")}
-                      value={editVuln}
-                      onChange={(e) => setEditVuln(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void saveEditGoal(g);
-                        if (e.key === "Escape") cancelEditGoal();
-                      }}
-                      disabled={goalBusy}
-                    />
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy || !editText.trim()}
-                      onClick={() => void saveEditGoal(g)}
-                    >
-                      <CheckIcon className="size-3.5 text-emerald-500" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={cancelEditGoal}
-                    >
-                      <XIcon className="size-3.5" />
-                    </Button>
-                  </div>
-                ) : (
-                  <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
-                    <StatusBadge domain="goal" value={g.state} />
-                    <span className="min-w-0 flex-1 break-words">{g.text}</span>
-                    {g.vulnclass && (
-                      <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
-                        {g.vulnclass}
-                      </span>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={() => startEditGoal(g)}
-                    >
-                      <PencilIcon className="size-3.5" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={() => void removeGoal(g)}
-                    >
-                      <Trash2Icon className="size-3.5 text-red-500" />
-                    </Button>
-                  </div>
-                ),
-              )}
+      {!(task?.assessment_mode && goals.length === 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ListChecksIcon className="size-4 text-primary" /> {ui("screen.5cb4a135cb1231")}
+              <span className="text-muted-foreground text-xs font-normal">
+                {ui("screen.414cc950518ecd")}
+                {goals.length} {ui("screen.d968fad4df505c")}
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            {/* 新增表单 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                className="h-7 min-w-56 flex-1 text-sm"
+                placeholder={ui("screen.27c7741caebcad")}
+                value={goalText}
+                onChange={(e) => setGoalText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void addGoal();
+                }}
+                disabled={goalBusy}
+              />
+              <Input
+                className="h-7 w-32 text-sm"
+                placeholder={ui("screen.bded0a7d463a70")}
+                value={goalVuln}
+                onChange={(e) => setGoalVuln(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void addGoal();
+                }}
+                disabled={goalBusy}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={goalBusy || !goalText.trim()}
+                onClick={() => void addGoal()}
+              >
+                <PlusIcon className="size-3.5" /> {ui("screen.7a8a11ead50742")}
+              </Button>
+              {goalErr && <span className="text-xs text-red-500">{goalErr}</span>}
             </div>
-          ) : (
-            <p className="text-muted-foreground text-sm">{ui("screen.6ca1f2eb099b5e")}</p>
-          )}
-        </CardContent>
-      </Card>
+            {/* 目标列表 */}
+            {goals.length > 0 ? (
+              <div className="flex flex-col gap-1.5">
+                {goals.map((g) =>
+                  editingGoalId === g.id ? (
+                    <div key={g.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5">
+                      <Input
+                        className="h-7 min-w-56 flex-1 text-sm"
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void saveEditGoal(g);
+                          if (e.key === "Escape") cancelEditGoal();
+                        }}
+                        disabled={goalBusy}
+                        autoFocus
+                      />
+                      <Input
+                        className="h-7 w-32 text-sm"
+                        placeholder={ui("screen.bded0a7d463a70")}
+                        value={editVuln}
+                        onChange={(e) => setEditVuln(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void saveEditGoal(g);
+                          if (e.key === "Escape") cancelEditGoal();
+                        }}
+                        disabled={goalBusy}
+                      />
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 shrink-0 px-1.5"
+                        disabled={goalBusy || !editText.trim()}
+                        onClick={() => void saveEditGoal(g)}
+                      >
+                        <CheckIcon className="size-3.5 text-emerald-500" />
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 shrink-0 px-1.5"
+                        disabled={goalBusy}
+                        onClick={cancelEditGoal}
+                      >
+                        <XIcon className="size-3.5" />
+                      </Button>
+                    </div>
+                  ) : (
+                    <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
+                      <StatusBadge domain="goal" value={g.state} />
+                      <span className="min-w-0 flex-1 break-words">{g.text}</span>
+                      {g.vulnclass && (
+                        <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
+                          {g.vulnclass}
+                        </span>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 shrink-0 px-1.5"
+                        disabled={goalBusy}
+                        onClick={() => startEditGoal(g)}
+                      >
+                        <PencilIcon className="size-3.5" />
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 shrink-0 px-1.5"
+                        disabled={goalBusy}
+                        onClick={() => void removeGoal(g)}
+                      >
+                        <Trash2Icon className="size-3.5 text-red-500" />
+                      </Button>
+                    </div>
+                  ),
+                )}
+              </div>
+            ) : (
+              <p className="text-muted-foreground text-sm">{ui("screen.6ca1f2eb099b5e")}</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
       {/* 操作约束管理：allow=允许 / deny=禁止。约束会在下一轮规划时注入 planner/worker 的系统
           提示以框定探索边界（注入范围可在 系统设置 里按 planner/worker 开关）。改动不即时打断，
           下一轮规划自然读到。 */}

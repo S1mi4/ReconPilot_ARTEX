@@ -977,6 +977,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/coverage-plan/generate", s.generateTaskCoveragePlanHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/coverage-plan/reconcile", s.reconcileTaskCoveragePlanHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/assessment/invalidate", s.invalidateAssessmentObligationsHandler)
+	mux.HandleFunc("GET /api/tasks/{id}/assessment-rounds", s.listAssessmentRoundsHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/assessment-rounds", s.createNextAssessmentRoundHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)

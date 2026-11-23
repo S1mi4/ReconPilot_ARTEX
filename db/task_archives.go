@@ -546,7 +546,9 @@ UNION SELECT value::bigint FROM findings finding
       ) value WHERE finding.task_id=$1 AND value ~ '^[0-9]+$'
 UNION SELECT value::bigint FROM task_intelligence intelligence
       CROSS JOIN LATERAL jsonb_array_elements_text(intelligence.asset_ids) value
-      WHERE intelligence.task_id=$1 AND value ~ '^[0-9]+$'`
+      WHERE intelligence.task_id=$1 AND value ~ '^[0-9]+$'
+UNION SELECT entity.asset_id FROM task_target_entities entity
+      WHERE entity.task_id=$1 AND entity.asset_id IS NOT NULL`
 }
 
 // SnapshotTaskArchive reads one repeatable PostgreSQL snapshot. Task-owned Agent
@@ -602,8 +604,15 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"task_code_services", `SELECT * FROM task_code_services WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"task_code_service_versions", `SELECT observation.* FROM task_code_service_versions observation JOIN task_code_services service ON service.id=observation.code_service_id WHERE service.task_id=$1 ORDER BY observation.id`, []any{taskID}},
 		{"task_codebase_discovery_runs", `SELECT * FROM task_codebase_discovery_runs WHERE task_id=$1 ORDER BY created_at,version_id`, []any{taskID}},
+		{"task_assessment_rounds", `SELECT * FROM task_assessment_rounds WHERE task_id=$1 ORDER BY round_no,id`, []any{taskID}},
+		{"task_evidence_refs", `SELECT * FROM task_evidence_refs WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_target_entities", `SELECT * FROM task_target_entities WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"task_code_audit_runs", `SELECT * FROM task_code_audit_runs WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"task_code_audit_candidates", `SELECT candidate.* FROM task_code_audit_candidates candidate JOIN task_code_audit_runs run ON run.id=candidate.run_id WHERE run.task_id=$1 ORDER BY candidate.id`, []any{taskID}},
+		{"task_profile_claims", `SELECT * FROM task_profile_claims WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_coverage_obligations", `SELECT * FROM task_coverage_obligations WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_test_attempts", `SELECT * FROM task_test_attempts WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"task_assessment_events", `SELECT * FROM task_assessment_events WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"findings", `SELECT * FROM findings WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"task_intelligence", `SELECT * FROM task_intelligence WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"finding_traffic_bindings", `SELECT b.* FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1 ORDER BY b.finding_id,b.position,b.id`, []any{taskID}},

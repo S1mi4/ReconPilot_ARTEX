@@ -837,3 +837,30 @@ func (s *Server) createNextAssessmentRoundHandler(w http.ResponseWriter, r *http
 	}
 	writeJSON(w, code, resp)
 }
+
+// GET /api/tasks/{id}/assessment-rounds
+func (s *Server) listAssessmentRoundsHandler(w http.ResponseWriter, r *http.Request) {
+	taskNum, ok := s.requireTaskInProject(w, r, r.PathValue("id"), true)
+	if !ok {
+		return
+	}
+	taskID := strconv.FormatInt(taskNum, 10)
+	t, ok := s.m.Task(taskID)
+	if !ok || t == nil {
+		writeErr(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if !t.AssessmentMode {
+		writeErr(w, http.StatusBadRequest, pgdb.ErrTaskNotAssessmentMode.Error())
+		return
+	}
+	rounds, err := s.m.pg.ListAssessmentRounds(taskNum)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"task_id": taskID,
+		"rounds":  rounds,
+	})
+}

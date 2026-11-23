@@ -526,13 +526,66 @@ export const api = {
     del<{ deleted_versions: number; codebase_id: string }>(
       `/tasks/${encodeURIComponent(id)}/codebases/${encodeURIComponent(codebaseId)}`,
     ),
-  getTaskProfile: (id: string) =>
-    get<import("./types").AssessmentProfileResponse>(`/tasks/${encodeURIComponent(id)}/profile`),
+  getTaskProfile: (id: string, roundId?: number) => {
+    const q = roundId && roundId > 0 ? `?round_id=${roundId}` : "";
+    return get<import("./types").AssessmentProfileResponse>(`/tasks/${encodeURIComponent(id)}/profile${q}`);
+  },
   rebuildTaskProfile: (id: string) =>
-    post<import("./types").AssessmentProfileResponse>(
-      `/tasks/${encodeURIComponent(id)}/profile/rebuild`,
+    post<import("./types").AssessmentProfileResponse>(`/tasks/${encodeURIComponent(id)}/profile/rebuild`, {}),
+  listAssessmentRounds: (id: string) =>
+    get<{ task_id: string; rounds: import("./types").AssessmentRound[] }>(
+      `/tasks/${encodeURIComponent(id)}/assessment-rounds`,
+    ),
+  createNextAssessmentRound: (
+    id: string,
+    input: { reason?: string; codebase_version?: string; environment_version?: string },
+  ) => post<import("./types").OpenRoundResponse>(`/tasks/${encodeURIComponent(id)}/assessment-rounds`, input),
+  getTaskCoveragePlan: (
+    id: string,
+    params?: { round_id?: number; status?: string; dimension?: string; execution_mode?: string; limit?: number },
+  ) => {
+    const sp = new URLSearchParams();
+    if (params?.round_id) sp.set("round_id", String(params.round_id));
+    if (params?.status) sp.set("status", params.status);
+    if (params?.dimension) sp.set("dimension", params.dimension);
+    if (params?.execution_mode) sp.set("execution_mode", params.execution_mode);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    return get<import("./types").AssessmentCoveragePlanResponse>(
+      `/tasks/${encodeURIComponent(id)}/coverage-plan${q ? `?${q}` : ""}`,
+    );
+  },
+  generateTaskCoveragePlan: (id: string) =>
+    post<import("./types").AssessmentCoveragePlanResponse>(
+      `/tasks/${encodeURIComponent(id)}/coverage-plan/generate`,
       {},
     ),
+  reconcileTaskCoveragePlan: (
+    id: string,
+    input?: { reopen_stale?: boolean; obligation_ids?: number[]; reopen_reason?: string; merge_hypotheses?: boolean },
+  ) =>
+    post<{
+      round_id: number;
+      reopened?: { round_id: number; reopened_ids?: number[]; ready_count: number };
+      merged_hypotheses?: { round_id: number; merged_pairs: number; primary_ids?: number[]; merged_ids?: number[] };
+      summary?: import("./types").DimensionCoverageSummary[];
+    }>(`/tasks/${encodeURIComponent(id)}/coverage-plan/reconcile`, input ?? {}),
+  invalidateAssessmentObligations: (
+    id: string,
+    input: {
+      reason: string;
+      change_kind?: string;
+      dimensions?: string[];
+      obligation_ids?: number[];
+      include_transitive?: boolean;
+      bump_profile_version?: boolean;
+    },
+  ) =>
+    post<{
+      round_id: number;
+      new_profile_version: number;
+      invalidated_ids?: number[];
+    }>(`/tasks/${encodeURIComponent(id)}/assessment/invalidate`, input),
   schedules: () => get<{ schedules: TaskSchedule[] }>("/schedules").then((r) => arr(r.schedules)),
   renameSchedule: (id: number, name: string) => patch<TaskSchedule>(`/schedules/${id}/metadata`, { name }),
   updateScheduleRemark: (id: number, remark: string) => patch<TaskSchedule>(`/schedules/${id}/remark`, { remark }),
@@ -1480,8 +1533,13 @@ export const api = {
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
       { signal },
     ),
-  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
+  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number, sourceAcknowledged?: boolean) =>
+    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, {
+      message,
+      attachments,
+      seg,
+      ...(sourceAcknowledged !== undefined ? { source_acknowledged: sourceAcknowledged } : {}),
+    }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {

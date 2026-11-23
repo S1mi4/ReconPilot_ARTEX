@@ -44,6 +44,7 @@ import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
+import { AssessmentPlanTab } from "./_tabs/assessment-plan-tab";
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
@@ -229,22 +230,25 @@ function TaskDetailInner() {
   const requestedTab = searchParams.get("tab") ?? "sessions";
   const normalizedRequestedTab = requestedTab === "http-history" ? "traffic" : requestedTab;
   const [tab, setTab] = React.useState(
-    TABS(ui).some((item) => item.value === normalizedRequestedTab) || normalizedRequestedTab === "profile"
+    TABS(ui).some((item) => item.value === normalizedRequestedTab) ||
+      normalizedRequestedTab === "profile" ||
+      normalizedRequestedTab === "assessment-plan"
       ? normalizedRequestedTab
       : "sessions",
   );
   const visibleTabs = React.useMemo(() => {
     const base = TABS(ui);
     if (!task?.assessment_mode) return base;
+    const planTab = { value: "assessment-plan", label: translate("taskUI.assessment.plan.tab") };
     const profileTab = { value: "profile", label: translate("taskUI.assessment.profile.tab") };
     const idx = base.findIndex((item) => item.value === "overview");
-    if (idx >= 0) return [...base.slice(0, idx + 1), profileTab, ...base.slice(idx + 1)];
-    return [profileTab, ...base];
+    if (idx >= 0) return [...base.slice(0, idx + 1), planTab, profileTab, ...base.slice(idx + 1)];
+    return [planTab, profileTab, ...base];
   }, [ui, translate, task?.assessment_mode]);
   React.useEffect(() => {
-    if (normalizedRequestedTab === "profile") {
+    if (normalizedRequestedTab === "profile" || normalizedRequestedTab === "assessment-plan") {
       if (task?.assessment_mode) {
-        setTab("profile");
+        setTab(normalizedRequestedTab);
       } else if (loaded && !task?.assessment_mode) {
         setTab("sessions");
       }
@@ -252,6 +256,20 @@ function TaskDetailInner() {
     }
     if (TABS(liveUI).some((item) => item.value === normalizedRequestedTab)) setTab(normalizedRequestedTab);
   }, [normalizedRequestedTab, liveUI, loaded, task?.assessment_mode]);
+  const switchTab = React.useCallback(
+    (nextTab: string, session?: string) => {
+      setTab(nextTab);
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("tab", nextTab);
+      if (session) {
+        params.set("session", session);
+      } else {
+        params.delete("session");
+      }
+      router.replace(`/function/tasks/detail?${params.toString()}`, { scroll: false });
+    },
+    [router, searchParams],
+  );
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -554,13 +572,14 @@ function TaskDetailInner() {
             taskId={id}
             requestedSession={searchParams.get("session") ?? ""}
             assessmentMode={Boolean(task.assessment_mode)}
+            sourceAcknowledgedDefault={Boolean(task.assessment_config?.source_acknowledged)}
           />
         </TabsContent>
         <TabsContent value="traffic" className="mt-0">
           <TrafficHistory taskId={id} />
         </TabsContent>
         <TabsContent value="overview" className="mt-0">
-          <OverviewTab taskId={id} />
+          <OverviewTab taskId={id} onSwitchTab={(nextTab) => switchTab(nextTab)} />
         </TabsContent>
         <TabsContent value="graph" className="mt-0">
           <GraphTab taskId={id} />
@@ -583,6 +602,11 @@ function TaskDetailInner() {
         <TabsContent value="assets" className="mt-0">
           <AssetsTab taskId={id} />
         </TabsContent>
+        {task.assessment_mode && (
+          <TabsContent value="assessment-plan" className="mt-0">
+            <AssessmentPlanTab task={task} onSwitchTab={switchTab} onTaskRefresh={load} />
+          </TabsContent>
+        )}
         {task.assessment_mode && (
           <TabsContent value="profile" className="mt-0">
             <ProfileTab task={task} />

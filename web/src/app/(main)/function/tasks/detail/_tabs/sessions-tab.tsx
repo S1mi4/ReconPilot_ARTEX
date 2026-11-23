@@ -45,6 +45,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { InputGroup, InputGroupAddon, InputGroupButton } from "@/components/ui/input-group";
@@ -53,6 +54,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
+import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api, openSSE } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
@@ -902,11 +904,18 @@ export function SessionsTab({
   taskId,
   requestedSession = "",
   assessmentMode = false,
+  sourceAcknowledgedDefault = false,
 }: {
   taskId: string;
   requestedSession?: string;
   assessmentMode?: boolean;
+  sourceAcknowledgedDefault?: boolean;
 }) {
+  const { t: translate } = useLiveTranslation();
+  const [mainSourceAck, setMainSourceAck] = React.useState(sourceAcknowledgedDefault);
+  React.useEffect(() => {
+    if (sourceAcknowledgedDefault) setMainSourceAck(true);
+  }, [sourceAcknowledgedDefault]);
   const { ui, liveUI } = useUITranslation();
 
   const approvalFocus = useApprovalFocus({ taskId });
@@ -2117,7 +2126,13 @@ export function SessionsTab({
     setSending(true);
     chatStatusRequestRef.current++;
     api
-      .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
+      .chat(
+        text,
+        taskId,
+        atts.length > 0 ? atts : undefined,
+        active.seg ?? 0,
+        assessmentMode ? mainSourceAck : undefined,
+      )
       .then(({ mode }) => {
         chatStatusRequestRef.current++;
         setMainChatRunning(mode === "llm");
@@ -2427,9 +2442,7 @@ export function SessionsTab({
                         {ui("screen.taskSessionsArchivedWorkers")}
                         <span className="ml-auto tabular-nums">{archivedWorkers.length}</span>
                         {archivedUnread > 0 && (
-                          <span
-                            className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] text-blue-600 tabular-nums dark:text-blue-400"
-                          >
+                          <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] text-blue-600 tabular-nums dark:text-blue-400">
                             <span className="sr-only">
                               {ui("screen.taskSessionsArchivedUnread", { v0: archivedUnread })}
                             </span>
@@ -2866,6 +2879,12 @@ export function SessionsTab({
                     )}
                   </InputGroupAddon>
                 </InputGroup>
+                {assessmentMode && (
+                  <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground select-none">
+                    <Checkbox checked={mainSourceAck} onCheckedChange={(v) => setMainSourceAck(v === true)} />
+                    <span>{translate("taskUI.assessment.sessions.mainSourceAck")}</span>
+                  </label>
+                )}
               </div>
             ) : active.role === "worker" &&
               !active.inherited &&

@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -26,6 +27,7 @@ import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api } from "@/lib/api";
 import type {
   AssessmentProfileResponse,
+  AssessmentRound,
   ProfileClaim,
   ProfileClaimSourceType,
   ProfileClaimStatus,
@@ -81,6 +83,8 @@ export function ProfileTab({ task }: { task: Task }) {
   const { t: translate } = useLiveTranslation();
 
   const [profile, setProfile] = React.useState<AssessmentProfileResponse | null>(null);
+  const [rounds, setRounds] = React.useState<AssessmentRound[]>([]);
+  const [selectedRoundId, setSelectedRoundId] = React.useState<number | undefined>(undefined);
   const [loading, setLoading] = React.useState(true);
   const [rebuilding, setRebuilding] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -95,14 +99,18 @@ export function ProfileTab({ task }: { task: Task }) {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.getTaskProfile(task.id);
+      const [next, roundResp] = await Promise.all([
+        api.getTaskProfile(task.id, selectedRoundId),
+        task.draft ? Promise.resolve({ rounds: [] }) : api.listAssessmentRounds(task.id).catch(() => ({ rounds: [] })),
+      ]);
       setProfile(next);
+      setRounds(roundResp.rounds ?? []);
     } catch (e) {
       setError((e as Error).message || translate("taskUI.assessment.profile.loadError"));
     } finally {
       setLoading(false);
     }
-  }, [task.id, translate]);
+  }, [selectedRoundId, task.draft, task.id, translate]);
 
   React.useEffect(() => {
     void loadProfile();
@@ -113,6 +121,7 @@ export function ProfileTab({ task }: { task: Task }) {
     setRebuilding(true);
     try {
       const next = await api.rebuildTaskProfile(task.id);
+      setSelectedRoundId(undefined);
       setProfile(next);
       setError(null);
       toast.success(translate("taskUI.assessment.profile.rebuildSuccess"));
@@ -139,6 +148,22 @@ export function ProfileTab({ task }: { task: Task }) {
           return translate("taskUI.assessment.profile.entityType.deployment_unit");
         case "unknown_item":
           return translate("taskUI.assessment.profile.entityType.unknown_item");
+        case "entry":
+          return translate("taskUI.assessment.profile.entityType.entry");
+        case "config":
+          return translate("taskUI.assessment.profile.entityType.config");
+        case "instance":
+          return translate("taskUI.assessment.profile.entityType.instance");
+        case "identity":
+          return translate("taskUI.assessment.profile.entityType.identity");
+        case "runtime_asset":
+          return translate("taskUI.assessment.profile.entityType.runtime_asset");
+        case "business_object":
+          return translate("taskUI.assessment.profile.entityType.business_object");
+        case "protocol":
+          return translate("taskUI.assessment.profile.entityType.protocol");
+        case "external_dependency":
+          return translate("taskUI.assessment.profile.entityType.external_dependency");
         default:
           return entityType;
       }
@@ -295,12 +320,29 @@ export function ProfileTab({ task }: { task: Task }) {
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {rounds.length > 0 && (
+              <NativeSelect
+                size="sm"
+                aria-label={translate("taskUI.assessment.profile.round")}
+                value={String(selectedRoundId ?? round?.id ?? "")}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setSelectedRoundId(Number.isFinite(val) && val > 0 ? val : undefined);
+                }}
+              >
+                {rounds.map((r) => (
+                  <NativeSelectOption key={r.id} value={String(r.id)}>
+                    #{r.round_no} · v{r.profile_version} ({r.status})
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
             <Button
               type="button"
               size="sm"
               variant="outline"
-              disabled={!canRebuild || rebuilding}
+              disabled={!canRebuild || rebuilding || Boolean(round && round.status !== "active")}
               onClick={() => void handleRebuild()}
             >
               {rebuilding ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}
