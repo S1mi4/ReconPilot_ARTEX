@@ -37,6 +37,9 @@ type AssessmentPlannerVars struct {
 type CodeInvestigateVars struct {
 	RoundNo, ProfileVersion, Scope, DataDir, Now string
 }
+type DynamicVerifyVars struct {
+	RoundNo, ProfileVersion, EnvironmentSummary, Scope, ProxyAddr, DataDir, Now string
+}
 type WorkerVars struct{ ProxyAddr, WorkerName, DataDir, Now string }
 type MainVars struct{ Goal, AssetSummary, FindingsSummary, DataDir, Now string }
 type GoalsVars struct{ EngagementDescription, DataDir, Now string }

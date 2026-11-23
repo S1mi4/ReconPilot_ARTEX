@@ -15,7 +15,7 @@ import (
 )
 
 // AssessmentExecResult captures the typed outcome produced by a specialized
-// executor (code_audit_batch / code_investigate) inside Engine.runIntent.
+// executor (code_audit_batch / code_investigate / dynamic_verify) inside Engine.runIntent.
 type AssessmentExecResult struct {
 	Outcome           string
 	EvidenceRefID     *int64
@@ -40,9 +40,20 @@ func (e *Engine) SetCodeInvestigateExecutor(fn AssessmentExecutorFunc) {
 	e.codeInvestigateExec = fn
 }
 
+// SetDynamicVerifyExecutor installs the Step-6/test executor for dynamic_verify Intents.
+func (e *Engine) SetDynamicVerifyExecutor(fn AssessmentExecutorFunc) {
+	e.dynamicVerifyExec = fn
+}
+
 // SetAssessmentPlanBuilder installs the catch-up deterministic coverage plan builder.
 func (e *Engine) SetAssessmentPlanBuilder(fn func(ctx context.Context, taskID string) error) {
 	e.assessmentPlanBuilder = fn
+}
+
+// SetAssessmentHypothesisSync installs the hook that promotes static findings into
+// dynamic hypothesis obligations before Planner inspects coverage.
+func (e *Engine) SetAssessmentHypothesisSync(fn func(ctx context.Context, taskID string, roundID int64) error) {
+	e.assessmentHypothesisSync = fn
 }
 
 func (e *Engine) claimMutex(taskID string) *sync.Mutex {
@@ -194,6 +205,9 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 		}
 	}
 
+	if e.assessmentHypothesisSync != nil {
+		_ = e.assessmentHypothesisSync(ctx, t.ID, round.ID)
+	}
 	_, _, _ = e.m.pg.ReconcileObligationReadiness(taskIDInt, round.ID)
 
 	e.emitActivity(t, db.Activity{
@@ -202,10 +216,10 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 		Summary: fmt.Sprintf("第 %d 轮评估规划", e.nextPlannerRound(t.ID)),
 	})
 	triggers := t.drainTriggers()
-	var processedChunkEventIDs []int64
+	var processedEventIDs []int64
 	if chunkEvents, evErr := e.m.pg.ListUnprocessedAssessmentEventsByType(taskIDInt, "code_audit_chunk_completed", 30); evErr == nil && len(chunkEvents) > 0 {
 		for _, ev := range chunkEvents {
-			processedChunkEventIDs = append(processedChunkEventIDs, ev.ID)
+			processedEventIDs = append(processedEventIDs, ev.ID)
 			var p struct {
 				IntentID             int64  `json:"intent_id"`
 				CodeAuditRunID       int64  `json:"code_audit_run_id"`
@@ -227,6 +241,17 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 				IntentID: p.IntentID,
 				Detail:   detail,
 			})
+		}
+	}
+	for _, evType := range []string{"new_asset", "new_entry", "profile_change", "evidence_invalidated", "knowledge_conflict", "code_version_change"} {
+		if evs, evErr := e.m.pg.ListUnprocessedAssessmentEventsByType(taskIDInt, evType, 20); evErr == nil && len(evs) > 0 {
+			for _, ev := range evs {
+				processedEventIDs = append(processedEventIDs, ev.ID)
+				triggers = append(triggers, agent.TriggerEvent{
+					Kind:   evType,
+					Detail: fmt.Sprintf("评估事件[%s]: %s", evType, strings.TrimSpace(string(ev.Payload))),
+				})
+			}
 		}
 	}
 	lifecycle := t.lifecycleSnapshot()
@@ -255,8 +280,8 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 	e.BeginLLMCall(t.ID)
 	completed, reason, planErr := planner.PlanAssessment(ctx, ac, e.m.assetsForTask(t), t.Store, triggers, emit)
 	e.EndLLMCall(t.ID)
-	if planErr == nil && ctx.Err() == nil && len(processedChunkEventIDs) > 0 {
-		_ = e.m.pg.MarkAssessmentEventIDsProcessed(taskIDInt, processedChunkEventIDs)
+	if planErr == nil && ctx.Err() == nil && len(processedEventIDs) > 0 {
+		_ = e.m.pg.MarkAssessmentEventIDsProcessed(taskIDInt, processedEventIDs)
 	}
 
 	switch {

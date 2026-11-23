@@ -204,6 +204,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	})
 	s.engine.SetCodeAuditBatchExecutor(s.runAssessmentCodeAuditBatch)
 	s.engine.SetCodeInvestigateExecutor(s.runAssessmentCodeInvestigate)
+	s.engine.SetDynamicVerifyExecutor(s.runAssessmentDynamicVerify)
+	s.engine.SetAssessmentHypothesisSync(func(ctx context.Context, taskID string, roundID int64) error {
+		taskNum, perr := strconv.ParseInt(taskID, 10, 64)
+		if perr != nil || taskNum <= 0 {
+			return nil
+		}
+		return s.ensureStaticHypothesisObligations(ctx, taskNum, roundID)
+	})
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.

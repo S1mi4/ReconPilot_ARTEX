@@ -410,6 +410,10 @@ func (s *Server) BuildAssessmentCoveragePlan(ctx context.Context, taskID string)
 		}
 	}
 
+	if err := s.ensureStaticHypothesisObligationsForRound(t, round, runtimeIDs); err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+
 	// Reconcile pending -> ready / blocked purely from dependency_ids and credential_ref.
 	_, _, err = s.m.pg.ReconcileObligationReadiness(taskNum, round.ID)
 	if err != nil {

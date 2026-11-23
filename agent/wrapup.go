@@ -27,6 +27,7 @@ var WrapupMaxTurnsOverride func(agentKey string) (int, bool)
 // (定义在 worker.go),planner/mainagent 各有一版;未命中的(自定义 agent)走通用兜底。
 var wrapupDefaults = map[string]string{
 	"worker":             settleWrapUpPrompt,
+	"dynamic_verify":     dynamicVerifyWrapUpDefault,
 	"code_investigate":   codeInvestigateWrapUpDefault,
 	"planner":            plannerWrapUpDefault,
 	"assessment_planner": assessmentPlannerWrapUpDefault,
@@ -37,6 +38,7 @@ var wrapupDefaults = map[string]string{
 // 均给 10 轮,保证收尾阶段有足够步数落库。未命中走 genericWrapupTurns。
 var wrapupTurnDefaults = map[string]int{
 	"worker":             10,
+	"dynamic_verify":     10,
 	"code_investigate":   10,
 	"planner":            10,
 	"assessment_planner": 10,
@@ -44,6 +46,8 @@ var wrapupTurnDefaults = map[string]int{
 }
 
 const genericWrapupTurns = 10
+
+const dynamicVerifyWrapUpDefault = "你本次动态验证（dynamic_verify）的步数/时长即将用尽。不要再执行新的命令、探测或浏览器操作。请立刻：(1) 把本次已核实的发现/环境差异写回——确认漏洞调用 report_finding，新资产 insert_assets，关键事实 record_fact，需要反向查码或更新画像则调用 record_profile_claim / add_exploration_obligation；(2) 必须调用 submit_dynamic_verification 提交本次执行结果（如未触达/未完成如实标为 unreproduced / dependency_missing / failed 并列出缺失前置）；(3) 最后单独用一句话纯文本概括本次动态验证结果。"
 
 const codeInvestigateWrapUpDefault = "你本次定向代码排查的步数/时长即将用尽。不要再展开新的大范围读码。请立刻：(1) 基于本次已真实读取并核验的文件与行号，调用 submit_investigation_result 提交最终排查结论与证据锚点（如有缺口如实保留）；(2) 若有必要写入关键事实，补充简明 record_fact；(3) 最后用一句话纯文本概括排查结论。"
 
@@ -122,10 +126,13 @@ var (
 
 var taskTimeoutWrapupDefaults = map[string]string{
 	"worker":             workerTaskTimeoutDefault,
+	"dynamic_verify":     dynamicVerifyTaskTimeoutDefault,
 	"code_investigate":   codeInvestigateTaskTimeoutDefault,
 	"planner":            plannerTaskTimeoutDefault,
 	"assessment_planner": assessmentPlannerTaskTimeoutDefault,
 }
+
+const dynamicVerifyTaskTimeoutDefault = "**整个评估任务已到达超时上限，即将结束**。不要再发起任何新的命令/HTTP 探测。请立刻把手头已取得真实运行或流量证据的发现落库（report_finding / record_fact / record_profile_claim），并调用 submit_dynamic_verification 提交客观结果分类与剩余缺口，最后单独用一句话总结本次动态验证结论。"
 
 const codeInvestigateTaskTimeoutDefault = "**整个评估任务已到达超时上限，即将结束**。不要再读取新文件。请立刻基于本次已真实读取并核验的代码证据调用 submit_investigation_result 落库结论（无法确认的明确标明未完成/待确认），最后单独用一句话总结本次代码排查结论。"
 

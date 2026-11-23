@@ -225,6 +225,13 @@ var builtinAgents = []builtinAgent{
 		{"ProfileVersion", "当前画像快照版本", "1", "runtime"},
 		{"Scope", "当前评估范围说明", "仅审计已上传模块", "runtime"},
 	}, false, nil},
+	{"dynamic_verify", "动态验证", "worker", "白盒驱动评估模式的动态环境核实与实证验证 Worker：基于结构化工作单、只读代码与画像切片执行真实探测（HTTP/Bash/浏览器/流量），提交可核验的执行或流量证据，严禁将单次未复现当成已修复。", []promptVar{
+		{"RoundNo", "当前评估轮次编号", "1", "runtime"},
+		{"ProfileVersion", "当前画像快照版本", "1", "runtime"},
+		{"EnvironmentSummary", "当前授权测试环境与接入方式摘要", "default (http://127.0.0.1:8080, direct)", "runtime"},
+		{"Scope", "当前评估授权范围与外部依赖边界", "仅测试已授权实例，外部依赖禁止主动探测", "runtime"},
+		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
+	}, false, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
 	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
 }

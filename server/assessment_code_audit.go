@@ -462,6 +462,7 @@ func (s *Server) runAssessmentCodeAuditBatch(ctx context.Context, t *Task, slotN
 			}
 			t.Notify()
 			if ev.CandidatesRegistered > 0 {
+				_ = s.ensureStaticHypothesisObligations(ctx, taskIDInt, obRoundID)
 				t.NotifyFinding(intent.ID, fmt.Sprintf("白盒审计 run #%d 分片 %d/%d 登记 %d 个静态候选", run.ID, ev.ChunkIndex, ev.ChunksTotal, ev.CandidatesRegistered))
 			}
 		},
@@ -561,6 +562,8 @@ func (s *Server) runAssessmentCodeAuditBatch(ctx context.Context, t *Task, slotN
 			IntentState:    "blocked",
 		}, nil
 	}
+
+	_ = s.ensureStaticHypothesisObligations(ctx, taskIDInt, obRoundID)
 
 	return AssessmentExecResult{
 		Outcome:           pgdb.AttemptSupported,
@@ -801,6 +804,7 @@ func (s *Server) runAssessmentCodeInvestigate(ctx context.Context, t *Task, slot
 			IntentState:   "blocked",
 		}, nil
 	}
+	s.ensureDynamicHypothesisFromInvestigate(taskIDInt, obRoundID, t, ob, outcome)
 	attemptOutcome := pgdb.AttemptSupported
 	if outcome.Verdict == "cleared" {
 		attemptOutcome = pgdb.AttemptDisproved

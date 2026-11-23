@@ -154,10 +154,12 @@ type Engine struct {
 	slotState            sync.Map // task/slot -> slotAvailability
 	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
 	claimMu              sync.Map // taskID -> *sync.Mutex (serializes assessment claim/quota checks)
-	// assessment mode specialized executor hooks (Step 5 / tests) and catch-up plan builder:
-	codeAuditBatchExec    AssessmentExecutorFunc
-	codeInvestigateExec   AssessmentExecutorFunc
-	assessmentPlanBuilder func(ctx context.Context, taskID string) error
+	// assessment mode specialized executor hooks (Step 5/6 / tests) and catch-up builders:
+	codeAuditBatchExec       AssessmentExecutorFunc
+	codeInvestigateExec      AssessmentExecutorFunc
+	dynamicVerifyExec        AssessmentExecutorFunc
+	assessmentPlanBuilder    func(ctx context.Context, taskID string) error
+	assessmentHypothesisSync func(ctx context.Context, taskID string, roundID int64) error
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness    func() bool
@@ -1201,17 +1203,25 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var ranSpecialized bool
 	var specRes AssessmentExecResult
 	if t.AssessmentMode && !hasChatMessage &&
-		(meta.ExecutionMode == db.ExecModeCodeAuditBatch || meta.ExecutionMode == db.ExecModeCodeInvestigate) {
-		ranSpecialized = true
-		execFn := e.codeInvestigateExec
-		if meta.ExecutionMode == db.ExecModeCodeAuditBatch {
+		(meta.ExecutionMode == db.ExecModeCodeAuditBatch || meta.ExecutionMode == db.ExecModeCodeInvestigate || meta.ExecutionMode == db.ExecModeDynamicVerify) {
+		var execFn AssessmentExecutorFunc
+		switch meta.ExecutionMode {
+		case db.ExecModeCodeAuditBatch:
 			execFn = e.codeAuditBatchExec
+		case db.ExecModeCodeInvestigate:
+			execFn = e.codeInvestigateExec
+		case db.ExecModeDynamicVerify:
+			execFn = e.dynamicVerifyExec
 		}
-		specRes, err = e.runSpecializedAssessmentExecutor(workCtx, t, name, intent, meta, taskEmit, execFn, meta.ExecutionMode)
-		if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
-			e.proxyFailure(t.ID, err)
+		if execFn != nil || meta.ExecutionMode != db.ExecModeDynamicVerify {
+			ranSpecialized = true
+			specRes, err = e.runSpecializedAssessmentExecutor(workCtx, t, name, intent, meta, taskEmit, execFn, meta.ExecutionMode)
+			if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
+				e.proxyFailure(t.ID, err)
+			}
 		}
-	} else {
+	}
+	if !ranSpecialized {
 		e.BeginLLMCall(t.ID)
 		if hasChatMessage {
 			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assetsForTask(t), t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)

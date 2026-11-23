@@ -782,7 +782,7 @@ func (d *DB) DispatchAssessmentIntent(in DispatchAssessmentIntentInput) (*Dispat
 	if summary == "" {
 		return nil, errors.New("summary cannot be empty")
 	}
-	if err := rejectSecretInProfileText(summary, in.IdempotencyKey); err != nil {
+	if err := rejectSecretInProfileText(summary, in.IdempotencyKey, string(in.WorkOrder)); err != nil {
 		return nil, err
 	}
 	execMode := strings.TrimSpace(in.ExecutionMode)
@@ -1381,6 +1381,9 @@ FOR UPDATE`, in.AttemptID).Scan(&attemptTask, &attemptOb, &attemptStatus, &attem
 			attemptExecMode != "" && attemptExecMode != ExecModeDynamicVerify:
 			insufficient = true
 			rejectionReason = fmt.Sprintf("静态只读调查（%s）不能替代入口/身份动态验证（%s）", attemptExecMode, dimension)
+		case attemptExecMode == ExecModeDynamicVerify && evKind != string(EvidenceExecution) && evKind != string(EvidenceTraffic):
+			insufficient = true
+			rejectionReason = fmt.Sprintf("动态验证（dynamic_verify）必须绑定 execution_output 或 traffic 证据引用，不能仅凭 %s 推进覆盖", evKind)
 		default:
 			if _, needsExec := executionDimensions[dimension]; needsExec && !hasExecAssoc {
 				insufficient = true
@@ -1693,4 +1696,149 @@ UPDATE task_test_attempts
 SET code_audit_run_id=$3
 WHERE id=$1 AND task_id=$2`, attemptID, taskID, runID)
 	return err
+}
+
+// PublishedCodeAuditFindingSummary summarizes one published static code audit
+// candidate and its linked finding (if recorded) for dynamic verification.
+type PublishedCodeAuditFindingSummary struct {
+	CandidateID       int64           `json:"candidate_id,omitempty"`
+	RunID             int64           `json:"run_id,omitempty"`
+	FindingID         *int64          `json:"finding_id,omitempty"`
+	TargetEntityID    *int64          `json:"target_entity_id,omitempty"`
+	ServiceName       string          `json:"service_name,omitempty"`
+	RelativePath      string          `json:"relative_path,omitempty"`
+	CodebaseID        string          `json:"codebase_id,omitempty"`
+	VersionID         string          `json:"version_id,omitempty"`
+	CandidateKey      string          `json:"candidate_key"`
+	VulnClass         string          `json:"vulnclass,omitempty"`
+	Title             string          `json:"title,omitempty"`
+	Severity          string          `json:"severity,omitempty"`
+	RegistrationTier  string          `json:"registration_tier,omitempty"`
+	VerifyLevel       string          `json:"verify_level,omitempty"`
+	Candidate         json.RawMessage `json:"candidate,omitempty"`
+	CodeAuditEvidence json.RawMessage `json:"code_audit_evidence,omitempty"`
+}
+
+// ListPublishedCodeAuditFindings returns published static A/B audit candidates
+// and any static theoretical findings on taskID so dynamic_verify can generate
+// verification hypotheses and anchor dynamic work orders to static findings.
+func (d *DB) ListPublishedCodeAuditFindings(taskID int64) ([]PublishedCodeAuditFindingSummary, error) {
+	if d == nil || taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.Query(`
+SELECT c.id, c.run_id, f.id, r.target_entity_id, COALESCE(r.target_name,''), COALESCE(r.relative_path,''),
+       COALESCE(r.codebase_id,''), COALESCE(r.version_id,''), c.candidate_key,
+       COALESCE(f.vulnclass, c.candidate->>'category', ''),
+       COALESCE(f.name, c.candidate->>'title', ''),
+       COALESCE(f.severity, c.candidate->>'severity', ''),
+       COALESCE(c.candidate->>'registration_tier', 'A'),
+       COALESCE(f.verify_level, 'theoretical'),
+       c.candidate,
+       COALESCE(f.code_audit_evidence, '{}'::jsonb)
+FROM task_code_audit_candidates c
+JOIN task_code_audit_runs r ON r.id = c.run_id
+LEFT JOIN LATERAL (
+    SELECT id, vulnclass, name, severity, verify_level, code_audit_evidence
+    FROM findings
+    WHERE task_id = r.task_id
+      AND code_audit_evidence->>'candidate_key' = c.candidate_key
+    ORDER BY id DESC LIMIT 1
+) f ON true
+WHERE r.task_id = $1 AND c.review_status = 'published'
+ORDER BY c.id ASC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PublishedCodeAuditFindingSummary
+	seenFindingID := map[int64]bool{}
+	seenCandKey := map[string]bool{}
+	for rows.Next() {
+		var item PublishedCodeAuditFindingSummary
+		var fID, targetEntID sql.NullInt64
+		var candRaw, evRaw []byte
+		if err := rows.Scan(
+			&item.CandidateID, &item.RunID, &fID, &targetEntID,
+			&item.ServiceName, &item.RelativePath, &item.CodebaseID, &item.VersionID,
+			&item.CandidateKey, &item.VulnClass, &item.Title, &item.Severity,
+			&item.RegistrationTier, &item.VerifyLevel, &candRaw, &evRaw,
+		); err != nil {
+			return nil, err
+		}
+		if fID.Valid {
+			v := fID.Int64
+			item.FindingID = &v
+			seenFindingID[v] = true
+		}
+		if targetEntID.Valid {
+			v := targetEntID.Int64
+			item.TargetEntityID = &v
+		}
+		if len(candRaw) > 0 {
+			item.Candidate = json.RawMessage(candRaw)
+		}
+		if len(evRaw) > 0 && string(evRaw) != "{}" {
+			item.CodeAuditEvidence = json.RawMessage(evRaw)
+		}
+		if item.CandidateKey != "" {
+			seenCandKey[item.CandidateKey] = true
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Include any static theoretical findings not paired with a published candidate row.
+	fRows, err := d.Query(`
+SELECT id, COALESCE(vulnclass,''), COALESCE(name,''), COALESCE(severity,''), COALESCE(verify_level,'theoretical'),
+       COALESCE(code_audit_evidence, '{}'::jsonb)
+FROM findings
+WHERE task_id = $1 AND COALESCE(verify_level,'') = 'theoretical'
+ORDER BY id ASC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer fRows.Close()
+	for fRows.Next() {
+		var fid int64
+		var vc, title, sev, vlevel string
+		var evRaw []byte
+		if err := fRows.Scan(&fid, &vc, &title, &sev, &vlevel, &evRaw); err != nil {
+			return nil, err
+		}
+		if seenFindingID[fid] {
+			continue
+		}
+		candKey := fmt.Sprintf("finding-%d", fid)
+		var evMap map[string]any
+		if len(evRaw) > 0 {
+			_ = json.Unmarshal(evRaw, &evMap)
+		}
+		if k, ok := evMap["candidate_key"].(string); ok && strings.TrimSpace(k) != "" {
+			candKey = strings.TrimSpace(k)
+		}
+		if seenCandKey[candKey] {
+			continue
+		}
+		var item PublishedCodeAuditFindingSummary
+		fidCopy := fid
+		item.FindingID = &fidCopy
+		item.CandidateKey = candKey
+		item.VulnClass = vc
+		item.Title = title
+		item.Severity = sev
+		item.RegistrationTier = "A"
+		item.VerifyLevel = vlevel
+		if len(evRaw) > 0 && string(evRaw) != "{}" {
+			item.CodeAuditEvidence = json.RawMessage(evRaw)
+		}
+		if sName, ok := evMap["relative_path"].(string); ok {
+			item.RelativePath = sName
+		}
+		out = append(out, item)
+	}
+	return out, fRows.Err()
 }
