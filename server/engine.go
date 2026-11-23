@@ -155,11 +155,12 @@ type Engine struct {
 	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
 	claimMu              sync.Map // taskID -> *sync.Mutex (serializes assessment claim/quota checks)
 	// assessment mode specialized executor hooks (Step 5/6 / tests) and catch-up builders:
-	codeAuditBatchExec       AssessmentExecutorFunc
-	codeInvestigateExec      AssessmentExecutorFunc
-	dynamicVerifyExec        AssessmentExecutorFunc
-	assessmentPlanBuilder    func(ctx context.Context, taskID string) error
-	assessmentHypothesisSync func(ctx context.Context, taskID string, roundID int64) error
+	codeAuditBatchExec        AssessmentExecutorFunc
+	codeInvestigateExec       AssessmentExecutorFunc
+	dynamicVerifyExec         AssessmentExecutorFunc
+	assessmentPlanBuilder     func(ctx context.Context, taskID string) error
+	assessmentHypothesisSync  func(ctx context.Context, taskID string, roundID int64) error
+	assessmentEventReconciler func(ctx context.Context, taskID string, roundID int64) ([]agent.TriggerEvent, []int64, error)
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness    func() bool

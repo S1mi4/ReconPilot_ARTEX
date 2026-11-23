@@ -929,11 +929,12 @@ WHERE task_id=$1 AND id<=$2 AND NOT processed`, taskID, upToID)
 // 各状态计数仅针对当前 open 轮次的必需义务；无适用义务的维度显示"不适用"，
 // 不显示 100%（§6.2），由前端基于 RequiredTotal=0 判断。
 type AssessmentCompletionReport struct {
-	TaskID      int64    `json:"task_id"`
-	RoundID     int64    `json:"round_id"`
-	RoundNo     int      `json:"round_no"`
-	CanComplete bool     `json:"can_complete"`
-	Reasons     []string `json:"reasons,omitempty"`
+	TaskID         int64    `json:"task_id"`
+	RoundID        int64    `json:"round_id"`
+	RoundNo        int      `json:"round_no"`
+	ProfileVersion int      `json:"profile_version,omitempty"`
+	CanComplete    bool     `json:"can_complete"`
+	Reasons        []string `json:"reasons,omitempty"`
 
 	// 必需义务按状态计数（当前 open 轮次）。
 	Obligations struct {
@@ -1001,7 +1002,7 @@ func (d *DB) AssessmentCompletionCheck(taskID int64) (*AssessmentCompletionRepor
 		addReason("没有进行中的评估轮次，无法进行完成判定")
 		return report, nil
 	}
-	report.RoundID, report.RoundNo = round.ID, round.RoundNo
+	report.RoundID, report.RoundNo, report.ProfileVersion = round.ID, round.RoundNo, round.ProfileVersion
 
 	// 必需义务统计 + 证据/凭证核验。缺凭证检查覆盖全部适用义务（含已标
 	// satisfied 的）——satisfied 不能凭空免除凭证要求；仅不适用义务除外
@@ -1192,30 +1193,57 @@ WHERE task_id=$1 AND NOT processed`, taskID).Scan(&report.UnprocessedEvents); er
 // （此前三步分开提交时，中途失败无法重试——终态守卫会拒绝一切后续写入）。
 // 队列在锁下仍非空时返回 won=false（非错误），调用方让任务继续运行。
 func (d *DB) FinalizeAssessmentCompletion(taskID, roundID int64, report json.RawMessage) (active int64, started *time.Time, won bool, err error) {
+	return d.FinalizeAssessmentCompletionAtVersion(taskID, roundID, 0, report)
+}
+
+// FinalizeAssessmentCompletionAtVersion atomically checks task/round/plan version,
+// unprocessed events, active intents, queued whitebox runs, and unfinished obligations
+// under row locks before committing done status + round closure + phase completed (§6.4).
+func (d *DB) FinalizeAssessmentCompletionAtVersion(taskID, roundID int64, expectedProfileVersion int, report json.RawMessage) (active int64, started *time.Time, won bool, err error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, nil, false, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// 锁任务行：串行化与评估模式下白盒入队（CreateTaskCodeAudit 对
-	// assessment_mode 任务行 FOR UPDATE）的并发。
+	// 锁任务行与当前开放轮次：串行化与并发白盒入队、增量事件、版本变化、暂停/超时的写入。
 	var status string
-	if err := tx.QueryRow(`SELECT status FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status); err != nil {
+	var explorationID int64
+	if err := tx.QueryRow(`SELECT status, exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &explorationID); err != nil {
 		return 0, nil, false, err
 	}
 	if status == "done" || status == "failed" || status == "timeout" {
 		return 0, nil, false, nil
 	}
-	// 复核白盒队列：契约检查与终态提交之间不允许出现新的 queued/running 工作。
-	var queuedRuns int64
-	if err := tx.QueryRow(`SELECT count(*) FROM task_code_audit_runs
-WHERE task_id=$1 AND status IN ('queued','running')`, taskID).Scan(&queuedRuns); err != nil {
-		return 0, nil, false, err
-	}
-	if queuedRuns > 0 {
+	var roundStatus string
+	var roundProfileVer int
+	err = tx.QueryRow(`SELECT status, profile_version FROM task_assessment_rounds WHERE id=$1 AND task_id=$2 FOR UPDATE`,
+		roundID, taskID).Scan(&roundStatus, &roundProfileVer)
+	if err == sql.ErrNoRows || (err == nil && roundStatus != "open") {
 		return 0, nil, false, nil
 	}
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if expectedProfileVersion > 0 && roundProfileVer != expectedProfileVersion {
+		return 0, nil, false, nil
+	}
+
+	// 复核并发窗口内不得出现新的白盒运行、未处理事件、活动意图或未满足/失效义务（§6.4）。
+	var queuedRuns, activeIntents, unprocessedEvents, unfinishedObs int64
+	if err := tx.QueryRow(`
+SELECT
+  (SELECT count(*) FROM task_code_audit_runs WHERE task_id=$1 AND status IN ('queued','running')),
+  (SELECT count(*) FROM exploration_nodes WHERE exploration_id=$2 AND kind='intent' AND state IN ('open','running')),
+  (SELECT count(*) FROM task_assessment_events WHERE task_id=$1 AND NOT processed),
+  (SELECT count(*) FROM task_coverage_obligations WHERE task_id=$1 AND round_id=$3 AND required AND status IN ('pending','ready','running','blocked','stale'))`,
+		taskID, explorationID, roundID).Scan(&queuedRuns, &activeIntents, &unprocessedEvents, &unfinishedObs); err != nil {
+		return 0, nil, false, err
+	}
+	if queuedRuns > 0 || activeIntents > 0 || unprocessedEvents > 0 || unfinishedObs > 0 {
+		return 0, nil, false, nil
+	}
+
 	// Guarded 终态：与常规路径的 done/timeout 竞态由首写者胜出解决。
 	err = tx.QueryRow(`
 UPDATE tasks
@@ -1232,11 +1260,12 @@ UPDATE tasks
 	if err != nil {
 		return 0, nil, false, err
 	}
-	// 关闭当前轮次并落完成报告：轮次已被并发关闭时整体回滚（不覆盖历史）。
+	// 关闭当前轮次并落完成报告：轮次已被并发关闭或版本已推进时整体回滚（不覆盖历史）。
 	result, err := tx.Exec(`
 UPDATE task_assessment_rounds
    SET status='completed', completion_report=$3, completed_at=now()
- WHERE id=$2 AND task_id=$1 AND status='open'`, taskID, roundID, string(report))
+ WHERE id=$2 AND task_id=$1 AND status='open' AND ($4 <= 0 OR profile_version=$4)`,
+		taskID, roundID, string(report), expectedProfileVersion)
 	if err != nil {
 		return 0, nil, false, err
 	}

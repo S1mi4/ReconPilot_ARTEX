@@ -348,6 +348,21 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
 				t.writes.Assets++
+				svcIP := strings.TrimSpace(item.ServiceIP)
+				if svcIP == "" {
+					svcIP = strings.TrimSpace(item.IP)
+				}
+				t.insertedAssets = append(t.insertedAssets, InsertedAssetSummary{
+					ID:          id,
+					Type:        typ,
+					URL:         strings.TrimSpace(item.URL),
+					Method:      strings.TrimSpace(item.Method),
+					Domain:      strings.TrimSpace(item.Domain),
+					IP:          svcIP,
+					ServiceName: strings.TrimSpace(item.ServiceName),
+					Port:        item.Port,
+					AppName:     strings.TrimSpace(item.AppName),
+				})
 				t.anchorOwner(id)
 				if taskID > 0 {
 					var sourceNodeID *int64

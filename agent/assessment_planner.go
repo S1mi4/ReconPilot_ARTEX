@@ -69,6 +69,8 @@ func (t *ToolSet) AssessmentPlannerTools() []actool.CoreTool {
 		t.recordProfileClaimTool(),
 		t.steerWorkTool(),
 		t.killWorkTool(),
+		t.reopenStaleObligationsTool(),
+		t.mergeHypothesisObligationsTool(),
 		t.requestAssessmentCompletionTool(),
 	}
 }
@@ -594,6 +596,74 @@ func (t *ToolSet) recordProfileClaimTool() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			return jsonResult(map[string]any{"claim": claim, "conflicted": conflicted})
+		})
+}
+
+func (t *ToolSet) reopenStaleObligationsTool() actool.CoreTool {
+	return t.writeAssessmentTool("reopen_stale_obligations",
+		"将因代码/配置/环境变化失效（stale）的义务重新打开为待重测/就绪状态。可传入 obligation_ids 列表，或省略以重开当前轮次全部 stale 义务。",
+		obj(map[string]any{
+			"obligation_ids": map[string]any{
+				"type":        "array",
+				"items":       idp("覆盖义务 ID"),
+				"description": "可选：指定要重开的 stale 义务 ID 列表；省略则重开本轮全部 stale 义务",
+			},
+			"reason": str("重开依据说明"),
+		}, "reason"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				ObligationIDs []json.RawMessage `json:"obligation_ids"`
+				Reason        string            `json:"reason"`
+			}
+			_ = json.Unmarshal(in, &a)
+			if strings.TrimSpace(a.Reason) == "" {
+				return actool.Errorf("reason 必填"), nil
+			}
+			ids := pidList(a.ObligationIDs)
+			res, err := t.assessment.PG.ReopenStaleObligations(t.assessment.TaskID, t.assessment.RoundID, ids, strings.TrimSpace(a.Reason))
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(res)
+		})
+}
+
+func (t *ToolSet) mergeHypothesisObligationsTool() actool.CoreTool {
+	return t.writeAssessmentTool("merge_hypothesis_obligations",
+		"合并重复的开放 hypothesis（静态线索/动态异常假设）义务，保留主义务与合并来源谱系。不可用于非 hypothesis 的必需覆盖义务。",
+		obj(map[string]any{
+			"primary_id": idp("保留为主义务的 hypothesis 义务 ID；与 duplicate_ids 均省略时按语义自动去重合并"),
+			"duplicate_ids": map[string]any{
+				"type":        "array",
+				"items":       idp("重复 hypothesis 义务 ID"),
+				"description": "待合并并归档为重复项的 hypothesis 义务 ID 列表",
+			},
+			"reason": str("合并原因说明（自动去重时可选）"),
+		}),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				PrimaryID    json.RawMessage   `json:"primary_id"`
+				DuplicateIDs []json.RawMessage `json:"duplicate_ids"`
+				Reason       string            `json:"reason"`
+			}
+			_ = json.Unmarshal(in, &a)
+			primaryID := pid(a.PrimaryID)
+			dupIDs := pidList(a.DuplicateIDs)
+			if primaryID == 0 && len(dupIDs) == 0 {
+				res, err := t.assessment.PG.MergeDuplicateHypothesisObligations(t.assessment.TaskID, t.assessment.RoundID)
+				if err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				return jsonResult(res)
+			}
+			if primaryID == 0 || len(dupIDs) == 0 {
+				return actool.Errorf("指定合并时 primary_id 与 duplicate_ids 均需提供；或均省略以执行自动去重"), nil
+			}
+			res, err := t.assessment.PG.MergeHypothesisObligations(t.assessment.TaskID, t.assessment.RoundID, primaryID, dupIDs, strings.TrimSpace(a.Reason))
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(res)
 		})
 }
 

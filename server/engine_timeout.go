@@ -295,7 +295,13 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, reason string) {
 		case cErr != nil:
 			log.Printf("[assessment] task %s 收尾完成判定失败(按 timeout 收场): %v", t.ID, cErr)
 		case completed:
-			status = "done"
+			log.Printf("[assessment] task %s 超时收尾程序完成契约通过，当前轮次已原子落盘 done", t.ID)
+			e.emitActivity(t, db.Activity{
+				Worker:  "system",
+				Kind:    "text",
+				Summary: "收尾程序完成契约通过，当前轮次全部必需覆盖义务与证据已对账完毕，任务以 done 原子落盘",
+			})
+			return
 		case report != nil:
 			log.Printf("[assessment] task %s 收尾完成契约未通过(按 timeout 收场): %s", t.ID, strings.Join(report.Reasons, "；"))
 		}

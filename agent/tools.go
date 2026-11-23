@@ -78,10 +78,11 @@ type ToolSet struct {
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
-	ownerNode int64
-	GoalMet   bool
-	Reason    string
-	writes    WriteCounts
+	ownerNode      int64
+	GoalMet        bool
+	Reason         string
+	writes         WriteCounts
+	insertedAssets []InsertedAssetSummary
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -178,10 +179,36 @@ func (w WriteCounts) String() string {
 	return summary
 }
 
+// InsertedAssetSummary captures a compact, secret-free record of an asset persisted
+// through insert_assets so assessment orchestration can incrementally materialize
+// new_asset / new_entry targets and obligations.
+type InsertedAssetSummary struct {
+	ID          int64  `json:"id"`
+	Type        string `json:"type"`
+	URL         string `json:"url,omitempty"`
+	Method      string `json:"method,omitempty"`
+	Domain      string `json:"domain,omitempty"`
+	IP          string `json:"ip,omitempty"`
+	ServiceName string `json:"service_name,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	AppName     string `json:"app_name,omitempty"`
+}
+
 // Writes reports what this run wrote back, split by node kind (so the engine can
 // tell "explored but persisted nothing" apart from a completed intent, and log an
 // honest breakdown instead of calling assets/findings "facts").
 func (t *ToolSet) Writes() WriteCounts { return t.writes }
+
+// InsertedAssets returns a snapshot of the secret-free asset summaries persisted via
+// insert_assets during this run.
+func (t *ToolSet) InsertedAssets() []InsertedAssetSummary {
+	if len(t.insertedAssets) == 0 {
+		return nil
+	}
+	out := make([]InsertedAssetSummary, len(t.insertedAssets))
+	copy(out, t.insertedAssets)
+	return out
+}
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}

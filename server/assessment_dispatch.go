@@ -56,6 +56,13 @@ func (e *Engine) SetAssessmentHypothesisSync(fn func(ctx context.Context, taskID
 	e.assessmentHypothesisSync = fn
 }
 
+// SetAssessmentEventReconciler installs the incremental reconciliation hook that
+// turns pending events (new assets/entries, version changes) into obligations and
+// stale invalidations before Planner inspects coverage.
+func (e *Engine) SetAssessmentEventReconciler(fn func(ctx context.Context, taskID string, roundID int64) ([]agent.TriggerEvent, []int64, error)) {
+	e.assessmentEventReconciler = fn
+}
+
 func (e *Engine) claimMutex(taskID string) *sync.Mutex {
 	v, _ := e.claimMu.LoadOrStore(taskID, &sync.Mutex{})
 	return v.(*sync.Mutex)
@@ -208,6 +215,17 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 	if e.assessmentHypothesisSync != nil {
 		_ = e.assessmentHypothesisSync(ctx, t.ID, round.ID)
 	}
+	var incTriggers []agent.TriggerEvent
+	if e.assessmentEventReconciler != nil {
+		var recErr error
+		incTriggers, _, recErr = e.assessmentEventReconciler(ctx, t.ID, round.ID)
+		if recErr != nil && ctx.Err() == nil {
+			log.Printf("[assessment-planner] task %s 增量对账失败: %v", t.ID, recErr)
+		}
+		if refreshed, rErr := e.m.pg.OpenAssessmentRound(taskIDInt); rErr == nil && refreshed != nil {
+			round = refreshed
+		}
+	}
 	_, _, _ = e.m.pg.ReconcileObligationReadiness(taskIDInt, round.ID)
 
 	e.emitActivity(t, db.Activity{
@@ -216,6 +234,7 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 		Summary: fmt.Sprintf("第 %d 轮评估规划", e.nextPlannerRound(t.ID)),
 	})
 	triggers := t.drainTriggers()
+	triggers = append(triggers, incTriggers...)
 	var processedEventIDs []int64
 	if chunkEvents, evErr := e.m.pg.ListUnprocessedAssessmentEventsByType(taskIDInt, "code_audit_chunk_completed", 30); evErr == nil && len(chunkEvents) > 0 {
 		for _, ev := range chunkEvents {
@@ -273,6 +292,9 @@ func (e *Engine) runAssessmentPlannerRound(ctx context.Context, t *Task, planner
 		ScopeNotes:       cfg.ScopeNotes,
 		WorkerSlots:      e.taskSlotCount(t),
 		RequestCompletion: func(reason string) (bool, *db.AssessmentCompletionReport, error) {
+			if len(processedEventIDs) > 0 {
+				_ = e.m.pg.MarkAssessmentEventIDsProcessed(taskIDInt, processedEventIDs)
+			}
 			return e.m.CompleteAssessment(t)
 		},
 	}

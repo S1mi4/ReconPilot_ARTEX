@@ -103,20 +103,21 @@ type DynamicVerifyContext struct {
 // DynamicVerifyOutcome captures the structured verdict persisted via
 // submit_dynamic_verification plus bidirectional feedback counters.
 type DynamicVerifyOutcome struct {
-	Submitted                  bool     `json:"submitted"`
-	Verdict                    string   `json:"verdict"`
-	Summary                    string   `json:"summary"`
-	BlockedReason              string   `json:"blocked_reason,omitempty"`
-	ObservedURL                string   `json:"observed_url,omitempty"`
-	ObservedVersion            string   `json:"observed_version,omitempty"`
-	VersionMatched             *bool    `json:"version_matched,omitempty"`
-	TrafficIDs                 []string `json:"traffic_ids,omitempty"`
-	CommandEvidence            []string `json:"command_evidence,omitempty"`
-	MissingPreconditions       []string `json:"missing_preconditions,omitempty"`
-	ReverseInvestigateSummary  string   `json:"reverse_investigate_summary,omitempty"`
-	FeedbackClaimsCreated      int      `json:"feedback_claims_created,omitempty"`
-	FeedbackObligationsCreated int      `json:"feedback_obligations_created,omitempty"`
-	EvidenceRefID              *int64   `json:"evidence_ref_id,omitempty"`
+	Submitted                  bool                   `json:"submitted"`
+	Verdict                    string                 `json:"verdict"`
+	Summary                    string                 `json:"summary"`
+	BlockedReason              string                 `json:"blocked_reason,omitempty"`
+	ObservedURL                string                 `json:"observed_url,omitempty"`
+	ObservedVersion            string                 `json:"observed_version,omitempty"`
+	VersionMatched             *bool                  `json:"version_matched,omitempty"`
+	TrafficIDs                 []string               `json:"traffic_ids,omitempty"`
+	CommandEvidence            []string               `json:"command_evidence,omitempty"`
+	MissingPreconditions       []string               `json:"missing_preconditions,omitempty"`
+	ReverseInvestigateSummary  string                 `json:"reverse_investigate_summary,omitempty"`
+	FeedbackClaimsCreated      int                    `json:"feedback_claims_created,omitempty"`
+	FeedbackObligationsCreated int                    `json:"feedback_obligations_created,omitempty"`
+	EvidenceRefID              *int64                 `json:"evidence_ref_id,omitempty"`
+	InsertedAssets             []InsertedAssetSummary `json:"inserted_assets,omitempty"`
 }
 
 var forbiddenDynamicVerifyTools = map[string]bool{
@@ -785,5 +786,8 @@ func (w *Worker) ExecuteDynamicVerify(
 		}
 	}
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	if inserted := tsx.InsertedAssets(); len(inserted) > 0 {
+		outcome.InsertedAssets = inserted
+	}
 	return outcome, tsx.Writes(), reason, err
 }

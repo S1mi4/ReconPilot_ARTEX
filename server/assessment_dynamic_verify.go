@@ -1152,11 +1152,34 @@ func (s *Server) recordDynamicFeedbackEvents(
 		})
 		_, _ = s.m.pg.RecordAssessmentRoundEvent(taskID, roundID, "knowledge_conflict", payload)
 	}
-	if wrote.Assets > 0 {
-		payload, _ := json.Marshal(map[string]any{
-			"obligation_id":  ob.ID,
-			"assets_written": wrote.Assets,
-		})
-		_, _ = s.m.pg.RecordAssessmentRoundEvent(taskID, roundID, "new_asset", payload)
+	if wrote.Assets > 0 || len(outcome.InsertedAssets) > 0 {
+		var entryAssets, otherAssets []agent.InsertedAssetSummary
+		for _, a := range outcome.InsertedAssets {
+			if strings.EqualFold(strings.TrimSpace(a.Type), "endpoint") {
+				entryAssets = append(entryAssets, a)
+			} else {
+				otherAssets = append(otherAssets, a)
+			}
+		}
+		if len(entryAssets) > 0 {
+			payload, _ := json.Marshal(map[string]any{
+				"obligation_id":   ob.ID,
+				"assets_written":  len(entryAssets),
+				"inserted_assets": entryAssets,
+			})
+			_, _ = s.m.pg.RecordAssessmentRoundEvent(taskID, roundID, "new_entry", payload)
+		}
+		if len(otherAssets) > 0 || (len(entryAssets) == 0 && wrote.Assets > 0) {
+			count := len(otherAssets)
+			if count == 0 {
+				count = wrote.Assets
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"obligation_id":   ob.ID,
+				"assets_written":  count,
+				"inserted_assets": otherAssets,
+			})
+			_, _ = s.m.pg.RecordAssessmentRoundEvent(taskID, roundID, "new_asset", payload)
+		}
 	}
 }

@@ -969,9 +969,90 @@ func (s *Server) createTaskProfileClaimHandler(w http.ResponseWriter, r *http.Re
 		}
 		return
 	}
+	conflicted := claim != nil && claim.ConfirmationStatus == pgdb.ClaimStatusConflicted
+	var invRes *pgdb.InvalidateObligationsResult
+	if !pgdb.IsTerminal(t.lifecycleSnapshot().Status) && (conflicted || (created && isInvalidatingClaimRelation(req.Relation))) {
+		if conflicted {
+			payload, _ := json.Marshal(map[string]any{
+				"claim_id":      claim.ID,
+				"subject":       claim.Subject,
+				"relation":      claim.Relation,
+				"object_value":  claim.ObjectValue,
+				"conflict_note": claim.ConflictNote,
+			})
+			_, _ = s.m.pg.RecordAssessmentRoundEvent(taskNum, round.ID, "knowledge_conflict", payload)
+		}
+		if dims := invalidationDimensionsForRelation(req.Relation); len(dims) > 0 || conflicted {
+			reason := fmt.Sprintf("画像断言变更（%s %s=%s）导致先前结论待重验", claim.Subject, claim.Relation, claim.ObjectValue)
+			if conflicted && strings.TrimSpace(claim.ConflictNote) != "" {
+				reason = claim.ConflictNote
+			}
+			var iErr error
+			invRes, iErr = s.m.pg.InvalidateObligationsOnChange(pgdb.InvalidateObligationsInput{
+				TaskID:             taskNum,
+				RoundID:            round.ID,
+				ChangeKind:         "profile_change",
+				Reason:             reason,
+				Dimensions:         dims,
+				IncludeTransitive:  true,
+				BumpProfileVersion: conflicted,
+			})
+			if iErr != nil {
+				log.Printf("[assessment-profile] task %s 断言变更失效处理失败: %v", taskID, iErr)
+			} else {
+				s.cancelInvalidatedIntents(invRes)
+			}
+		}
+		if conflicted || (invRes != nil && len(invRes.InvalidatedIDs) > 0) {
+			t.Notify()
+		}
+	}
+
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, map[string]any{"claim": claim, "created": created})
+	resp := map[string]any{
+		"claim":      claim,
+		"created":    created,
+		"conflicted": conflicted,
+	}
+	if invRes != nil && len(invRes.InvalidatedIDs) > 0 {
+		resp["invalidation"] = invRes
+	}
+	writeJSON(w, status, resp)
+}
+
+func isInvalidatingClaimRelation(rel string) bool {
+	return len(invalidationDimensionsForRelation(rel)) > 0
+}
+
+func invalidationDimensionsForRelation(rel string) []string {
+	switch strings.ToLower(strings.TrimSpace(rel)) {
+	case "auth_required", "auth_type", "auth_mechanism", "has_role", "permission":
+		return []string{
+			pgdb.DimensionConfigAudit,
+			pgdb.DimensionEntryTest,
+			pgdb.DimensionIdentityResource,
+			pgdb.DimensionCrossModule,
+			pgdb.DimensionHypothesis,
+		}
+	case "deployed_to_instance", "deployability", "code_version_verified", "base_url":
+		return []string{
+			pgdb.DimensionRuntimeAsset,
+			pgdb.DimensionEntryTest,
+			pgdb.DimensionIdentityResource,
+			pgdb.DimensionCrossModule,
+			pgdb.DimensionHypothesis,
+		}
+	case "config_setting", "server_port":
+		return []string{
+			pgdb.DimensionConfigAudit,
+			pgdb.DimensionRuntimeAsset,
+			pgdb.DimensionEntryTest,
+			pgdb.DimensionHypothesis,
+		}
+	default:
+		return nil
+	}
 }

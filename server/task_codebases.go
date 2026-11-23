@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -205,14 +206,86 @@ func (s *Server) onTaskCodebaseUploaded(taskID string, version taskCodebaseVersi
 		s.m.InvalidateTaskMaterialCheck(taskID)
 		return
 	}
-	if taskNum, err := strconv.ParseInt(taskID, 10, 64); err == nil && taskNum > 0 && s.m.pg != nil {
+	taskNum, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || taskNum <= 0 || s.m.pg == nil {
+		return
+	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if pgdb.IsTerminal(task.lifecycleSnapshot().Status) {
+		reason := fmt.Sprintf("代码版本变更（%s / %s）开启新一轮评估", firstNonEmpty(version.CodebaseID, "codebase"), firstNonEmpty(version.Name, version.ID))
+		if _, _, rErr := s.OpenNextAssessmentRound(ctx, taskID, reason, version.ID, ""); rErr != nil {
+			log.Printf("[assessment] task %s 终态上传新代码开启下一轮评估失败: %v", taskID, rErr)
+		}
+		return
+	}
+
+	round, rErr := s.m.pg.OpenAssessmentRound(taskNum)
+	if rErr != nil || round == nil {
 		payload, _ := json.Marshal(map[string]any{
 			"codebase_id": version.CodebaseID,
 			"version_id":  version.ID,
 			"name":        version.Name,
 		})
 		_, _ = s.m.pg.RecordAssessmentEvent(taskNum, "code_version_change", payload)
+		task.Notify()
+		return
 	}
+
+	invReason := fmt.Sprintf("代码版本更新为 %s(%s)，相关代码审计与动态验证证据失效待重测", firstNonEmpty(version.Name, version.ID), version.ID)
+	invRes, invErr := s.m.pg.InvalidateObligationsOnChange(pgdb.InvalidateObligationsInput{
+		TaskID:     taskNum,
+		RoundID:    round.ID,
+		ChangeKind: "code_version_change",
+		Reason:     invReason,
+		Dimensions: []string{
+			pgdb.DimensionCodeAudit,
+			pgdb.DimensionConfigAudit,
+			pgdb.DimensionEntryTest,
+			pgdb.DimensionIdentityResource,
+			pgdb.DimensionCrossModule,
+			pgdb.DimensionHypothesis,
+		},
+		IncludeTransitive:  true,
+		BumpProfileVersion: true,
+		NewCodebaseVersion: version.ID,
+	})
+	if invErr != nil {
+		log.Printf("[assessment] task %s 代码上传失效处理失败: %v", taskID, invErr)
+	} else {
+		s.cancelInvalidatedIntents(invRes)
+	}
+
+	if _, _, pErr := s.BuildAssessmentInitialProfile(ctx, taskID, BuildProfileOptions{}); pErr != nil && ctx.Err() == nil {
+		log.Printf("[assessment] task %s 新版本代码画像重建失败: %v", taskID, pErr)
+	}
+	if _, _, cErr := s.BuildAssessmentCoveragePlan(ctx, taskID); cErr != nil && ctx.Err() == nil {
+		log.Printf("[assessment] task %s 新版本覆盖计划增补失败: %v", taskID, cErr)
+	}
+
+	invCount := 0
+	if invRes != nil {
+		invCount = len(invRes.InvalidatedIDs)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"codebase_id":       version.CodebaseID,
+		"version_id":        version.ID,
+		"name":              version.Name,
+		"invalidated":       invErr == nil,
+		"invalidated_count": invCount,
+	})
+	_, _ = s.m.pg.RecordAssessmentRoundEvent(taskNum, round.ID, "code_version_change", payload)
+	if s.engine != nil {
+		s.engine.emitActivity(task, pgdb.Activity{
+			Worker:  "system",
+			Kind:    "text",
+			Summary: fmt.Sprintf("代码版本更新为 %s（%s），%d 条历史覆盖义务已标记为 stale，将增量重测", firstNonEmpty(version.Name, version.ID), version.ID, invCount),
+		})
+	}
+	task.Notify()
 }
 
 // DELETE /api/tasks/{id}/codebases/{cid} removes a mistakenly attached codebase

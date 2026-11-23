@@ -62,7 +62,7 @@ func (m *Manager) CompleteAssessment(t *Task) (completed bool, report *pgdb.Asse
 	if mErr != nil {
 		return false, report, fmt.Errorf("marshal completion report: %w", mErr)
 	}
-	active, started, won, err := m.pg.FinalizeAssessmentCompletion(id, report.RoundID, reportJSON)
+	active, started, won, err := m.pg.FinalizeAssessmentCompletionAtVersion(id, report.RoundID, report.ProfileVersion, reportJSON)
 	if err != nil {
 		return false, report, fmt.Errorf("finalize assessment completion: %w", err)
 	}

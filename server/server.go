@@ -212,6 +212,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		return s.ensureStaticHypothesisObligations(ctx, taskNum, roundID)
 	})
+	s.engine.SetAssessmentEventReconciler(s.reconcileIncrementalAssessmentState)
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
@@ -974,6 +975,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/profile/claims", s.createTaskProfileClaimHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-plan", s.getTaskCoveragePlanHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/coverage-plan/generate", s.generateTaskCoveragePlanHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/coverage-plan/reconcile", s.reconcileTaskCoveragePlanHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/assessment/invalidate", s.invalidateAssessmentObligationsHandler)
+	mux.HandleFunc("POST /api/tasks/{id}/assessment-rounds", s.createNextAssessmentRoundHandler)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services", s.taskCodeServicesList)
 	mux.HandleFunc("POST /api/tasks/{id}/code-services/{serviceID}/decision", s.taskCodeServiceDecision)
 	mux.HandleFunc("GET /api/tasks/{id}/code-services/{serviceID}/audit-config", s.taskCodeAuditConfigHandler)
